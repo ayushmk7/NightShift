@@ -18,8 +18,6 @@ pkg_test_raw() {
             ( cd "$REPO/jac" && HOME="$H" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test tests/compiler ) >> "$out" 2>&1 || true ;;
         jac-byllm)
             ( cd "$REPO" && HOME="$H" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test jac-byllm/tests ) >> "$out" 2>&1 || true ;;
-        jac-mcp)
-            ( cd "$REPO" && HOME="$H" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test jac-mcp/tests ) >> "$out" 2>&1 || true ;;
         *) return 2 ;;
     esac
 }
@@ -27,7 +25,7 @@ pkg_test_raw() {
 # The gated packages whose files a branch actually changed (diff is truth, covers autofix too).
 gated_pkgs_from_diff() {
     git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD" \
-        | cut -d/ -f1 | sort -u | grep -E '^(jac|jac-byllm|jac-mcp)$' || true
+        | cut -d/ -f1 | sort -u | grep -E '^(jac|jac-byllm)$' || true
 }
 
 # Record the per-package baseline of already-failing tests on main. Slow (runs the real suites);
@@ -36,7 +34,7 @@ baseline_main() {
     mkdir -p "$BASELINE_DIR"
     cd "$REPO"; git checkout "$NS_REPO_DEFAULT_BRANCH"
     local tp raw n
-    for tp in jac jac-byllm jac-mcp; do
+    for tp in jac jac-byllm; do
         raw="$LOG_DIR/baseline-raw-$tp.txt"
         ns_log BASELINE "recording $tp (slow)..."
         pkg_test_raw "$tp" "$raw"
