@@ -34,7 +34,9 @@ tier2_audit() {
     prompt="$(render_prompt "$NS_ROOT/prompts/audit.md" \
         "pkg=$pkg" "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
 
-    (cd "$REPO" && ns_timebox "$NS_BUDGETS_AUDIT_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
+    # dev jac first on PATH so the agent's Bash(jac *) and the jac MCP server hit the repo binary
+    (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
+        && ns_timebox "$NS_BUDGETS_AUDIT_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
         --permission-mode dontAsk \
         --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
         --max-turns 25 --output-format json) > "$LOG_DIR/audit.json" || true
@@ -84,7 +86,8 @@ tier2_apply() {
         prompt="$(render_prompt "$NS_ROOT/prompts/apply.md" \
             "pkg=$pkg" "theme=$(cat "$theme_file")" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
 
-        (cd "$REPO" && ns_timebox "$NS_BUDGETS_APPLY_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
+        (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
+            && ns_timebox "$NS_BUDGETS_APPLY_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
             --permission-mode acceptEdits \
             --allowedTools "Read,Edit,Grep,Glob,Bash(jac fmt *),Bash(jac format *),Bash(jac lint *),Bash(jac check *),Bash(jac code *),Bash(jac test *),Bash(git diff *),Bash(git status *),Bash(git log *),Bash(git add *),Bash(git commit *),mcp__jac__*" \
             --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \

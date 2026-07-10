@@ -103,6 +103,12 @@ ns_git_push() {   # ns_git_push <dir> <push-args...>
     fi
 }
 
+# pre-commit's system-language hooks (jac-format, validate-fragments) shell out to `jac`;
+# that must be the target repo's dev binary, so put its dir first on PATH for the hook run.
+ns_precommit() {
+    PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" "$NS_PATHS_PRECOMMIT" "$@"
+}
+
 # --- secrets ---
 ns_load_env() {
     # shellcheck disable=SC1090

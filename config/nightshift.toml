@@ -41,7 +41,12 @@ smtp_host = "smtp.gmail.com"
 smtp_port = 465                              # SSL; creds live in ~/.nightshift.env, never here
 
 [paths]                                      # absolute paths pinned at M0 (launchd PATH is minimal)
-jac      = "/Users/ayush/.local/bin/jac"                                # e.g. /Users/you/.local/bin/jac  (bootstrap-grepped)
-claude   = "/Users/ayush/.local/bin/claude"                                # e.g. /Users/you/.local/bin/claude
-gh       = "/opt/homebrew/bin/gh"                                # e.g. /opt/homebrew/bin/gh
-node_dir = "/opt/homebrew/bin"                                # e.g. /opt/homebrew/bin (ponytail hooks need node)
+# TWO jac binaries: `jac` runs the harness's own Jac helpers (validated on 0.16.1);
+# `jac_repo` is the target repo's dev binary (built by fresh_env.sh) used for the jaseci
+# gates (jac check/test/format) and the agent sessions — it tracks the repo's version.
+jac      = "/Users/ayush/.local/bin/jac"
+jac_repo = "/Volumes/ExtremePro/JaseciLabs/NightShift/work/repo/jac/zig-out/bin/jac"
+claude   = "/Users/ayush/.local/bin/claude"
+gh       = "/opt/homebrew/bin/gh"
+node_dir = "/opt/homebrew/bin"
+precommit = "/Users/ayush/.local/bin/pre-commit"

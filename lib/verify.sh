@@ -1,11 +1,19 @@
 # shellcheck shell=bash
 # lib/verify.sh — S4 (TechnicalPRD 7-S4): fail-closed gate. Any red after retry → branch deleted.
 
-# `jac test tests` must run from inside the package dir (needs its cwd).
-# ponytail: bounded by the night's 180m ceiling, not a per-gate gtimeout — gtimeout may be absent
-# and the jac timeout-fallback runs from NS_ROOT, which would break jac test's required cwd.
+# `jac test` must run from inside the package dir, and the bundled pytest runner needs a
+# clean HOME or its conftest import fails (ModuleNotFoundError: tests.conftest).
+#
+# ponytail: KNOWN-INCOMPLETE. On the target machine the full suite is (a) not green on main
+# (~42 env-dependent client/bundle failures needing node/bun/browser), (b) ~13min for a single
+# subdir so the whole suite blows the 180m ceiling per-branch, (c) partly k8s-dependent (jac-scale).
+# The real gate needs a redesign: record a per-package baseline of passing tests on main, then
+# gate each branch on "no NEW failures vs baseline", scoped to the edited package and skipping
+# infra-dependent suites. Until then this runs the naive per-package suite and WILL over-reject.
+# The CI-accurate commands are: jac -> `jac test tests/ --ignore tests/compiler` + `jac test tests/compiler`;
+# jac-byllm -> `jac test jac-byllm/tests/test_byllm.jac` (JAC_TEST_JOBS=0); jac-scale -> needs k8s.
 run_pkg_tests() {
-    ( cd "$REPO/$1" && JAC_TEST_JOBS=auto "$NS_PATHS_JAC" test tests )
+    ( cd "$REPO/$1" && HOME="$(mktemp -d)" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test tests )
 }
 
 verify_main() {
@@ -30,7 +38,7 @@ verify_branch() {
     t0="$(date +%s)"
     cd "$REPO"
     git checkout "$branch"
-    "$NS_PATHS_JAC" clean --cache || true
+    "$NS_PATHS_JAC_REPO" clean --cache || true
 
     # 1. scope containment FIRST — reject before spending a second on tests (anti-injection, T1)
     if [ "$theme" != "-" ]; then
@@ -41,10 +49,16 @@ verify_branch() {
         fi
     fi
 
-    # 2. whole-program type check
-    if ! ns_timebox 10 "$NS_PATHS_JAC" check; then
-        verify_red "$branch" "jac check red"
-        return 1
+    # 2. type-check the changed .jac files. A whole-repo `jac check` would fail on the repo's
+    #    intentionally-broken test fixtures; import resolution still pulls each file's deps in.
+    local changed_jac
+    changed_jac="$(git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD" | grep '\.jac$' || true)"
+    if [ -n "$changed_jac" ]; then
+        # shellcheck disable=SC2086  # word-split into per-file args; jac paths have no spaces
+        if ! ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $changed_jac ); then
+            verify_red "$branch" "jac check red"
+            return 1
+        fi
     fi
 
     # 3. tests: jaseci ships one Zig-built jac binary with a bundled runner (no pytest, no .venv).
@@ -63,10 +77,10 @@ verify_branch() {
 
     # 4. pre-commit (standalone contributor tool from PATH, installed via pipx at M0 — NOT a git
     #    hook, so orchestrator commits stay unhooked). Hooks may self-mutate; fold in, demand clean.
-    if ! pre-commit run --all-files; then
+    if ! ns_precommit run --all-files; then
         git add -A
         git diff --cached --quiet || git commit -m "style: pre-commit autofix (nightshift)"
-        if ! pre-commit run --all-files; then
+        if ! ns_precommit run --all-files; then
             verify_red "$branch" "pre-commit red"
             return 1
         fi

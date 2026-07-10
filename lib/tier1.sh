@@ -6,9 +6,9 @@ tier1_main() {
     cd "$REPO"
     git checkout -B "$branch" "$NS_REPO_DEFAULT_BRANCH"
 
-    "$NS_PATHS_JAC" clean --cache || true         # stale-bytecode footgun (upstream-documented)
-    "$NS_PATHS_JAC" format .                      # respects .jacignore
-    "$NS_PATHS_JAC" lint . --fix || true
+    "$NS_PATHS_JAC_REPO" clean --cache || true         # stale-bytecode footgun (upstream-documented)
+    "$NS_PATHS_JAC_REPO" format .                      # respects .jacignore
+    "$NS_PATHS_JAC_REPO" lint . --fix || true
 
     # The formatter runs repo-wide; protected paths must never ship edited (PRD 9).
     local protected
@@ -19,7 +19,7 @@ tier1_main() {
     fi
 
     # pre-commit (from PATH, pipx-installed at M0) may self-mutate on the first pass; the second must pass
-    pre-commit run --all-files || pre-commit run --all-files
+    ns_precommit run --all-files || ns_precommit run --all-files
 
     git add -A
     if git diff --cached --quiet; then
