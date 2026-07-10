@@ -10,7 +10,7 @@ rm -rf .jac
 for f in scripts/*.jac; do
     jac check "$f" >/dev/null 2>&1 || fail "jac check $f"
 done
-for f in nslib config ledger check_scope parse_result selector render_draft sendmail; do
+for f in nslib config ledger check_scope parse_result selector render_draft sendmail testgate; do
     jac test "scripts/$f.jac" >/dev/null 2>&1 || fail "jac test $f"
 done
 rm -rf .jac

@@ -1,19 +1,48 @@
 # shellcheck shell=bash
 # lib/verify.sh — S4 (TechnicalPRD 7-S4): fail-closed gate. Any red after retry → branch deleted.
 
-# `jac test` must run from inside the package dir, and the bundled pytest runner needs a
-# clean HOME or its conftest import fails (ModuleNotFoundError: tests.conftest).
+BASELINE_DIR="$NS_ROOT/state/test-baseline"
+
+# The target suite is not green on main here (env/infra failures) and is slow, so we gate on a
+# per-package BASELINE of already-failing tests (see testgate.jac) rather than a fully-green run.
+# The bundled pytest runner needs a clean HOME or its conftest import fails.
 #
-# ponytail: KNOWN-INCOMPLETE. On the target machine the full suite is (a) not green on main
-# (~42 env-dependent client/bundle failures needing node/bun/browser), (b) ~13min for a single
-# subdir so the whole suite blows the 180m ceiling per-branch, (c) partly k8s-dependent (jac-scale).
-# The real gate needs a redesign: record a per-package baseline of passing tests on main, then
-# gate each branch on "no NEW failures vs baseline", scoped to the edited package and skipping
-# infra-dependent suites. Until then this runs the naive per-package suite and WILL over-reject.
-# The CI-accurate commands are: jac -> `jac test tests/ --ignore tests/compiler` + `jac test tests/compiler`;
-# jac-byllm -> `jac test jac-byllm/tests/test_byllm.jac` (JAC_TEST_JOBS=0); jac-scale -> needs k8s.
-run_pkg_tests() {
-    ( cd "$REPO/$1" && HOME="$(mktemp -d)" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test tests )
+# pkg_test_raw <pkg> <outfile>: run <pkg>'s CI-accurate test command(s), combined output to outfile.
+# Returns 2 for packages with no local test gate (jac-scale: needs k8s). The runner's own exit code
+# is ignored — baseline failures are expected; testgate decides pass/fail on NEW failures only.
+pkg_test_raw() {
+    local pkg=$1 out=$2 H; H="$(mktemp -d)"; : > "$out"
+    case "$pkg" in
+        jac)
+            ( cd "$REPO/jac" && HOME="$H" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test tests/ --ignore tests/compiler ) >> "$out" 2>&1 || true
+            ( cd "$REPO/jac" && HOME="$H" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test tests/compiler ) >> "$out" 2>&1 || true ;;
+        jac-byllm)
+            ( cd "$REPO" && HOME="$H" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test jac-byllm/tests ) >> "$out" 2>&1 || true ;;
+        jac-mcp)
+            ( cd "$REPO" && HOME="$H" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test jac-mcp/tests ) >> "$out" 2>&1 || true ;;
+        *) return 2 ;;
+    esac
+}
+
+# The gated packages whose files a branch actually changed (diff is truth, covers autofix too).
+gated_pkgs_from_diff() {
+    git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD" \
+        | cut -d/ -f1 | sort -u | grep -E '^(jac|jac-byllm|jac-mcp)$' || true
+}
+
+# Record the per-package baseline of already-failing tests on main. Slow (runs the real suites);
+# run once at M0 and re-run after a major upstream sync. `nightshift.sh baseline`.
+baseline_main() {
+    mkdir -p "$BASELINE_DIR"
+    cd "$REPO"; git checkout "$NS_REPO_DEFAULT_BRANCH"
+    local tp raw n
+    for tp in jac jac-byllm jac-mcp; do
+        raw="$LOG_DIR/baseline-raw-$tp.txt"
+        ns_log BASELINE "recording $tp (slow)..."
+        pkg_test_raw "$tp" "$raw"
+        n="$(ns_jac testgate record "$tp" "$raw" "$BASELINE_DIR")"
+        ns_log BASELINE "$tp: $n known-failing tests recorded"
+    done
 }
 
 verify_main() {
@@ -32,7 +61,7 @@ verify_main() {
     return 0
 }
 
-# Gate order: scope containment → jac check → jac test per pkg (one retry each) → pre-commit.
+# Gate order: scope containment → jac check (changed files) → baseline-diff test gate → pre-commit.
 verify_branch() {
     local branch=$1 theme=$2 t0 t1
     t0="$(date +%s)"
@@ -61,17 +90,16 @@ verify_branch() {
         fi
     fi
 
-    # 3. tests: jaseci ships one Zig-built jac binary with a bundled runner (no pytest, no .venv).
-    #    Run every package that has a tests/ dir; one retry per package absorbs flakes (PRD 11).
-    local tpkg
-    for tpkg in jac jac-byllm jac-mcp; do
-        [ -d "$REPO/$tpkg/tests" ] || continue
-        if ! run_pkg_tests "$tpkg"; then
-            ns_log S4 "$tpkg tests red — one retry"
-            if ! run_pkg_tests "$tpkg"; then
-                verify_red "$branch" "$tpkg tests red after retry"
-                return 1
-            fi
+    # 3. tests: baseline-diff gate. Run the CI suite for each gated package the branch changed,
+    #    fail only on NEW failures vs the recorded main baseline (testgate.jac). jac-scale changes
+    #    get no test gate (k8s) — jac check + pre-commit still gate them.
+    local tpkg raw
+    for tpkg in $(gated_pkgs_from_diff); do
+        raw="$LOG_DIR/tests-raw-$(basename "$branch")-$tpkg.txt"
+        pkg_test_raw "$tpkg" "$raw"
+        if ! ns_jac testgate gate "$tpkg" "$raw" "$BASELINE_DIR"; then
+            verify_red "$branch" "$tpkg: new test failures vs baseline (see $(basename "$raw"))"
+            return 1
         fi
     done
 
@@ -91,7 +119,7 @@ verify_branch() {
     local dur_min=$(( (t1 - t0) / 60 )); [ "$dur_min" -lt 1 ] && dur_min=1
     local old_est; old_est="$(ns_jac ledger state-get verify_estimate_min "$STATE" | tr -d '"')"
     ns_jac ledger state-set verify_estimate_min $(( ( ${old_est:-30} + dur_min ) / 2 )) "$STATE"
-    echo "jac check ✓ · jac test (jac/jac-byllm/jac-mcp) ✓ · pre-commit ✓ (${dur_min} min)" \
+    echo "jac check ✓ · tests (no new failures vs baseline) ✓ · pre-commit ✓ (${dur_min} min)" \
         > "$LOG_DIR/tests-$(basename "$branch").txt"
     git checkout "$NS_REPO_DEFAULT_BRANCH"
     return 0
