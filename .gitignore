@@ -1,0 +1,7 @@
+# jac bytecode cache (written into cwd on check/run/test)
+.jac/
+__jac_gen__/
+# runtime workspace (lives at ~/nightshift/, never in the repo)
+logs/
+work/
+state/

@@ -1,0 +1,48 @@
+# config/nightshift.toml — every knob in one file (TechnicalPRD 6). Values are defaults.
+
+[repo]
+upstream       = "jaseci-labs/jaseci"
+fork           = "YOURUSER/jaseci"          # <- set at M0
+default_branch = "main"
+
+[rotation]                                   # one package per night, round-robin (PRD 7 stage 3)
+packages = ["jac", "jac-byllm", "jac-client", "jac-scale", "jac-mcp", "jac-super", "jaseci-package"]
+
+[budgets]                                    # PRD 9 guardrails — no step may violate these
+themes_per_night   = 3
+files_per_theme    = 10
+loc_per_theme      = 300
+wallclock_min      = 180                     # hard ceiling for the whole night
+box_sync_tier1_min = 15
+box_agentic_min    = 90
+box_verify_min     = 65
+box_ship_email_min = 10
+audit_timeout_min  = 15
+apply_timeout_min  = 25                      # per theme session
+max_turns          = 80                      # the real cost brake on a subscription
+max_budget_usd     = 5                       # inert on subscription; belt if ever on an API key
+
+[agent]
+model         = ""                           # empty = account default
+ponytail_mode = "full"                       # PRD 14-Q5
+
+[protect]                                    # glob deny-list; enforced twice (prompt + S4 gate)
+globs = [
+  "**/tests/**", "**/fixtures/**", "**/*.test.jac",
+  "**/jac.spec", "**/grammar/**", "**/generated/**", "**/vendor/**",
+  "docs/**", "!docs/docs/community/release_notes/unreleased/**",
+  ".github/**", "examples/**",
+]
+
+[email]
+to        = "you@example.com"                # <- set at M0
+from      = "nightshift@localhost"
+smtp_host = "smtp.gmail.com"
+smtp_port = 465                              # SSL; creds live in ~/.nightshift.env, never here
+
+[paths]                                      # absolute paths pinned at M0 (launchd PATH is minimal)
+jac      = ""                                # e.g. /Users/you/.local/bin/jac  (bootstrap-grepped)
+claude   = ""                                # e.g. /Users/you/.local/bin/claude
+gh       = ""                                # e.g. /opt/homebrew/bin/gh
+node_dir = ""                                # e.g. /opt/homebrew/bin (ponytail hooks need node)
+venv     = ""                                # the jaseci clone's venv, e.g. .../work/repo/.venv

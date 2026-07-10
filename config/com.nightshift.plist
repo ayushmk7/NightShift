@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.nightshift</string>
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/caffeinate</string><string>-i</string>
+    <string>/Users/YOURUSER/nightshift/bin/nightshift.sh</string><string>run</string>
+  </array>
+  <key>StartCalendarInterval</key><dict>
+    <key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer>
+  </dict>
+  <key>EnvironmentVariables</key><dict>
+    <!-- launchd's minimal PATH is the #1 documented cause of silent failures (TPRD row 15) -->
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StandardOutPath</key><string>/Users/YOURUSER/nightshift/logs/launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/YOURUSER/nightshift/logs/launchd.err</string>
+</dict></plist>

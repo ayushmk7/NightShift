@@ -1,0 +1,1 @@
+{"result":"Audit complete.\n```json\n[{\"file\":\"pkg/main.jac\",\"rule\":\"dead-code\",\"snippet\":\"def never_called(x: int) -> int { return x * 999; }\",\"summary\":\"never_called is unreferenced\",\"est_loc_saved\":3,\"confidence\":5,\"risk\":1,\"theme_hint\":\"dead code\"}]\n```","is_error":false,"num_turns":8,"total_cost_usd":0}
