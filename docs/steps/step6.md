@@ -11,7 +11,7 @@ queue the branch for the same S4 gate as everything else. Implements TechnicalPR
 
 ## Prerequisites
 
-Steps 2–5. The repo venv has `pre-commit` installed (step 1.2).
+Steps 2–5. `pre-commit` is installed via pipx (step 1.2) and run from PATH — no venv.
 
 ## Files created
 
@@ -44,8 +44,8 @@ tier1_main() {
         echo "$protected" | while IFS= read -r p; do git checkout -- "$p"; done
     fi
 
-    # pre-commit may self-mutate on the first pass (formatters); the second must pass
-    "$NS_PATHS_VENV/bin/pre-commit" run --all-files || "$NS_PATHS_VENV/bin/pre-commit" run --all-files
+    # pre-commit (from PATH, pipx-installed at M0) may self-mutate on the first pass; the second must pass
+    pre-commit run --all-files || pre-commit run --all-files
 
     git add -A
     if git diff --cached --quiet; then

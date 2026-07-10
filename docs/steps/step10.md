@@ -300,7 +300,7 @@ jac check scripts/selector.jac && jac test scripts/selector.jac
 - [ ] `selector split` writes one `theme-<slug>.json` per theme and prints the
       slugs; `selector dropped` prints `fp⇥file⇥reason` lines.
 - [ ] `selector rotate config/nightshift.toml /tmp/rot.json` called 8 times prints
-      `jac, jac-byllm, …, jaseci-package, jac` — full cycle then wraps.
+      `jac, jac-byllm, jac-mcp, jac-scale, jac` — full cycle then wraps.
 
 ## Verification procedure
 

@@ -18,8 +18,8 @@ tier1_main() {
         echo "$protected" | while IFS= read -r p; do git checkout -- "$p"; done
     fi
 
-    # pre-commit may self-mutate on the first pass (formatters); the second must pass
-    "$NS_PATHS_VENV/bin/pre-commit" run --all-files || "$NS_PATHS_VENV/bin/pre-commit" run --all-files
+    # pre-commit (from PATH, pipx-installed at M0) may self-mutate on the first pass; the second must pass
+    pre-commit run --all-files || pre-commit run --all-files
 
     git add -A
     if git diff --cached --quiet; then

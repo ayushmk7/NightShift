@@ -61,6 +61,9 @@ HARD RULES:
 Style: minimum code that works; prefer deleting to rewriting; leave a `# ponytail: <why>`
 comment where you consciously defer a simplification.
 
+Repo rule: this repo's pre-commit REJECTS the em-dash character. Do not introduce it in any
+edit, and keep the `release_note_md` you return free of em-dashes (use a hyphen or reword).
+
 Verification protocol, per edited file, BEFORE you commit:
 1. `mcp__jac__validate_jac` on the file (full compile-pipeline check).
 2. If any signature changed, run `jac check` on the package.

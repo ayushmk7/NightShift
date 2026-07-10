@@ -128,7 +128,9 @@ def git_report(repo_dir: str, summary: str) -> dict {
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
-    if cmd == "git-report" and len(args) == 4 {
+    if cmd == "frag" and len(args) == 3 {
+        print(release_fragment(args[2]));
+    } elif cmd == "git-report" and len(args) == 4 {
         print(json.dumps(git_report(args[2], args[3])));
     } elif cmd == "render" and len(args) >= 3 {
         with open(args[2], "r") as f {
@@ -151,6 +153,7 @@ with entry {
         }
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run render_draft.jac render <report.json> [branch=... package=... date=... tests=... url=...]");
+        eprint("       jac run render_draft.jac frag <pkg>");
         eprint("       jac run render_draft.jac git-report <repo_dir> <summary>");
         eprint("       jac run render_draft.jac meta <draft.md>");
         eprint("       jac run render_draft.jac body <draft.md>");
@@ -161,7 +164,7 @@ test "render then split roundtrips the frontmatter" {
     d: dict = {
         "branch": "nightshift/2026-07-10/dead-code-jac-client", "package": "jac-client",
         "date": "2026-07-10", "risk": "low",
-        "tests": "jac check ok; pytest ok; pre-commit ok",
+        "tests": "jac check ok; jac test ok; pre-commit ok",
         "summary": "remove dead render-path duplication",
         "files": ["jac-client/render/pipe.jac"], "loc_before": 512, "loc_after": 143,
         "skipped": [{"file": "jac-client/render/pipe.jac", "reason": "ponytail: kept boundary check"}],

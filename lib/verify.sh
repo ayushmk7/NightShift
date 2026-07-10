@@ -1,6 +1,13 @@
 # shellcheck shell=bash
 # lib/verify.sh — S4 (TechnicalPRD 7-S4): fail-closed gate. Any red after retry → branch deleted.
 
+# `jac test tests` must run from inside the package dir (needs its cwd).
+# ponytail: bounded by the night's 180m ceiling, not a per-gate gtimeout — gtimeout may be absent
+# and the jac timeout-fallback runs from NS_ROOT, which would break jac test's required cwd.
+run_pkg_tests() {
+    ( cd "$REPO/$1" && JAC_TEST_JOBS=auto "$NS_PATHS_JAC" test tests )
+}
+
 verify_main() {
     [ -f "$LOG_DIR/queue.tsv" ] || { ns_log S4 "no branches queued"; return 0; }
     local branch theme report shipped=0
@@ -17,7 +24,7 @@ verify_main() {
     return 0
 }
 
-# Gate order (each time-boxed): scope containment → jac check → pytest (one retry) → pre-commit.
+# Gate order: scope containment → jac check → jac test per pkg (one retry each) → pre-commit.
 verify_branch() {
     local branch=$1 theme=$2 t0 t1
     t0="$(date +%s)"
@@ -40,20 +47,26 @@ verify_branch() {
         return 1
     fi
 
-    # 3. full test suite; one retry of only the failures (flaky-test policy, PRD 11)
-    if ! ns_timebox "$NS_BUDGETS_BOX_VERIFY_MIN" "$NS_PATHS_VENV/bin/python" -m pytest jac -n auto -q; then
-        ns_log S4 "pytest red — retrying only the failures once"
-        if ! ns_timebox 15 "$NS_PATHS_VENV/bin/python" -m pytest jac --last-failed -q; then
-            verify_red "$branch" "pytest red after retry"
-            return 1
+    # 3. tests: jaseci ships one Zig-built jac binary with a bundled runner (no pytest, no .venv).
+    #    Run every package that has a tests/ dir; one retry per package absorbs flakes (PRD 11).
+    local tpkg
+    for tpkg in jac jac-byllm jac-mcp; do
+        [ -d "$REPO/$tpkg/tests" ] || continue
+        if ! run_pkg_tests "$tpkg"; then
+            ns_log S4 "$tpkg tests red — one retry"
+            if ! run_pkg_tests "$tpkg"; then
+                verify_red "$branch" "$tpkg tests red after retry"
+                return 1
+            fi
         fi
-    fi
+    done
 
-    # 4. pre-commit; if hooks self-mutate, fold the mutation in and demand a clean second pass
-    if ! "$NS_PATHS_VENV/bin/pre-commit" run --all-files; then
+    # 4. pre-commit (standalone contributor tool from PATH, installed via pipx at M0 — NOT a git
+    #    hook, so orchestrator commits stay unhooked). Hooks may self-mutate; fold in, demand clean.
+    if ! pre-commit run --all-files; then
         git add -A
         git diff --cached --quiet || git commit -m "style: pre-commit autofix (nightshift)"
-        if ! "$NS_PATHS_VENV/bin/pre-commit" run --all-files; then
+        if ! pre-commit run --all-files; then
             verify_red "$branch" "pre-commit red"
             return 1
         fi
@@ -64,7 +77,7 @@ verify_branch() {
     local dur_min=$(( (t1 - t0) / 60 )); [ "$dur_min" -lt 1 ] && dur_min=1
     local old_est; old_est="$(ns_jac ledger state-get verify_estimate_min "$STATE" | tr -d '"')"
     ns_jac ledger state-set verify_estimate_min $(( ( ${old_est:-30} + dur_min ) / 2 )) "$STATE"
-    echo "jac check ✓ · pytest jac -n auto ✓ · pre-commit ✓ (${dur_min} min)" \
+    echo "jac check ✓ · jac test (jac/jac-byllm/jac-mcp) ✓ · pre-commit ✓ (${dur_min} min)" \
         > "$LOG_DIR/tests-$(basename "$branch").txt"
     git checkout "$NS_REPO_DEFAULT_BRANCH"
     return 0

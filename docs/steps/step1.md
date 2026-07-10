@@ -8,7 +8,7 @@ subscription and verified **headless**, the ponytail plugin, the exported Jac ag
 skills, the `jac mcp` compiler server registered, `gh` authenticated, and the
 `~/nightshift/` workspace scaffold with absolute binary paths pinned. Implements
 PRD §13-M0 and resolves the three empirical facts from TechnicalPRD §2 (rows
-13–15): pytest wall time, launchd↔Keychain, launchd PATH.
+13–15): jac test wall time, launchd↔Keychain, launchd PATH.
 
 ## Prerequisites
 
@@ -48,22 +48,27 @@ git config push.default nothing
 
 ### 1.2 Jac toolchain green on a virgin clone
 
-```bash
-# install jac (official installer or pipx/uv — pick one and stick with it)
-uv tool install jaclang        # or: pip install jaclang
-jac --version                  # expect 0.16.x or newer
+jaclang ships as a **single Zig-built `jac` binary** — there is no pip-installed jaclang
+and no `.venv`. Build it once per the repo's CONTRIBUTING.md (Zig 0.16.0 is pinned):
 
+```bash
+brew install zig          # must be exactly 0.16.0 (repo pins it)
 cd ~/nightshift/work/repo
-python3 -m venv .venv && .venv/bin/pip install -e ".[dev]" pre-commit pytest-xdist  # per repo README
-jac check                      # must be green on the virgin clone
-.venv/bin/pre-commit install --install-hooks
+./scripts/fresh_env.sh    # builds the jac binary, installs plugins editable (--global), sets up pre-commit
+jac --version             # expect 0.16.x or newer
+jac check                 # must be green on the virgin clone
+
+# pre-commit is a standalone contributor tool — install it but do NOT `pre-commit install`
+# (the verify gate runs `pre-commit run --all-files` explicitly; installing the git hook would
+#  make the orchestrator's own commits, e.g. the draft branch, fail on em-dashes)
+pipx install pre-commit
 ```
 
 ### 1.3 The timing run (calibrates the whole harness)
 
 ```bash
-cd ~/nightshift/work/repo
-time .venv/bin/python -m pytest jac -n auto -q   # WRITE THIS NUMBER DOWN
+cd ~/nightshift/work/repo/jac
+time JAC_TEST_JOBS=auto jac test tests   # WRITE THIS NUMBER DOWN (repeat for jac-byllm, jac-mcp)
 ```
 
 This number is **the** input to the budget math (TechnicalPRD §15): the S4 box is
@@ -127,7 +132,7 @@ launchd's PATH is minimal; every binary is pinned as an absolute path in step 2'
 
 ```bash
 command -v jac claude gh node
-echo "venv: $HOME/nightshift/work/repo/.venv"
+command -v pipx pre-commit   # pre-commit from PATH (no venv)
 brew install coreutils            # gtimeout — stage time-boxes (fallback exists, but this is better)
 ```
 
@@ -139,7 +144,7 @@ All commands above, top to bottom. Nothing else.
 
 - [ ] `git -C ~/nightshift/work/repo remote -v` shows `origin` = your fork, `upstream` = jaseci-labs.
 - [ ] `git -C ~/nightshift/work/repo config push.default` prints `nothing`.
-- [ ] `jac check` green on the virgin clone; `pytest jac -n auto` green, wall time recorded.
+- [ ] `jac check` green on the virgin clone; `jac test` green per package, wall time recorded.
 - [ ] `claude -p "reply with exactly: pong" --max-turns 1 --output-format json` returns `"result":"pong"` from a **non-interactive** shell (e.g. `zsh -c '...'`).
 - [ ] `/plugin` list shows ponytail installed; `ls ~/.claude/skills` shows the exported jac-* skills.
 - [ ] `claude mcp list` run from inside the clone shows the `jac` stdio server connected.

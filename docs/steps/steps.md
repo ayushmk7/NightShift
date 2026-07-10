@@ -10,7 +10,7 @@ Follow them in order; every step ends with something you can run and check.
 syncs a fork of `jaseci-labs/jaseci`, runs a deterministic clean (`jac format` /
 `jac lint --fix` / pre-commit), then bounded headless Claude Code sessions (ponytail
 skill + Jac agent skills + `jac mcp`) that audit and apply cleanup themes, gates
-every branch behind `jac check` + full `pytest jac -n auto` + `pre-commit`
+every branch behind `jac check` + full `jac test` (per package) + `pre-commit`
 (fail-closed), pushes survivors to the fork with PR-draft `.md` files on an orphan
 `nightshift/drafts` branch, updates a JSONL ledger, and emails a digest. Morning
 commands `promote`/`discard` open the real PR or bury the branch.
@@ -31,7 +31,7 @@ commands `promote`/`discard` open the real PR or bury the branch.
                                       │
                                       ▼
                           [S4 Verify gate — fail closed]
-                            scope · jac check · pytest jac -n auto · pre-commit
+                            scope · jac check · jac test (per pkg) · pre-commit
                               red? ─▶ discard branch, log, continue
                                       │ green
                                       ▼
@@ -49,7 +49,7 @@ commands `promote`/`discard` open the real PR or bury the branch.
 > **bash sequences processes; Jac owns every data and logic transformation.
 > There are no Python files in this harness.**
 
-- **bash** (`bin/nightshift.sh`, `lib/*.sh`): stage ordering, git/gh/claude/pytest
+- **bash** (`bin/nightshift.sh`, `lib/*.sh`): stage ordering, git/gh/claude/jac-test
   invocations, traps, time-boxes, lock files. Bash never parses or composes JSON.
 - **Jac** (`scripts/*.jac`): fingerprinting, ledger, config flattening, finding
   selection/packing, Claude-envelope parsing, scope gate, draft rendering, email.

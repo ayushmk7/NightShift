@@ -166,8 +166,16 @@ def is_protected(path: str, globs: list[str]) -> bool {
     return hit;
 }
 
+"""The repo's release-note dir names differ from package names (check-release-notes.sh):
+jac code lives in jac/jaclang -> fragment dir 'jaclang'; jac-byllm/byllm -> 'byllm'."""
+def fragment_dir(pkg: str) -> str {
+    mapping: dict[str, str] = {"jac": "jaclang", "jac-byllm": "byllm",
+                               "jac-mcp": "jac-mcp", "jac-scale": "jac-scale"};
+    return mapping[pkg] if pkg in mapping else pkg;
+}
+
 def release_fragment(pkg: str) -> str {
-    return "docs/docs/community/release_notes/unreleased/" + pkg + "/0000.refactor.md";
+    return "docs/docs/community/release_notes/unreleased/" + fragment_dir(pkg) + "/0000.refactor.md";
 }
 
 test "fingerprint normalizes whitespace" {

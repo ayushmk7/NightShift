@@ -36,11 +36,11 @@ step 1.7.
 
 [repo]
 upstream       = "jaseci-labs/jaseci"
-fork           = "YOURUSER/jaseci"          # <- set at M0
+fork           = "ayushmk7/jaseci"          # <- set at M0
 default_branch = "main"
 
 [rotation]                                   # one package per night, round-robin (PRD 7 stage 3)
-packages = ["jac", "jac-byllm", "jac-client", "jac-scale", "jac-mcp", "jac-super", "jaseci-package"]
+packages = ["jac", "jac-byllm", "jac-mcp", "jac-scale"]   # the 4 package dirs that exist in the repo
 
 [budgets]                                    # PRD 9 guardrails — no step may violate these
 themes_per_night   = 3
@@ -69,17 +69,16 @@ globs = [
 ]
 
 [email]
-to        = "you@example.com"                # <- set at M0
+to        = "community@jaseci.org"                # <- set at M0
 from      = "nightshift@localhost"
 smtp_host = "smtp.gmail.com"
 smtp_port = 465                              # SSL; creds live in ~/.nightshift.env, never here
 
 [paths]                                      # absolute paths pinned at M0 (launchd PATH is minimal)
-jac      = ""                                # e.g. /Users/you/.local/bin/jac  (bootstrap-grepped)
-claude   = ""                                # e.g. /Users/you/.local/bin/claude
-gh       = ""                                # e.g. /opt/homebrew/bin/gh
-node_dir = ""                                # e.g. /opt/homebrew/bin (ponytail hooks need node)
-venv     = ""                                # the jaseci clone's venv, e.g. .../work/repo/.venv
+jac      = "/Users/ayush/.local/bin/jac"                                # e.g. /Users/you/.local/bin/jac  (bootstrap-grepped)
+claude   = "/Users/ayush/.local/bin/claude"                                # e.g. /Users/you/.local/bin/claude
+gh       = "/opt/homebrew/bin/gh"                                # e.g. /opt/homebrew/bin/gh
+node_dir = "/opt/homebrew/bin"                                # e.g. /opt/homebrew/bin (ponytail hooks need node)
 ```
 
 ### 2.2 `scripts/nslib.jac` — shared primitives
@@ -258,8 +257,16 @@ def is_protected(path: str, globs: list[str]) -> bool {
     return hit;
 }
 
+"""The repo's release-note dir names differ from package names (check-release-notes.sh):
+jac code lives in jac/jaclang -> fragment dir 'jaclang'; jac-byllm/byllm -> 'byllm'."""
+def fragment_dir(pkg: str) -> str {
+    mapping: dict[str, str] = {"jac": "jaclang", "jac-byllm": "byllm",
+                               "jac-mcp": "jac-mcp", "jac-scale": "jac-scale"};
+    return mapping[pkg] if pkg in mapping else pkg;
+}
+
 def release_fragment(pkg: str) -> str {
-    return "docs/docs/community/release_notes/unreleased/" + pkg + "/0000.refactor.md";
+    return "docs/docs/community/release_notes/unreleased/" + fragment_dir(pkg) + "/0000.refactor.md";
 }
 
 test "fingerprint normalizes whitespace" {

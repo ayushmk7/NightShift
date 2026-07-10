@@ -1,7 +1,8 @@
 # PRD — Nightshift: a nightly Jac code-cleanup harness for jaseci-labs/jaseci
 
 **Status:** Draft v0.4 · **Date:** 2026-07-10 · **Owner:** you · **Codename:** Nightshift (rename freely)
-**v0.2:** resolved runtime = macOS (§10) and auth = Pro/Max subscription (§9, §13-M0, §14). **v0.3:** wall clock raised to a 3 h ceiling with adaptive stage boxes; full test suite every night (§9, §14-Q4). **v0.4:** scope definition sharpened (§3.1); all open questions resolved or defaulted (§14); feasibility audited — see companion doc **`PRD-nightshift-technical.md`** for the full technical specification and feasibility audit.
+**v0.2:** resolved runtime = macOS (§10) and auth = Pro/Max subscription (§9, §13-M0, §14). **v0.3:** wall clock raised to a 3 h ceiling with adaptive stage boxes; full test suite every night (§9, §14-Q4). **v0.4:** scope definition sharpened (§3.1); all open questions resolved or defaulted (§14); feasibility audited.
+**v0.5 (2026-07-10):** corrected for the real `jaseci-labs/jaseci`, which moved to a single Zig-built `jac` binary. Tests run via the binary's **bundled runner** (`JAC_TEST_JOBS=auto jac test tests` per package), NOT `pytest jac -n auto`; there is **no pip-installed jaclang and no `.venv`**; the toolchain is built with `./scripts/fresh_env.sh` (Zig 0.16.0). Only **4 package dirs exist** (`jac`, `jac-byllm`, `jac-mcp`, `jac-scale`), so the rotation is 4 not 7. Release-note fragment dirs differ from package names (`jac`→`jaclang`, `jac-byllm`→`byllm`). The repo's pre-commit **rejects em-dashes and AI co-author trailers** — Nightshift's commits and fragments avoid both, and pre-commit is run explicitly in the gate, never installed as a git hook.
 
 ---
 
@@ -15,7 +16,7 @@ The machine does the janitorial pass at night; the human makes the judgment call
 
 **The target.** `jaseci-labs/jaseci` is the monorepo for the Jac language and the Jaseci stack: the `jac` compiler/runtime, `jac-byllm` (LLM integration), `jac-client`, `jac-scale`, `jac-mcp`, `jac-super`, and docs. The repo is ~95% Jac — the compiler is largely self-hosted — so "cleaning Jac code" means editing a live compiler, stdlib, and plugins. Tests are not optional decoration here; they are the only thing standing between a cleanup and a broken toolchain.
 
-**The toolchain is already agent-ready.** The `jac` CLI ships formatting (`jac fmt` / `jac format .`), linting (`jac check --lint`, `jac lint . --fix`), whole-program type checking (`jac check`), and tests (`jac test`, upstream CI uses `pytest jac -n auto`). A Model Context Protocol server is built into the binary — `jac mcp` — exposing `validate_jac` (full compile-pipeline type check), `check_syntax`, `lint` (with `auto_fix` returning corrected code), `format_jac`, plus resources for the grammar, docs, examples, and a common-AI-mistakes guide. `jac guide --export ~/.claude/skills` exports the compiler's bundled reference guides as auto-loading Agent Skills. Nightshift builds on all of this instead of reimplementing any of it.
+**The toolchain is already agent-ready.** The `jac` CLI ships formatting (`jac fmt` / `jac format .`), linting (`jac check --lint`, `jac lint . --fix`), whole-program type checking (`jac check`), and tests (run per package as `JAC_TEST_JOBS=auto jac test tests` via the binary's bundled runner — jaclang ships as one Zig-built `jac` binary, so there is no pip-installed jaclang and no `.venv`). A Model Context Protocol server is built into the binary — `jac mcp` — exposing `validate_jac` (full compile-pipeline type check), `check_syntax`, `lint` (with `auto_fix` returning corrected code), `format_jac`, plus resources for the grammar, docs, examples, and a common-AI-mistakes guide. `jac guide --export ~/.claude/skills` exports the compiler's bundled reference guides as auto-loading Agent Skills. Nightshift builds on all of this instead of reimplementing any of it.
 
 **The cleaner's brain.** [ponytail](https://github.com/DietrichGebert/ponytail) (MIT, ~75k stars) makes an agent apply a decision ladder before writing code — does this need to exist, is it already in the codebase, does stdlib/native cover it, can it be one line — and ships `/ponytail-audit` (whole-repo ranked report of what to delete/simplify, applies nothing) and `/ponytail-review` (same, on a diff). It carries four hard guardrails the agent may never cut: trust-boundary input validation, data-loss-preventing error handling, security measures, and accessibility basics. Its `ponytail:` comments form a harvestable tech-debt ledger.
 
@@ -66,7 +67,7 @@ Nightshift only ever operates on **existing** code, and only in these ways: dele
                                       │
                                       ▼
                           [4 Verify gate — fail closed]
-                            jac check · pytest jac -n auto · pre-commit
+                            jac check · jac test (per pkg) · pre-commit
                               red? ─▶ discard branch, log, continue
                                       │ green
                                       ▼
@@ -93,7 +94,7 @@ Acquire a lock file (`/tmp/nightshift.lock`) so overlapping runs are impossible;
 Run `jac format .` and `jac lint . --fix` (equivalently the MCP `lint` tool with `auto_fix`) across eligible paths, then `pre-commit run --all-files`. If the diff is non-empty, commit to `nightshift/YYYY-MM-DD/autofix` as `style: nightly jac fmt + lint autofix`. This branch goes through the same Stage 4 gate as everything else.
 
 ### Stage 3 — Tier 2: agentic clean
-One package per night on a rotation (`jac` → `jac-byllm` → `jac-client` → `jac-scale` → `jac-mcp` → `jac-super` → `jaseci-package` → repeat), so attention is spread and diffs stay reviewable.
+One package per night on a rotation (`jac` → `jac-byllm` → `jac-mcp` → `jac-scale` → repeat — the four package dirs that exist in the repo), so attention is spread and diffs stay reviewable.
 
 **Phase A — audit (read-only).** Headless call: prompt includes `/ponytail-audit` scoped to the night's package (skills and slash commands expand inside `-p` prompts). Tools locked to read-only. Output parsed into candidate findings.
 
@@ -112,7 +113,7 @@ claude -p "$(cat prompts/apply.md)" \
 Notes that matter: we intentionally do **not** pass `--bare`, because we *want* auto-discovery of the ponytail plugin, the exported Jac skills in `~/.claude/skills`, and the repo's `.mcp.json` (which registers `jac mcp` as a stdio server). `acceptEdits` lets the agent write files without prompting; everything else runs only through the scoped allow-list — no network tools, no unscoped bash, and `Bash(git push *)` is deliberately absent (the orchestrator pushes, not the agent). `--max-budget-usd` applies only on API-key billing; on a subscription, `--max-turns` is the cost brake. The apply prompt instructs the agent to validate every edited file via the MCP `validate_jac` tool before committing, honor ponytail's four never-cut guardrails, leave `ponytail:` comments where it consciously defers, and write the release-note fragment `docs/docs/community/release_notes/unreleased/<package>/0000.refactor.md` (placeholder number, fixed at promote time).
 
 ### Stage 4 — Verify gate (fail-closed)
-Per branch, in order, each with a time-box: `jac check` (whole-program type check), `pytest jac -n auto` (full suite; configurable to a scoped subset if the laptop budget demands), `pre-commit run --all-files`. Any red → the branch is deleted, the finding is marked `failed_verify` in the ledger (eligible for one retry on a future night, then auto-`rejected`), and the failure is summarized in the email. No partial shipping.
+Per branch, in order: `jac check` (whole-program type check), then `jac test tests` for each package that has a `tests/` dir (`jac`, `jac-byllm`, `jac-mcp`) via the bundled runner (`JAC_TEST_JOBS=auto`; one retry per package absorbs flakes), then `pre-commit run --all-files`. Any red → the branch is deleted, the finding is marked `failed_verify` in the ledger (eligible for one retry on a future night, then auto-`rejected`), and the failure is summarized in the email. No partial shipping.
 
 ### Stage 5 — Ship to fork
 Green branches are pushed to the fork. For each, a PR draft file is generated (spec §8) and committed to the **orphan branch `nightshift/drafts`** in the fork — an orphan branch so the fork's `main` stays a pristine mirror of upstream and draft files never contaminate a real PR's history. The ledger is updated (`status: drafted`).
@@ -138,7 +139,7 @@ date: 2026-07-10
 files: 6
 loc: {before: 512, after: 143}
 risk: low            # low | medium — medium requires extra morning scrutiny
-tests: "jac check ✓ · pytest jac -n auto ✓ (1,842 passed) · pre-commit ✓"
+tests: "jac check ✓ · jac test ✓ · pre-commit ✓"
 release_note: docs/docs/community/release_notes/unreleased/jac-client/0000.refactor.md
 ---
 # refactor(jac-client): remove dead render-path duplication
@@ -180,7 +181,7 @@ Net LOC removed or simplified per week; % of drafted branches you actually promo
 
 ## 13. Milestones
 
-- **M0 — Bootstrap (½ day):** fork + clone, `jac` toolchain installed and `jac check`/`pytest jac` green on a virgin clone (time the test run — it sets the §14-Q4 budget), Claude Code authed via `/login` on your Pro/Max account and verified headless (`claude -p "ping"` from a non-interactive shell), ponytail installed (`/plugin marketplace add DietrichGebert/ponytail` → `/plugin install ponytail@ponytail`; needs Node on PATH for its hooks), `jac guide --export ~/.claude/skills`, register the compiler server at local scope from inside the clone (`claude mcp add jac -- jac mcp` — stored in `~/.claude.json` keyed to the project path, so the clone stays a pristine mirror; **not** a committed `.mcp.json`), `gh` authed.
+- **M0 — Bootstrap (½ day):** fork + clone, `jac` toolchain built via `./scripts/fresh_env.sh` (Zig 0.16.0) and `jac check`/`jac test` green on a virgin clone (time the test run — it sets the §14-Q4 budget), `pipx install pre-commit` (do NOT `pre-commit install` — the gate runs it explicitly), Claude Code authed via `/login` on your Pro/Max account and verified headless (`claude -p "ping"` from a non-interactive shell), ponytail installed (`/plugin marketplace add DietrichGebert/ponytail` → `/plugin install ponytail@ponytail`; needs Node on PATH for its hooks), `jac guide --export ~/.claude/skills`, register the compiler server at local scope from inside the clone (`claude mcp add jac -- jac mcp` — stored in `~/.claude.json` keyed to the project path, so the clone stays a pristine mirror; **not** a committed `.mcp.json`), `gh` authed.
 - **M1 — Deterministic tier + email (1 day):** Stages 0–2 + 4–6 wired end to end; first real digest email lands.
 - **M2 — Agentic tier (1–2 days):** audit → select → apply on one package with all caps enforced; first drafted branch.
 - **M3 — Ledger + rotation (½ day):** dedupe across nights, package rotation, retry/reject lifecycle.
@@ -191,7 +192,7 @@ Net LOC removed or simplified per week; % of drafted branches you actually promo
 1. ~~OS of the machine~~ **Resolved: macOS** → LaunchAgent plan in §10.
 2. ~~Claude Code auth~~ **Resolved: Pro/Max subscription** → `--max-turns` is the cost brake (§9); `/login` once + `setup-token` fallback (§10).
 3. ~~Email transport~~ **Defaulted: stdlib `smtplib` over SSL with an app password**; swap to msmtp later if desired (isolated in one module).
-4. ~~Test scope~~ **Resolved: full `pytest jac -n auto` every night** — the 3 h envelope accommodates it. The M0 timing run now calibrates *how many themes fit per night*, not whether to subset the suite.
+4. ~~Test scope~~ **Resolved: full `jac test` (every package with tests) every night** — the 3 h envelope accommodates it. The M0 timing run now calibrates *how many themes fit per night*, not whether to subset the suite.
 5. ~~Ponytail mode~~ **Defaulted: `full` for the apply phase.** `ultra` may be enabled for the *audit's suggestions only* (never edits) after a few weeks of promote-rate data.
 6. ~~Discord courtesy ping~~ **Resolved: no ping** (owner decision). Consequence: the first upstream PRs introduce themselves on merit alone, so the promote bar should be extra conservative early — small diffs, obviously-correct deletions first.
 
@@ -203,7 +204,7 @@ Net LOC removed or simplified per week; % of drafted branches you actually promo
 # Jac toolchain
 jac format .            # formatter        jac lint . --fix   # lint w/ autofix
 jac check               # type-check gate  jac check --lint   # lint report
-pytest jac -n auto      # upstream's test invocation
+JAC_TEST_JOBS=auto jac test tests   # per-package tests (run inside each pkg dir); no pytest/.venv
 jac mcp                 # built-in MCP server (stdio default; --mode lite|standard|full)
 jac guide --export ~/.claude/skills   # export Jac guides as Agent Skills
 

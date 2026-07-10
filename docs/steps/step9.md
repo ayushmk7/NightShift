@@ -344,8 +344,9 @@ tier2_apply() {
             continue
         fi
 
-        # The ORCHESTRATOR writes the release-note fragment — the agent has no Write tool (TPRD S3-C)
-        local fragment="docs/docs/community/release_notes/unreleased/$pkg/0000.refactor.md"
+        # The ORCHESTRATOR writes the release-note fragment — the agent has no Write tool (TPRD S3-C).
+        # Fragment dir is the repo's name (jac->jaclang, jac-byllm->byllm), not the package name.
+        local fragment; fragment="$(ns_jac render_draft frag "$pkg")"
         mkdir -p "$(dirname "$REPO/$fragment")"
         ns_jac parse_result field release_note_md < "$LOG_DIR/report-$slug.json" > "$REPO/$fragment"
         git add "$fragment"

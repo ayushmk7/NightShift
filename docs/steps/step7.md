@@ -6,7 +6,7 @@ The harness's central invariant: **never ship a broken branch** (PRD goal 1) and
 **never ship a diff that escaped its declared scope** (threat T1's backstop). Two
 pieces: `scripts/check_scope.jac` (pure gate: changed paths vs theme allow-list vs
 protected globs) and `lib/verify.sh` (per-branch pipeline: scope → `jac check` →
-full `pytest jac -n auto` with one retry of failures → `pre-commit`; red ⇒ branch
+per-package `jac test tests` (one retry each) → `pre-commit`; red ⇒ branch
 deleted + ledger `failed_verify` + email autopsy line). Implements TechnicalPRD
 §7-S4 and the §12 failure rows.
 
@@ -28,8 +28,8 @@ Steps 2–3 (nslib, ledger). Consumes `queue.tsv` produced by steps 6 and 11.
    file outside the theme's declared list, or inside a protected glob, is discarded
    **no matter how green the tests are**.
 2. `jac check` — whole-program type check (minutes).
-3. `pytest jac -n auto` — the full suite, the expensive one; one automatic retry of
-   only-the-failures absorbs flakes (PRD §11).
+3. `jac test tests` per package (`jac`, `jac-byllm`, `jac-mcp`) via the bundled runner
+   (`JAC_TEST_JOBS=auto`); one retry per package absorbs flakes (PRD §11).
 4. `pre-commit` — with the self-mutation fold-in (commit the hook's fixes, demand a
    clean second pass).
 
@@ -117,6 +117,13 @@ test "allowed file inside a protected glob is still rejected" {
 # shellcheck shell=bash
 # lib/verify.sh — S4 (TechnicalPRD 7-S4): fail-closed gate. Any red after retry → branch deleted.
 
+# `jac test tests` must run from inside the package dir (needs its cwd).
+# ponytail: bounded by the night's 180m ceiling, not a per-gate gtimeout — gtimeout may be absent
+# and the jac timeout-fallback runs from NS_ROOT, which would break jac test's required cwd.
+run_pkg_tests() {
+    ( cd "$REPO/$1" && JAC_TEST_JOBS=auto "$NS_PATHS_JAC" test tests )
+}
+
 verify_main() {
     [ -f "$LOG_DIR/queue.tsv" ] || { ns_log S4 "no branches queued"; return 0; }
     local branch theme report shipped=0
@@ -133,7 +140,7 @@ verify_main() {
     return 0
 }
 
-# Gate order (each time-boxed): scope containment → jac check → pytest (one retry) → pre-commit.
+# Gate order: scope containment → jac check → jac test per pkg (one retry each) → pre-commit.
 verify_branch() {
     local branch=$1 theme=$2 t0 t1
     t0="$(date +%s)"
@@ -156,20 +163,26 @@ verify_branch() {
         return 1
     fi
 
-    # 3. full test suite; one retry of only the failures (flaky-test policy, PRD 11)
-    if ! ns_timebox "$NS_BUDGETS_BOX_VERIFY_MIN" "$NS_PATHS_VENV/bin/python" -m pytest jac -n auto -q; then
-        ns_log S4 "pytest red — retrying only the failures once"
-        if ! ns_timebox 15 "$NS_PATHS_VENV/bin/python" -m pytest jac --last-failed -q; then
-            verify_red "$branch" "pytest red after retry"
-            return 1
+    # 3. tests: jaseci ships one Zig-built jac binary with a bundled runner (no pytest, no .venv).
+    #    Run every package that has a tests/ dir; one retry per package absorbs flakes (PRD 11).
+    local tpkg
+    for tpkg in jac jac-byllm jac-mcp; do
+        [ -d "$REPO/$tpkg/tests" ] || continue
+        if ! run_pkg_tests "$tpkg"; then
+            ns_log S4 "$tpkg tests red — one retry"
+            if ! run_pkg_tests "$tpkg"; then
+                verify_red "$branch" "$tpkg tests red after retry"
+                return 1
+            fi
         fi
-    fi
+    done
 
-    # 4. pre-commit; if hooks self-mutate, fold the mutation in and demand a clean second pass
-    if ! "$NS_PATHS_VENV/bin/pre-commit" run --all-files; then
+    # 4. pre-commit (standalone contributor tool from PATH, installed via pipx at M0 — NOT a git
+    #    hook, so orchestrator commits stay unhooked). Hooks may self-mutate; fold in, demand clean.
+    if ! pre-commit run --all-files; then
         git add -A
         git diff --cached --quiet || git commit -m "style: pre-commit autofix (nightshift)"
-        if ! "$NS_PATHS_VENV/bin/pre-commit" run --all-files; then
+        if ! pre-commit run --all-files; then
             verify_red "$branch" "pre-commit red"
             return 1
         fi
@@ -180,7 +193,7 @@ verify_branch() {
     local dur_min=$(( (t1 - t0) / 60 )); [ "$dur_min" -lt 1 ] && dur_min=1
     local old_est; old_est="$(ns_jac ledger state-get verify_estimate_min "$STATE" | tr -d '"')"
     ns_jac ledger state-set verify_estimate_min $(( ( ${old_est:-30} + dur_min ) / 2 )) "$STATE"
-    echo "jac check ✓ · pytest jac -n auto ✓ · pre-commit ✓ (${dur_min} min)" \
+    echo "jac check ✓ · jac test (jac/jac-byllm/jac-mcp) ✓ · pre-commit ✓ (${dur_min} min)" \
         > "$LOG_DIR/tests-$(basename "$branch").txt"
     git checkout "$NS_REPO_DEFAULT_BRANCH"
     return 0
@@ -252,8 +265,8 @@ the red path (branch gone, ledger updated). The chaos/e2e coverage is step 14's.
 - Glob semantics: `**` crosses directories via `PurePosixPath.full_match`
   (Python ≥ 3.13 — jac 0.16.1 ships on 3.13). A later `!glob` in the list carves an
   exception out of earlier positives; order matters.
-- pytest's retry uses `--last-failed`, which needs pytest's cache from the failing
-  run — don't add `-p no:cacheprovider` to "clean things up".
+- `jac test` has no `--last-failed`, so the retry re-runs the whole package once — simpler
+  and good enough to absorb a flake; a persistent failure still fails twice and is discarded.
 - The verify-estimate update (`(old + observed) / 2`) is the self-tuning input to
   step 10's time projection. First night uses the default 30 min; it converges in
   two or three nights.

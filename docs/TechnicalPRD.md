@@ -1,12 +1,14 @@
 # Technical PRD — Nightshift v0.4
 
-Companion to `PRD-nightshift.md`. That document says *what and why*; this one says *exactly how*, down to commands, schemas, prompts, and failure semantics. Where the two disagree, the product PRD's intent wins and this doc gets fixed.
+Companion to `PRD-nightshift.md`. That document says *what and why*; this one says *exactly how*.
+
+**v0.5 (2026-07-10):** corrected for the real repo — single Zig-built `jac` binary (no pip jaclang, no `.venv`), tests via bundled `jac test tests` per package (not `pytest jac -n auto`), 4 package dirs, fragment dirs `jac`→`jaclang`/`jac-byllm`→`byllm`, pre-commit bans em-dashes + AI co-author trailers and is run explicitly (never installed as a git hook). Note: the "Python-stdlib helpers" phrasing below predates the bash+Jac decision — the shipped harness's helpers are Jac (`scripts/*.jac`); `docs/steps/` is the current source of truth for the code.
 
 ---
 
 ## 1. System summary (one paragraph)
 
-A launchd-scheduled orchestrator (`nightshift.sh`, plain bash + a few Python-stdlib helpers) runs nightly on a Mac. It syncs a fork of `jaseci-labs/jaseci`, applies a deterministic clean (jac fmt/lint + pre-commit), then runs bounded headless Claude Code sessions (ponytail skill + Jac agent skills + `jac mcp` compiler server) to audit and apply cleanup themes, gates every branch behind `jac check` + full `pytest jac -n auto` + `pre-commit`, pushes survivors to the fork with PR-draft `.md` files on an orphan `nightshift/drafts` branch, updates a JSONL ledger, and emails a digest. Morning commands `promote`/`discard` open the real PR (deleting its draft) or bury the branch (remembering why).
+A launchd-scheduled orchestrator (`nightshift.sh`, plain bash + a few Python-stdlib helpers) runs nightly on a Mac. It syncs a fork of `jaseci-labs/jaseci`, applies a deterministic clean (jac fmt/lint + pre-commit), then runs bounded headless Claude Code sessions (ponytail skill + Jac agent skills + `jac mcp` compiler server) to audit and apply cleanup themes, gates every branch behind `jac check` + full `jac test` (per package) + `pre-commit`, pushes survivors to the fork with PR-draft `.md` files on an orphan `nightshift/drafts` branch, updates a JSONL ledger, and emails a digest. Morning commands `promote`/`discard` open the real PR (deleting its draft) or bury the branch (remembering why).
 
 ## 2. Feasibility audit
 
@@ -22,11 +24,11 @@ Every load-bearing assumption, its status, and the evidence. **V** = verified ag
 | 6 | `--allowedTools` scoped rules (`Bash(jac fmt *)`), `--permission-mode acceptEdits` semantics, `--max-turns`, `--max-budget-usd`, `--output-format json` (result + session_id + total_cost_usd) | V | official headless docs + CLI reference |
 | 7 | Pro/Max subscription covers headless; `claude setup-token` mints a 1-year, inference-only `CLAUDE_CODE_OAUTH_TOKEN`; a set `ANTHROPIC_API_KEY` silently outranks the subscription | V | official authentication docs |
 | 8 | `claude mcp add jac -- jac mcp` at **local scope** (default) stores config in `~/.claude.json` keyed to the project path — nothing written inside the clone | V | official MCP docs; scopes local/user → `~/.claude.json`, project → committed `.mcp.json` (which we deliberately avoid) |
-| 9 | Upstream PR requirements: focused PRs, pre-commit green, release-note fragment `docs/docs/community/release_notes/unreleased/<pkg>/<PR#>.<category>.md` (or `skip-release-notes-check` label), tests via `pytest jac -n auto` | V | docs.jaseci.org contributing guide |
+| 9 | Upstream PR requirements: focused PRs, pre-commit green, release-note fragment `docs/docs/community/release_notes/unreleased/<dir>/<PR#>.<category>.md` where `<dir>` maps from the package (`jac`→`jaclang`, `jac-byllm`→`byllm`, `jac-mcp`, `jac-scale`); tests via per-package `jac test tests` | V | repo CONTRIBUTING.md + check-release-notes.sh |
 | 10 | `gh repo sync --source`, `gh pr create --repo <upstream> --head <owner>:<branch> --body-file`, orphan branches, `git worktree` | S | standard git/gh, years-stable |
 | 11 | launchd `StartCalendarInterval` fires missed jobs on wake; `caffeinate -i` blocks idle sleep; `pmset repeat wakeorpoweron` schedules wake | S | standard macOS |
 | 12 | Python stdlib `smtplib` + SSL + app password sends mail from a residential Mac | S | standard; provider app-password required (Gmail: 2FA + app password) |
-| 13 | Full `pytest jac -n auto` wall time on the target Mac | **E** | M0 measures it; calibrates themes/night inside the 65-min verify box |
+| 13 | Full per-package `jac test` wall time on the target Mac | **E** | M0 measures it; calibrates themes/night inside the 65-min verify box |
 | 14 | launchd job can use Keychain-stored subscription credentials | **E** | expected-yes (user-domain LaunchAgent, user logged in); fallback = setup-token env var, so auth cannot hard-block the project |
 | 15 | `node`, `jac`, `claude`, `gh` resolvable under launchd's minimal PATH | **E** | mitigated by explicit `PATH` in the plist + absolute-path config (§16); this is the #1 documented cause of stdio/plugin silence |
 
@@ -42,7 +44,7 @@ launchd (02:00, user domain)
         ├─ lib/tier1       ─ jac fmt/lint --fix, pre-commit       [S2]
         ├─ lib/tier2       ─ audit → select → apply (claude -p)   [S3]
         │     └─ talks to: ponytail plugin · ~/.claude/skills(jac) · mcp jac (stdio → jac mcp)
-        ├─ lib/verify      ─ jac check · pytest · pre-commit      [S4]
+        ├─ lib/verify      ─ jac check · jac test · pre-commit    [S4]
         ├─ lib/ship        ─ push branches, write drafts, ledger  [S5]
         └─ lib/email       ─ digest via smtplib (trap EXIT)       [S6]
 morning (human)
@@ -83,7 +85,9 @@ Trust boundaries: the **agent** may read the repo and edit files in `repo/` only
 | git ≥ 2.40 | worktrees, orphan branch | Xcode CLT / brew | — |
 | python3 ≥ 3.10 | email/parse/select helpers (stdlib only) | ships with macOS/brew | — |
 | coreutils (gtimeout) | stage time-boxes | brew | optional — `scripts/timeout.py` is the fallback |
-| pre-commit, pytest(-xdist) | verify gate | repo's dev setup (M0) | run via the repo venv's absolute paths |
+| pre-commit | verify gate | `pipx install pre-commit` (M0); NOT installed as a git hook | run explicitly in S4, from PATH |
+| jac (bundled test runner) | tests | Zig build via `./scripts/fresh_env.sh` | `jac test tests` per pkg; no pytest, no `.venv` |
+| zig 0.16.0 | build the jac binary | brew | pinned; `fresh_env.sh` needs it |
 
 All binaries are resolved once at M0 and pinned as absolute paths in `nightshift.toml [paths]`; the plist additionally exports `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`. Belt and suspenders, because a silent `command not found` under launchd is this project's most likely first-week failure.
 
@@ -98,7 +102,7 @@ fork           = "<you>/jaseci"
 default_branch = "main"
 
 [rotation]                       # one package per night, round-robin
-packages   = ["jac", "jac-byllm", "jac-client", "jac-scale", "jac-mcp", "jac-super", "jaseci-package"]
+packages   = ["jac", "jac-byllm", "jac-mcp", "jac-scale"]   # the 4 package dirs that exist
 
 [budgets]
 themes_per_night   = 3
@@ -133,7 +137,7 @@ smtp_host = "smtp.gmail.com"
 smtp_port = 465                  # SSL; creds from ~/.nightshift.env (SMTP_USER/SMTP_PASS)
 
 [paths]                          # absolute, pinned at M0
-jac = "" ; claude = "" ; gh = "" ; node_dir = "" ; venv = ""
+jac = "" ; claude = "" ; gh = "" ; node_dir = ""   # no venv: pre-commit comes from PATH (pipx)
 ```
 
 `~/.nightshift.env`: `SMTP_USER`, `SMTP_PASS`, optional `CLAUDE_CODE_OAUTH_TOKEN`. The orchestrator **unsets `ANTHROPIC_API_KEY`** unconditionally after sourcing env (auth footgun, feasibility row 7).
@@ -206,7 +210,7 @@ jac clean --cache                                  # stale-bytecode footgun, doc
 git diff --name-only main...HEAD | scripts/check_scope.py --theme "$THEME_JSON" --protect config/nightshift.toml
 # 2. gates, each under gtimeout, budgets from [budgets]:
 jac check
-python -m pytest jac -n auto                       # via repo venv; ONE retry of only-failed on red
+for pkg in jac jac-byllm jac-mcp; do (cd $pkg && JAC_TEST_JOBS=auto jac test tests); done  # bundled runner; ONE retry per pkg on red
 pre-commit run --all-files
 ```
 Any red after retry → `git branch -D`, ledger `failed_verify` (attempts++), one-line autopsy to the email. Scope containment is the anti-prompt-injection backstop: a diff touching *any* file outside the theme's declared list or inside a protected glob is discarded no matter how green the tests are.
@@ -289,7 +293,7 @@ A rebase conflict or re-gate red at promote time downgrades the branch to `faile
 | Apply session timeout/turn-cap | gtimeout / is_error | branch discarded, `failed_verify` | per-theme autopsy |
 | Diff outside scope | check_scope | branch discarded regardless of tests | flagged prominently (possible injection) |
 | Tests red ×2 | S4 | branch discarded, attempts++ | failing tests listed |
-| pytest exceeds box | gtimeout | treated as red | "verify box exceeded — lower themes or raise box" |
+| jac test exceeds box | gtimeout | treated as red | "verify box exceeded — lower themes or raise box" |
 | SMTP down | sendmail.py | EMAIL_FAILED marker + osascript banner | (silence + banner) |
 | Wall-clock ceiling | master gtimeout on run | kill children, trap still emails | "ceiling hit at S<k>" |
 | Crash mid-run, rerun same day | `.done-S*` markers | resume after last completed stage | notes resume |
@@ -304,7 +308,7 @@ Everything under `logs/<date>/`: `run.log` (orchestrator, timestamped), per-stag
 
 ## 15. Time-budget math (defaults)
 
-180 = 15 (S0–S2) + 90 (S3: ≤15 audit + ≤3×25 apply) + 65 (S4: ≤4 branches — autofix + 3 themes; requires per-branch verify ≈ ≤16 min mean, hence M0's timing run gates `themes_per_night`) + 10 (S5–S6). If M0 measures pytest at >20 min, first remedy is `themes_per_night = 2`, not subsetting the suite (product-PRD Q4 stands).
+180 = 15 (S0–S2) + 90 (S3: ≤15 audit + ≤3×25 apply) + 65 (S4: ≤4 branches — autofix + 3 themes; requires per-branch verify ≈ ≤16 min mean, hence M0's timing run gates `themes_per_night`) + 10 (S5–S6). If M0 measures `jac test` at >20 min, first remedy is `themes_per_night = 2`, not subsetting the suite (product-PRD Q4 stands).
 
 ## 16. macOS integration
 
