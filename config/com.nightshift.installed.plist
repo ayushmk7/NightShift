@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.nightshift</string>
+  <!-- /bin/bash (granted Full Disk Access in System Settings) runs the volume script; passing the
+       script as a bash ARGUMENT (read, not execve'd) + FDA lets it and its children execute the
+       binaries under /Volumes/ExtremePro. caffeinate -i keeps the machine awake during the run. -->
+  <key>ProgramArguments</key><array>
+    <string>/usr/bin/caffeinate</string><string>-i</string>
+    <string>/bin/bash</string>
+    <string>/Volumes/ExtremePro/JaseciLabs/NightShift/bin/nightshift.sh</string><string>run</string>
+  </array>
+  <key>StartCalendarInterval</key><dict>
+    <key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer>
+  </dict>
+  <key>EnvironmentVariables</key><dict>
+    <!-- launchd's minimal PATH is the #1 documented cause of silent failures (TPRD row 15).
+         Include ~/.local/bin (jac SYS, claude, pre-commit) and /opt/homebrew/bin (gh, gtimeout). -->
+    <key>PATH</key><string>/Users/ayush/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <!-- These are opened BY LAUNCHD (which has NO Full Disk Access) before spawn, so they MUST live on
+       internal disk. The harness's own detailed logs still go to the volume via the FDA'd bash. -->
+  <key>StandardOutPath</key><string>/Users/ayush/Library/Logs/nightshift-launchd.out</string>
+  <key>StandardErrorPath</key><string>/Users/ayush/Library/Logs/nightshift-launchd.err</string>
+</dict></plist>
