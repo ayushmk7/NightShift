@@ -65,7 +65,7 @@ verify_branch() {
     t0="$(date +%s)"
     cd "$REPO"
     git checkout "$branch"
-    "$NS_PATHS_JAC_REPO" clean --cache || true
+    rm -rf "$REPO/.jac"        # `jac clean --cache` prompts [y/N] non-interactively -> aborts; nuke directly
 
     # 1. scope containment FIRST — reject before spending a second on tests (anti-injection, T1)
     if [ "$theme" != "-" ]; then
@@ -76,14 +76,39 @@ verify_branch() {
         fi
     fi
 
-    # 2. type-check the changed .jac files. A whole-repo `jac check` would fail on the repo's
-    #    intentionally-broken test fixtures; import resolution still pulls each file's deps in.
-    local changed_jac
+    # 2. type-check changed .jac files, BASELINE-DIFF style. The repo is not clean under
+    #    `jac check` on main (pre-existing E1053 "Cannot assign Any" etc.), so a plain "must pass"
+    #    gate would reject any branch that merely touches such a file. Instead: check the changed
+    #    files on the branch AND on their main content, fail only on NEW errors (checkgate.jac).
+    #    A whole-repo check is avoided anyway — it would trip the repo's broken test fixtures.
+    local changed_jac main_jac f br mr
     changed_jac="$(git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD" | grep '\.jac$' || true)"
     if [ -n "$changed_jac" ]; then
+        br="$LOG_DIR/check-branch-$(basename "$branch").txt"
+        mr="$LOG_DIR/check-main-$(basename "$branch").txt"
+        # branch side (the branch is checked out)
+        rm -rf "$REPO/.jac"
         # shellcheck disable=SC2086  # word-split into per-file args; jac paths have no spaces
-        if ! ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $changed_jac ); then
-            verify_red "$branch" "jac check red"
+        ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $changed_jac ) > "$br" 2>&1 || true
+        # main side: only files that exist on main (new-on-branch files have no baseline -> their
+        # errors all count as new). Restore just those files to main content, check, then put back.
+        main_jac=""
+        for f in $changed_jac; do
+            git -C "$REPO" cat-file -e "$NS_REPO_DEFAULT_BRANCH:$f" 2>/dev/null && main_jac="$main_jac $f"
+        done
+        if [ -n "$main_jac" ]; then
+            # shellcheck disable=SC2086
+            git -C "$REPO" checkout "$NS_REPO_DEFAULT_BRANCH" -- $main_jac
+            rm -rf "$REPO/.jac"
+            # shellcheck disable=SC2086
+            ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $main_jac ) > "$mr" 2>&1 || true
+            # shellcheck disable=SC2086
+            git -C "$REPO" checkout HEAD -- $main_jac        # back to branch content
+        else
+            : > "$mr"
+        fi
+        if ! ns_jac checkgate gate "$mr" "$br"; then
+            verify_red "$branch" "jac check: new type errors vs main (see $(basename "$br"))"
             return 1
         fi
     fi

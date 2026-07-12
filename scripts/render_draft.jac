@@ -125,7 +125,7 @@ def git_report(repo_dir: str, summary: str) -> dict {
     };
 }
 
-with entry {
+with entry:__main__ {   # only dispatch the CLI on direct `jac run`; sendmail.jac imports split_draft
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "frag" and len(args) == 3 {
