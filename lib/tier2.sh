@@ -30,24 +30,30 @@ tier2_main() {
 
 # Phase A — audit, physically read-only (dontAsk + no Edit/Write in the allow-list)
 tier2_audit() {
-    local pkg=$1 prompt
+    local pkg=$1 prompt attempt
     prompt="$(render_prompt "$NS_ROOT/prompts/audit.md" \
         "pkg=$pkg" "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
 
-    # dev jac first on PATH so the agent's Bash(jac *) and the jac MCP server hit the repo binary
-    (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
-        && ns_timebox "$NS_BUDGETS_AUDIT_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
-        --permission-mode dontAsk \
-        --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
-        --max-turns 25 --output-format json) > "$LOG_DIR/audit.json" || true
+    # Up to 2 attempts: a transient API error (e.g. "Connection closed mid-response") shouldn't
+    # burn the whole agentic tier. Each attempt is time-boxed; the parse decides success.
+    for attempt in 1 2; do
+        # dev jac first on PATH so the agent's Bash(jac *) and the jac MCP server hit the repo binary
+        (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
+            && ns_timebox "$NS_BUDGETS_AUDIT_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
+            --permission-mode dontAsk \
+            --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
+            --max-turns 25 --output-format json) > "$LOG_DIR/audit.json" || true
 
-    ns_jac parse_result meta < "$LOG_DIR/audit.json" > "$LOG_DIR/meta-audit.json" || true
+        ns_jac parse_result meta < "$LOG_DIR/audit.json" > "$LOG_DIR/meta-audit.json" || true
 
-    if ! ns_jac parse_result findings < "$LOG_DIR/audit.json" > "$LOG_DIR/findings.json"; then
-        ns_fail "audit ($pkg)" "malformed findings JSON (exit 50) — agentic tier skipped tonight"
-        return 1
-    fi
-    ns_log S3 "audit produced $(grep -c '"file"' "$LOG_DIR/findings.json" || echo 0) findings"
+        if ns_jac parse_result findings < "$LOG_DIR/audit.json" > "$LOG_DIR/findings.json"; then
+            ns_log S3 "audit produced $(grep -c '"file"' "$LOG_DIR/findings.json" || echo 0) findings"
+            return 0
+        fi
+        ns_log S3 "audit attempt $attempt failed to parse (transient API error?) — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"
+    done
+    ns_fail "audit ($pkg)" "malformed/failed audit after retry (exit 50) — agentic tier skipped tonight"
+    return 1
 }
 
 # Phase B — select (pure function in selector.jac; deterministic, unit-tested)
