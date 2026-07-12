@@ -17,15 +17,24 @@ pkg_test_raw() {
             ( cd "$REPO/jac" && HOME="$H" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test tests/ --ignore tests/compiler ) >> "$out" 2>&1 || true
             ( cd "$REPO/jac" && HOME="$H" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test tests/compiler ) >> "$out" 2>&1 || true ;;
         jac-byllm)
-            ( cd "$REPO" && HOME="$H" JAC_TEST_JOBS=auto "$NS_PATHS_JAC_REPO" test jac-byllm/tests ) >> "$out" 2>&1 || true ;;
+            # byllm SOURCE + TESTS both live in the jac tree; the tests SHARE a SQLite mock-LLM cache
+            # so they must run SERIAL (JAC_TEST_JOBS=0), exactly as ci.yml does. Parallel = flaky.
+            ( cd "$REPO" && HOME="$H" JAC_TEST_JOBS=0 "$NS_PATHS_JAC_REPO" test jac/jaclang/byllm/tests ) >> "$out" 2>&1 || true ;;
         *) return 2 ;;
     esac
 }
 
-# The gated packages whose files a branch actually changed (diff is truth, covers autofix too).
+# Map each changed path to the test-package that actually COVERS it, emit the unique set.
+# byllm SOURCE lives under jac/jaclang/byllm/** but its TESTS live in jac-byllm/tests, so a
+# byllm-only change must gate on the (small) byllm suite, NOT the large, env-flaky jac core suite.
+# `cut -d/ -f1` got this wrong (jac/jaclang/byllm -> "jac" -> ran core tests full of CEF/pip flakes).
 gated_pkgs_from_diff() {
-    git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD" \
-        | cut -d/ -f1 | sort -u | grep -E '^(jac|jac-byllm)$' || true
+    git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD" | while IFS= read -r p; do
+        case "$p" in
+            jac/jaclang/byllm/*|jac-byllm/*) echo jac-byllm ;;
+            jac/*)                           echo jac ;;
+        esac
+    done | sort -u
 }
 
 # Record the per-package baseline of already-failing tests on main. Slow (runs the real suites);
@@ -121,8 +130,16 @@ verify_branch() {
         raw="$LOG_DIR/tests-raw-$(basename "$branch")-$tpkg.txt"
         pkg_test_raw "$tpkg" "$raw"
         if ! ns_jac testgate gate "$tpkg" "$raw" "$BASELINE_DIR"; then
-            verify_red "$branch" "$tpkg: new test failures vs baseline (see $(basename "$raw"))"
-            return 1
+            # One retry: the target suite has documented flaky tests (ci.yml retries `-x || -x`).
+            # Only a failure that reproduces on a second run counts.
+            # ponytail: two *different* flakes across the two runs could still red; acceptable —
+            #           the branch just gets re-attempted next night. Tighten to id-intersection if it bites.
+            ns_log S4 "$tpkg: new failures on run 1 — retrying once (flaky-test guard)"
+            pkg_test_raw "$tpkg" "$raw"
+            if ! ns_jac testgate gate "$tpkg" "$raw" "$BASELINE_DIR"; then
+                verify_red "$branch" "$tpkg: new test failures vs baseline (2 runs; see $(basename "$raw"))"
+                return 1
+            fi
         fi
     done
 
