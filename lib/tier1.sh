@@ -6,9 +6,11 @@ tier1_main() {
     cd "$REPO"
     git checkout -B "$branch" "$NS_REPO_DEFAULT_BRANCH"
 
-    "$NS_PATHS_JAC_REPO" clean --cache || true         # stale-bytecode footgun (upstream-documented)
-    "$NS_PATHS_JAC_REPO" format .                      # respects .jacignore
-    "$NS_PATHS_JAC_REPO" lint . --fix || true
+    rm -rf "$REPO/.jac"                                # `jac clean --cache` prompts [y/N] non-interactively -> aborts
+    # `jac format`/`jac lint` were removed (CLI cleanup #7255); `jac fmt --lintfix` does both in one
+    # pass, respects .jacignore. (Avoids a separate `jac check --lint` sweep, which would type-check
+    # the whole repo incl. its intentionally-broken test fixtures.)
+    "$NS_PATHS_JAC_REPO" fmt . --lintfix || true
 
     # The formatter runs repo-wide; protected paths must never ship edited (PRD 9).
     local protected
