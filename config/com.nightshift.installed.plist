@@ -3,25 +3,24 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.nightshift</string>
-  <!-- /bin/bash (granted Full Disk Access in System Settings) runs the volume script directly as
-       launchd's immediate child. TCC attributes external-volume disk access to the immediate
-       spawning process: with caffeinate wrapping bash (launchd->caffeinate->bash), the FDA grant on
-       bash never applied and every run died EPERM before touching a file. nightshift.sh
-       self-caffeinates instead (spawns caffeinate as ITS OWN child once started). -->
+  <!-- macOS TCC hangs (never errors, blocks forever in `open`/`getcwd`) any HEADLESS background
+       daemon -- launchd LaunchAgent, no WindowServer session -- that touches an external volume,
+       across every process identity it forks (jac's python, git, claude, ...), not just the first.
+       Full Disk Access on individual binaries doesn't scale to a whole toolchain. Fix: have launchd
+       ask Terminal.app to run the script instead of running it directly. A real Terminal session is
+       NOT subject to this restriction (same reason a manual `bin/nightshift.sh run` from an
+       interactive terminal always worked fine) -- osascript's automation of Terminal needs a
+       one-time "Allow" click the first time this fires. -->
   <key>ProgramArguments</key><array>
-    <string>/bin/bash</string>
-    <string>/Volumes/ExtremePro/JaseciLabs/NightShift/bin/nightshift.sh</string><string>run</string>
+    <string>/usr/bin/osascript</string>
+    <string>-e</string>
+    <string>tell application "Terminal" to do script "/Volumes/ExtremePro/JaseciLabs/NightShift/bin/nightshift.sh run; exit"</string>
   </array>
   <key>StartCalendarInterval</key><dict>
     <key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer>
   </dict>
-  <key>EnvironmentVariables</key><dict>
-    <!-- launchd's minimal PATH is the #1 documented cause of silent failures (TPRD row 15).
-         Include ~/.local/bin (jac SYS, claude, pre-commit) and /opt/homebrew/bin (gh, gtimeout). -->
-    <key>PATH</key><string>/Users/ayush/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-  </dict>
-  <!-- These are opened BY LAUNCHD (which has NO Full Disk Access) before spawn, so they MUST live on
-       internal disk. The harness's own detailed logs still go to the volume via the FDA'd bash. -->
+  <!-- These are opened BY LAUNCHD before spawning osascript, so they must live on internal disk.
+       The harness's own detailed logs still go to the volume as always. -->
   <key>StandardOutPath</key><string>/Users/ayush/Library/Logs/nightshift-launchd.out</string>
   <key>StandardErrorPath</key><string>/Users/ayush/Library/Logs/nightshift-launchd.err</string>
 </dict></plist>

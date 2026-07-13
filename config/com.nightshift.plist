@@ -3,10 +3,16 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.nightshift</string>
-  <!-- bash runs the script directly (no caffeinate wrapper): TCC attributes external-volume disk
-       access to the immediate spawning process, so if launchd->caffeinate->bash, Full Disk Access
-       granted to /bin/bash never applies (caffeinate would need its own grant). nightshift.sh
-       self-caffeinates instead (spawns caffeinate as ITS child, watching its own pid). -->
+  <!-- Assumes the standard internal-disk layout (~/nightshift): a plain launchd daemon can read/exec
+       here fine, no special handling needed. nightshift.sh self-caffeinates + self-timeboxes
+       internally (bin/nightshift.sh ns_run()), so ProgramArguments stays a direct bash invocation.
+
+       IF THIS REPO LIVES ON AN EXTERNAL VOLUME instead: macOS TCC hangs (blocks forever, no error)
+       any headless launchd daemon that touches an external volume, across every process identity it
+       forks -- Full Disk Access on individual binaries does not scale to a whole toolchain (jac,
+       git, claude, python, ...). Use config/com.nightshift.installed.plist's pattern instead: have
+       launchd ask Terminal.app to run the script (osascript `do script`), since a real Terminal
+       session is not subject to this restriction. -->
   <key>ProgramArguments</key><array>
     <string>/bin/bash</string>
     <string>/Users/YOURUSER/nightshift/bin/nightshift.sh</string><string>run</string>
