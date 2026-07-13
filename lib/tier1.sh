@@ -8,11 +8,19 @@ tier1_main() {
 
     rm -rf "$REPO/.jac"                                # `jac clean --cache` prompts [y/N] non-interactively -> aborts
     # `jac format`/`jac lint` were removed (CLI cleanup #7255); `jac fmt --lintfix` does both in one
-    # pass, respects .jacignore. (Avoids a separate `jac check --lint` sweep, which would type-check
-    # the whole repo incl. its intentionally-broken test fixtures.)
-    "$NS_PATHS_JAC_REPO" fmt . --lintfix || true
+    # pass, respects .jacignore.
+    #
+    # Scoped to jac/jaclang/byllm, NOT repo-wide (`.`), for reasons found the hard way on the first
+    # real night: a repo-wide pass (a) maps via gated_pkgs_from_diff to the "jac" core package,
+    # triggering its ~95min test suite on EVERY autofix night — the nightly wall-clock budget can't
+    # absorb that; (b) touches hundreds of files already listed in .jacignore for known, pre-existing
+    # type-check gaps, where a blind auto-fix is genuinely risky, not "near-zero risk" as S2 is meant
+    # to be; (c) jac-mcp/ is an empty placeholder (nothing to format) and jac/jaclang/scale has no
+    # test gate yet (needs k8s). byllm is the one subtree with a proven, fast, baseline-diff-gated
+    # test suite (see lib/verify.sh) — same scope tier2's agentic apply already trusts.
+    "$NS_PATHS_JAC_REPO" fmt jac/jaclang/byllm --lintfix || true
 
-    # The formatter runs repo-wide; protected paths must never ship edited (PRD 9).
+    # Backstop even though the formatter is scoped now: protected paths must never ship edited (PRD 9).
     local protected
     protected="$(git diff --name-only | ns_jac check_scope protected "$CONFIG")"
     if [ -n "$protected" ]; then
@@ -20,8 +28,12 @@ tier1_main() {
         echo "$protected" | while IFS= read -r p; do git checkout -- "$p"; done
     fi
 
-    # pre-commit (from PATH, pipx-installed at M0) may self-mutate on the first pass; the second must pass
-    ns_precommit run --all-files || ns_precommit run --all-files
+    # pre-commit (from PATH, pipx-installed at M0) may self-mutate on the first pass; the second must pass.
+    # SKIP jac-format: that hook itself shells out to `jac fmt --lintfix` against EVERY .jac file in
+    # the repo on `--all-files` (its own `files: \.jac$` pattern, not scoped to our diff), completely
+    # undoing the scoping above the moment it runs — confirmed live: with it included, this stage was
+    # still running past 2 minutes. The scoped fmt call three lines up already did this job.
+    SKIP=jac-format ns_precommit run --all-files || SKIP=jac-format ns_precommit run --all-files
 
     git add -A
     if git diff --cached --quiet; then
