@@ -21,13 +21,18 @@ def frontmatter_lines(d: dict) -> list[str] {
         lines.append(key + ": " + json.dumps(d[key]));
     }
     lines.append("files: " + json.dumps(len(as_list(d["files"]))));
-    lines.append("loc: " + json.dumps({"before": as_int(d["loc_before"]), "after": as_int(d["loc_after"])}));
+    # "loc_before"/"loc_after" carry real git-diff removed/added line counts (ship.sh always
+    # overrides these via `git diff --numstat`, not the agent's self-reported file line count).
+    lines.append("loc: " + json.dumps({"added": as_int(d["loc_after"]), "removed": as_int(d["loc_before"])}));
     lines.append("---");
     return lines;
 }
 
 def body_lines(d: dict) -> list[str] {
-    loc_delta: int = as_int(d["loc_before"]) - as_int(d["loc_after"]);
+    added: int = as_int(d["loc_after"]);
+    removed: int = as_int(d["loc_before"]);
+    net: int = added - removed;
+    net_str: str = ("+" + str(net)) if net >= 0 else ("-" + str(-net));
     lines: list[str] = [
         "# " + str(d["title"]),
         "",
@@ -45,7 +50,7 @@ def body_lines(d: dict) -> list[str] {
         lines.append("- `" + str(f) + "`");
     }
     lines.append("");
-    lines.append("Net: **-" + str(loc_delta) + " LOC** (" + str(d["loc_before"]) + " → " + str(d["loc_after"]) + ").");
+    lines.append("Lines: **+" + str(added) + " -" + str(removed) + "** (net " + net_str + ").");
     skipped: list = as_list(d.get("skipped", []));
     if skipped {
         lines.append("");
@@ -172,10 +177,12 @@ test "render then split roundtrips the frontmatter" {
     text: str = render(d);
     (meta, body) = split_draft(text);
     assert meta["branch"] == d["branch"];
-    assert meta["loc"]["before"] == 512;
+    assert meta["loc"]["removed"] == 512;
+    assert meta["loc"]["added"] == 143;
     assert meta["files"] == 1;
     assert meta["release_note"] == "docs/docs/community/release_notes/unreleased/jac-client/0000.refactor.md";
     assert body.startswith("# refactor(jac-client):");
-    assert "-369 LOC" in body;
+    assert "+143 -512" in body;
+    assert "net -369" in body;
     assert "Consciously deferred" in body;
 }

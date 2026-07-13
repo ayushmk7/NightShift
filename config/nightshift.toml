@@ -35,7 +35,7 @@ globs = [
 ]
 
 [email]
-to        = "community@jaseci.org"                # <- set at M0
+to        = "contactayushmadhav@gmail.com"
 from      = "nightshift@localhost"
 smtp_host = "smtp.gmail.com"
 smtp_port = 465                              # SSL; creds live in ~/.nightshift.env, never here

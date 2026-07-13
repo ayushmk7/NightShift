@@ -32,9 +32,18 @@ ship_branch() {
     # explicit refspec, only nightshift/* refs, never force (threat T3)
     ns_git_push "$REPO" -u origin "refs/heads/$branch:refs/heads/$branch"
 
+    # Real added/removed line counts from git itself, not the agent's self-reported loc_before/after
+    # (which is a FILE line count, not a diff stat, and was off by a few lines on a real run: agent
+    # said +11 net, actual diff was +90/-77). Overrides render()'s loc_before/loc_after args below --
+    # same convention render_draft.jac's git_report() already uses for tier-1's own reports.
+    local added removed
+    read -r added removed < <(git -C "$REPO" diff --numstat "$NS_REPO_DEFAULT_BRANCH...$branch" \
+        | awk '{if ($1 ~ /^[0-9]+$/) a+=$1; if ($2 ~ /^[0-9]+$/) r+=$2} END {print a+0, r+0}')
+
     draft_path="$DRAFTS/drafts/$NS_DATE--$slug.md"
     ns_jac render_draft render "$report" \
         "branch=$branch" "package=$pkg" "date=$NS_DATE" "tests=$tests_line" \
+        "loc_before=$removed" "loc_after=$added" \
         > "$draft_path"
 
     # findings on this branch: drafted (autofix has no ledger rows — that's fine)

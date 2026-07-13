@@ -23,11 +23,11 @@ import from render_draft { split_draft }
 """Subject grammar (TPRD S6): Nightshift <date> · <n> ready · −<loc> LOC · <m> failed[ · DISABLED| ERROR S<k>]."""
 def subject(summary: dict) -> str {
     branches: list = as_list(summary.get("branches", []));
-    loc: int = sum([as_int(as_dict(b).get("loc_delta", 0)) for b in branches]);
-    loc_str: str = ("−" + str(-loc)) if loc <= 0 else ("+" + str(loc));
+    added: int = sum([as_int(as_dict(b).get("added", 0)) for b in branches]);
+    removed: int = sum([as_int(as_dict(b).get("removed", 0)) for b in branches]);
     failed: int = len(as_list(summary.get("failed", [])));
     s: str = "Nightshift " + str(summary["date"]) + " · " + str(len(branches)) + " ready";
-    s += " · " + loc_str + " LOC · " + str(failed) + " failed";
+    s += " · +" + str(added) + " -" + str(removed) + " · " + str(failed) + " failed";
     if summary.get("disabled", False) {
         s += " · DISABLED";
     } elif summary.get("error_stage") is not None and summary.get("error_stage") != "" {
@@ -40,7 +40,7 @@ def branch_card(b: dict) -> list[str] {
     return [
         "== " + str(b.get("theme", b.get("branch", "?"))) + " ==",
         "branch:  " + str(b.get("branch", "?")),
-        "files:   " + str(b.get("files", "?")) + "   loc: " + str(b.get("loc_delta", "?")),
+        "files:   " + str(b.get("files", "?")) + "   lines: +" + str(b.get("added", 0)) + " -" + str(b.get("removed", 0)),
         "tests:   " + str(b.get("tests", "?")),
         "risk:    " + str(b.get("risk", "?")),
         "url:     " + str(b.get("url", "")),
@@ -161,11 +161,14 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
         }
         (meta, _body) = split_draft(text);
         loc: dict = as_dict(meta.get("loc", {}));
+        added: int = as_int(loc.get("added", 0));
+        removed: int = as_int(loc.get("removed", 0));
         branches.append({
             "theme": meta.get("title", os.path.basename(path)),
             "branch": meta.get("branch", "?"),
             "files": meta.get("files", 0),
-            "loc_delta": as_int(loc.get("after", 0)) - as_int(loc.get("before", 0)),
+            "added": added, "removed": removed,
+            "loc_delta": added - removed,
             "tests": meta.get("tests", "?"),
             "risk": meta.get("risk", "?"),
             "url": "https://github.com/" + fork + "/tree/" + str(meta.get("branch", "")),
@@ -227,14 +230,14 @@ with entry {
     }
 }
 
-test "subject grammar covers ready/loc/failed and error suffix" {
+test "subject grammar covers ready/added/removed/failed and error suffix" {
     summary: dict = {
         "date": "2026-07-10",
-        "branches": [{"loc_delta": -300}, {"loc_delta": -112}],
+        "branches": [{"added": 20, "removed": 300}, {"added": 8, "removed": 112}],
         "failed": [{"what": "theme x", "reason": "tests red"}],
         "error_stage": None,
     };
-    assert subject(summary) == "Nightshift 2026-07-10 · 2 ready · −412 LOC · 1 failed";
+    assert subject(summary) == "Nightshift 2026-07-10 · 2 ready · +28 -412 · 1 failed";
     summary["error_stage"] = "S4";
     assert subject(summary).endswith("· ERROR S4");
 }
@@ -243,7 +246,7 @@ test "summarize assembles branches, failures and bugs from disk conventions" {
     import tempfile;
     log_dir: str = tempfile.mkdtemp();
     drafts_dir: str = tempfile.mkdtemp();
-    draft: str = "---\nbranch: \"nightshift/2026-07-10/dead-code\"\npackage: \"jac\"\ndate: \"2026-07-10\"\ntitle: \"refactor(jac): x\"\nrisk: \"low\"\ntests: \"green\"\nrelease_note: \"r.md\"\nfiles: 2\nloc: {\"before\": 100, \"after\": 40}\n---\n\n# refactor(jac): x\n";
+    draft: str = "---\nbranch: \"nightshift/2026-07-10/dead-code\"\npackage: \"jac\"\ndate: \"2026-07-10\"\ntitle: \"refactor(jac): x\"\nrisk: \"low\"\ntests: \"green\"\nrelease_note: \"r.md\"\nfiles: 2\nloc: {\"added\": 40, \"removed\": 100}\n---\n\n# refactor(jac): x\n";
     with open(os.path.join(drafts_dir, "2026-07-10--dead-code.md"), "w") as f {
         f.write(draft);
     }
@@ -260,10 +263,12 @@ test "summarize assembles branches, failures and bugs from disk conventions" {
     summary: dict = summarize(log_dir, drafts_dir, "2026-07-10", cfg);
     assert len(as_list(summary["branches"])) == 1;
     assert as_dict(as_list(summary["branches"])[0])["loc_delta"] == -60;
+    assert as_dict(as_list(summary["branches"])[0])["added"] == 40;
+    assert as_dict(as_list(summary["branches"])[0])["removed"] == 100;
     assert as_dict(as_list(summary["failed"])[0])["reason"] == "tests red";
     assert len(as_list(summary["suspected_bugs"])) == 1;
     assert summary["turns"] == 41;
-    assert subject(summary) == "Nightshift 2026-07-10 · 1 ready · −60 LOC · 1 failed";
+    assert subject(summary) == "Nightshift 2026-07-10 · 1 ready · +40 -100 · 1 failed";
 }
 
 test "body inlines drafts and bug reports" {
