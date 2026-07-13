@@ -3,8 +3,12 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.nightshift</string>
+  <!-- bash runs the script directly (no caffeinate wrapper): TCC attributes external-volume disk
+       access to the immediate spawning process, so if launchd->caffeinate->bash, Full Disk Access
+       granted to /bin/bash never applies (caffeinate would need its own grant). nightshift.sh
+       self-caffeinates instead (spawns caffeinate as ITS child, watching its own pid). -->
   <key>ProgramArguments</key><array>
-    <string>/usr/bin/caffeinate</string><string>-i</string>
+    <string>/bin/bash</string>
     <string>/Users/YOURUSER/nightshift/bin/nightshift.sh</string><string>run</string>
   </array>
   <key>StartCalendarInterval</key><dict>

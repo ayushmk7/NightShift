@@ -30,14 +30,27 @@ ns_run() {
     mkdir -p "$LOG_DIR" "$NS_ROOT/state"
     [ -f "$LOG_DIR/start_epoch" ] || date +%s > "$LOG_DIR/start_epoch"
 
-    # hard wall-clock ceiling (TPRD budgets): re-exec self under a timeout wrapper.
-    # gtimeout sends TERM first, so the child's EXIT trap still emails the autopsy.
-    # (NS_DRY_RUN survives the exec because it is exported.)
-    if [ -z "${NS_TIMEBOXED:-}" ] && command -v gtimeout >/dev/null 2>&1; then
-        export NS_TIMEBOXED=1
-        exec gtimeout --signal=TERM "${NS_BUDGETS_WALLCLOCK_MIN}m" "$0" run
+    # Self-caffeinate AND self-timebox as OUR OWN background children (forked, never exec'd/wrapped).
+    # Two macOS/TCC footguns on an external-volume repo, both found the hard way under launchd:
+    #   1. launchd -> caffeinate -> bash: TCC attributes disk access to the immediate spawning
+    #      process (caffeinate), so Full Disk Access granted to /bin/bash never applied — every
+    #      launchd-fired run died EPERM before touching a file.
+    #   2. The old `exec gtimeout ... "$0" run` re-execs a FRESH process image over this pid; the
+    #      resulting child (forked by gtimeout, execve'd again via the script's own shebang) reads to
+    #      macOS as a new "responsible" identity needing a first-run TCC consent prompt — which a
+    #      headless LaunchAgent can never show, so the very next open() blocks FOREVER instead of
+    #      erroring (confirmed via `sample`: stuck in libsystem_kernel `open`).
+    # Forked (not exec'd) children inherit this process's already-granted FDA identity — proven by
+    # every subprocess the pipeline forks below (git, jac, claude, gh, pre-commit) all working fine.
+    if command -v caffeinate >/dev/null 2>&1; then
+        caffeinate -i -w $$ >/dev/null 2>&1 &
+        disown
     fi
-    # no gtimeout → run un-boxed; the per-stage boxes still bound the damage
+    # gtimeout's default behavior: TERM first (EXIT trap still runs -> autopsy email), KILL after a
+    # grace period if TERM didn't land.
+    ( sleep "$(( NS_BUDGETS_WALLCLOCK_MIN * 60 ))"; kill -TERM $$ 2>/dev/null; sleep 30; kill -KILL $$ 2>/dev/null ) &
+    disown
+
     ns_run_inner
 }
 

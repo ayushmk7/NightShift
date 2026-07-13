@@ -3,11 +3,12 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.nightshift</string>
-  <!-- /bin/bash (granted Full Disk Access in System Settings) runs the volume script; passing the
-       script as a bash ARGUMENT (read, not execve'd) + FDA lets it and its children execute the
-       binaries under /Volumes/ExtremePro. caffeinate -i keeps the machine awake during the run. -->
+  <!-- /bin/bash (granted Full Disk Access in System Settings) runs the volume script directly as
+       launchd's immediate child. TCC attributes external-volume disk access to the immediate
+       spawning process: with caffeinate wrapping bash (launchd->caffeinate->bash), the FDA grant on
+       bash never applied and every run died EPERM before touching a file. nightshift.sh
+       self-caffeinates instead (spawns caffeinate as ITS OWN child once started). -->
   <key>ProgramArguments</key><array>
-    <string>/usr/bin/caffeinate</string><string>-i</string>
     <string>/bin/bash</string>
     <string>/Volumes/ExtremePro/JaseciLabs/NightShift/bin/nightshift.sh</string><string>run</string>
   </array>
