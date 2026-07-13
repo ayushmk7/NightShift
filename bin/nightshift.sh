@@ -23,6 +23,11 @@ ns_on_exit() {
     fi
     email_main || true
     ns_lock_release
+    # Explicitly reap our self-caffeinate/self-timebox background children instead of trusting
+    # `disown` alone to let bash exit immediately — observed once (under launchd/Terminal-launch)
+    # that this process stayed alive, idle, long after every stage finished.
+    [ -n "${NS_CAFFEINATE_PID:-}" ] && kill "$NS_CAFFEINATE_PID" 2>/dev/null
+    [ -n "${NS_WATCHDOG_PID:-}" ] && kill "$NS_WATCHDOG_PID" 2>/dev/null
     exit "$code"
 }
 
@@ -44,11 +49,13 @@ ns_run() {
     # every subprocess the pipeline forks below (git, jac, claude, gh, pre-commit) all working fine.
     if command -v caffeinate >/dev/null 2>&1; then
         caffeinate -i -w $$ >/dev/null 2>&1 &
+        NS_CAFFEINATE_PID=$!
         disown
     fi
     # gtimeout's default behavior: TERM first (EXIT trap still runs -> autopsy email), KILL after a
     # grace period if TERM didn't land.
     ( sleep "$(( NS_BUDGETS_WALLCLOCK_MIN * 60 ))"; kill -TERM $$ 2>/dev/null; sleep 30; kill -KILL $$ 2>/dev/null ) &
+    NS_WATCHDOG_PID=$!
     disown
 
     ns_run_inner

@@ -130,11 +130,22 @@ def glob_paths(directory: str, pattern: str) -> list[str] {
     return sorted([str(m) for m in Path(directory).glob(pattern)]);
 }
 
+"""Skips files that fail to parse (e.g. an empty report-*.json left by a died apply session) --
+the digest is the one thing meant to always send, even on a bad night; one bad file must not
+crash the whole summary."""
 def read_json_files(directory: str, pattern: str) -> list[dict] {
     out: list[dict] = [];
     for path in glob_paths(directory, pattern) {
         with open(path, "r") as f {
-            out.append(parse_obj(f.read()));
+            text: str = f.read();
+        }
+        if not text.strip() {
+            continue;
+        }
+        try {
+            out.append(parse_obj(text));
+        } except Exception {
+            eprint("sendmail: skipping unparseable " + path);
         }
     }
     return out;

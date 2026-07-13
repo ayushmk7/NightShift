@@ -75,7 +75,7 @@ tier2_select() {
 
 # Phase C — apply: fresh branch + fresh headless session per theme
 tier2_apply() {
-    local pkg=$1 slug branch theme_file prompt remaining
+    local pkg=$1 slug branch theme_file prompt remaining attempt got_report
     ns_jac selector split "$LOG_DIR/selection.json" "$LOG_DIR" | while IFS= read -r slug; do
         theme_file="$LOG_DIR/theme-$slug.json"
         branch="nightshift/$NS_DATE/$slug"
@@ -86,23 +86,37 @@ tier2_apply() {
             continue
         fi
 
-        cd "$REPO"
-        git checkout -B "$branch" "$NS_REPO_DEFAULT_BRANCH"
-
         prompt="$(render_prompt "$NS_ROOT/prompts/apply.md" \
             "pkg=$pkg" "theme=$(cat "$theme_file")" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
 
-        (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
-            && ns_timebox "$NS_BUDGETS_APPLY_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
-            --permission-mode acceptEdits \
-            --allowedTools "Read,Edit,Grep,Glob,Bash(jac fmt *),Bash(jac format *),Bash(jac lint *),Bash(jac check *),Bash(jac code *),Bash(jac test *),Bash(git diff *),Bash(git status *),Bash(git log *),Bash(git add *),Bash(git commit *),mcp__jac__*" \
-            --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \
-            --output-format json) > "$LOG_DIR/apply-$slug.json" || true
+        # Up to 2 attempts, each on a FRESH branch: a transient API error mid-session (same class
+        # tier2_audit already retries) shouldn't burn the whole theme for the night.
+        got_report=0
+        for attempt in 1 2; do
+            cd "$REPO"
+            git checkout "$NS_REPO_DEFAULT_BRANCH" 2>/dev/null || true
+            git branch -D "$branch" 2>/dev/null || true
+            git checkout -B "$branch" "$NS_REPO_DEFAULT_BRANCH"
 
-        ns_jac parse_result meta < "$LOG_DIR/apply-$slug.json" > "$LOG_DIR/meta-apply-$slug.json" || true
+            (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
+                && ns_timebox "$NS_BUDGETS_APPLY_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
+                --permission-mode acceptEdits \
+                --allowedTools "Read,Edit,Grep,Glob,Bash(jac fmt *),Bash(jac check *),Bash(jac code *),Bash(jac test *),Bash(git diff *),Bash(git status *),Bash(git log *),Bash(git add *),Bash(git commit *),mcp__jac__*" \
+                --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \
+                --output-format json) > "$LOG_DIR/apply-$slug.json" || true
 
-        if ! ns_jac parse_result report < "$LOG_DIR/apply-$slug.json" > "$LOG_DIR/report-$slug.json"; then
-            ns_fail "theme $slug" "apply session died or returned malformed report — branch discarded"
+            ns_jac parse_result meta < "$LOG_DIR/apply-$slug.json" > "$LOG_DIR/meta-apply-$slug.json" || true
+
+            if ns_jac parse_result report < "$LOG_DIR/apply-$slug.json" > "$LOG_DIR/report-$slug.json"; then
+                got_report=1
+                break
+            fi
+            ns_log S3 "apply $slug attempt $attempt failed to parse (transient API error?) — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"
+        done
+
+        if [ "$got_report" -ne 1 ]; then
+            ns_fail "theme $slug" "apply session died or returned malformed report after retry — branch discarded"
+            rm -f "$LOG_DIR/report-$slug.json"    # empty/invalid leftover from the failed redirect — sendmail's digest globs report-*.json
             git checkout "$NS_REPO_DEFAULT_BRANCH"; git branch -D "$branch" || true
             continue
         fi
