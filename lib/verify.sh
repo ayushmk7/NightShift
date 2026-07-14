@@ -134,20 +134,34 @@ verify_branch() {
     fi
 
     # 3. tests: baseline-diff gate. Run the CI suite for each gated package the branch changed,
-    #    fail only on NEW failures vs the recorded main baseline (testgate.jac). jac-scale changes
-    #    get no test gate (k8s) — jac check + pre-commit still gate them.
-    local tpkg raw
+    #    fail only on NEW failures vs the recorded main baseline (testgate.jac). jac-scale/jac-mcp
+    #    changes get no test gate (k8s / no CI suite) — jac check + pre-commit still gate them.
+    #    testgate.jac exit codes: 0 = no new failures, 1 = new failures, 2 = no baseline recorded
+    #    (== no gate for this package). This loop used to `if !` on the raw exit status, which
+    #    can't tell 1 and 2 apart -- confirmed live: a genuinely safe jac-scale branch got rejected
+    #    as "new test failures" when the real story was "jac-scale has no baseline, can't gate."
+    local tpkg raw rc
     for tpkg in $(gated_pkgs_from_diff); do
         raw="$LOG_DIR/tests-raw-$(basename "$branch")-$tpkg.txt"
         pkg_test_raw "$tpkg" "$raw"
-        if ! ns_jac testgate gate "$tpkg" "$raw" "$BASELINE_DIR"; then
+        ns_jac testgate gate "$tpkg" "$raw" "$BASELINE_DIR"; rc=$?
+        if [ "$rc" -eq 2 ]; then
+            ns_log S4 "$tpkg: no test baseline recorded — no gate, skipping"
+            continue
+        fi
+        if [ "$rc" -ne 0 ]; then
             # One retry: the target suite has documented flaky tests (ci.yml retries `-x || -x`).
             # Only a failure that reproduces on a second run counts.
             # ponytail: two *different* flakes across the two runs could still red; acceptable —
             #           the branch just gets re-attempted next night. Tighten to id-intersection if it bites.
             ns_log S4 "$tpkg: new failures on run 1 — retrying once (flaky-test guard)"
             pkg_test_raw "$tpkg" "$raw"
-            if ! ns_jac testgate gate "$tpkg" "$raw" "$BASELINE_DIR"; then
+            ns_jac testgate gate "$tpkg" "$raw" "$BASELINE_DIR"; rc=$?
+            if [ "$rc" -eq 2 ]; then
+                ns_log S4 "$tpkg: no test baseline recorded on retry — no gate, skipping"
+                continue
+            fi
+            if [ "$rc" -ne 0 ]; then
                 verify_red "$branch" "$tpkg: new test failures vs baseline (2 runs; see $(basename "$raw"))"
                 return 1
             fi
