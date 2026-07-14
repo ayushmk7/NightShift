@@ -27,7 +27,7 @@ import sys;
 import os;
 import json;
 import subprocess;
-import from nslib { eprint, parse_obj, parse_list, as_dict, as_list, as_int }
+import from nslib { eprint, parse_obj, parse_list, as_dict, as_list, as_int, fingerprint }
 
 def git_show(repo_dir: str, ref: str, path: str) -> str {
     r = subprocess.run(["git", "-C", repo_dir, "show", ref + ":" + path],
@@ -81,7 +81,10 @@ def record_audit(log_dir: str, dataset_dir: str, date_s: str, package: str) -> i
     audit_out: str = os.path.join(dataset_dir, "audit_findings.jsonl");
     for f in findings {
         fd: dict = as_dict(f);
-        fp: str = str(fd.get("fingerprint", ""));
+        # Raw audit findings never carry a fingerprint -- the selector computes it (same formula,
+        # nslib.fingerprint) only once a finding survives into selection.json. Must recompute it
+        # here identically to cross-reference correctly.
+        fp: str = fingerprint(str(fd.get("file", "")), str(fd.get("rule", "")), str(fd.get("snippet", "")));
         status: str = "applied" if fp in selected_fps else dropped_map.get(fp, "not_selected");
         append_row(audit_out, {
             "date": date_s, "package": package, "file": fd.get("file", ""),
@@ -172,16 +175,21 @@ with entry:__main__ {
 test "record_audit cross-references selection status and always logs a night row, even zero-finding" {
     import tempfile;
     d: str = tempfile.mkdtemp();
+    # Raw findings never carry a fingerprint -- the selector computes it (same nslib.fingerprint
+    # formula) only once a finding survives into selection.json. Compute the SAME fingerprints
+    # here to build a realistic selection.json, exactly as the real pipeline would.
+    fp_a: str = fingerprint("a.jac", "dup", "snip a");
+    fp_b: str = fingerprint("b.jac", "dead", "snip b");
     with open(d + "/findings.json", "w") as f {
         f.write(json.dumps([
-            {"file": "a.jac", "rule": "dup", "summary": "s1", "fingerprint": "f1", "confidence": 4, "risk": 2, "score": 10.0},
-            {"file": "b.jac", "rule": "dead", "summary": "s2", "fingerprint": "f2", "confidence": 3, "risk": 3, "score": 5.0},
+            {"file": "a.jac", "rule": "dup", "snippet": "snip a", "summary": "s1", "confidence": 4, "risk": 2, "score": 10.0},
+            {"file": "b.jac", "rule": "dead", "snippet": "snip b", "summary": "s2", "confidence": 3, "risk": 3, "score": 5.0},
         ]));
     }
     with open(d + "/selection.json", "w") as f {
         f.write(json.dumps({
-            "themes": [{"findings": [{"fingerprint": "f1"}]}],
-            "dropped": [{"fingerprint": "f2", "file": "b.jac", "reason": "over-night-budget"}],
+            "themes": [{"findings": [{"fingerprint": fp_a}]}],
+            "dropped": [{"fingerprint": fp_b, "file": "b.jac", "reason": "over-night-budget"}],
         }));
     }
     ds: str = tempfile.mkdtemp();
