@@ -21,6 +21,34 @@ def slugify(hint: str) -> str {
     return slug if slug else "misc";
 }
 
+"""jac's decl/impl split (X.jac <-> X.impl.jac, either same directory or an `impl/` subdirectory)
+is a tightly-coupled pair: editing one without the other desyncs signatures from bodies and breaks
+compilation. Confirmed live: an apply session correctly refused to touch a declaration file whose
+impl file wasn't in the theme's scope, rather than risk exactly that. Returns candidate sibling
+PATHS (no filesystem check -- selector.jac has no repo access here); harmless if a guess doesn't
+exist, since only findings' own files ever actually drive an edit. Deliberately NOT extended to
+test files: **/tests/** is protected, so including a test path in scope wouldn't help -- the agent
+still can't touch it, and never should for this repo's threat model."""
+def impl_siblings(file: str) -> list[str] {
+    if file.endswith(".impl.jac") {
+        base: str = file[:-len(".impl.jac")];
+        parts: list[str] = base.rsplit("/", 1);
+        if len(parts) == 2 and parts[0].endswith("/impl") {
+            return [parts[0][:-len("/impl")] + "/" + parts[1] + ".jac"];
+        }
+        return [base + ".jac"];
+    }
+    if file.endswith(".jac") {
+        base: str = file[:-len(".jac")];
+        parts: list[str] = base.rsplit("/", 1);
+        if len(parts) == 2 {
+            return [base + ".impl.jac", parts[0] + "/impl/" + parts[1] + ".impl.jac"];
+        }
+        return [base + ".impl.jac"];
+    }
+    return [];
+}
+
 def score_of(f: dict) -> float {
     return float(int(f["est_loc_saved"]) * int(f["confidence"])) / float(int(f["risk"]));
 }
@@ -76,6 +104,16 @@ def pack_themes(eligible: list[dict], budgets: dict, package: str) -> (list[dict
             est_loc += int(f["est_loc_saved"]);
         }
         if picked {
+            # Pull each finding's file's decl/impl sibling into scope too, budget allowing --
+            # a doomed-from-the-start partial edit (declaration without its impl) is worse than
+            # one fewer file slot for something else.
+            for f in list(files) {
+                for sib in impl_siblings(f) {
+                    if sib not in files and len(files) < int(budgets["files_per_theme"]) {
+                        files.append(sib);
+                    }
+                }
+            }
             themes.append({
                 "name": str(picked[0]["theme_hint"]), "slug": slug, "package": package,
                 "files": files, "findings": picked, "est_loc": est_loc,
@@ -203,6 +241,31 @@ test "packing respects caps, drops ledger-known and protected findings" {
     reasons: list[str] = [str(d["reason"]) for d in as_list(result["dropped"])];
     assert "protected-path" in reasons;
     assert "over-theme-budget" in reasons;
+}
+
+test "impl_siblings covers same-dir and impl/ subdirectory decl<->impl pairing" {
+    assert "jac/jaclang/scale/gw/embedded_gateway.impl.jac" in impl_siblings("jac/jaclang/scale/gw/embedded_gateway.jac");
+    assert "jac/jaclang/scale/gw/impl/embedded_gateway.impl.jac" in impl_siblings("jac/jaclang/scale/gw/embedded_gateway.jac");
+    assert impl_siblings("jac/jaclang/cli/commands/impl/mcp.impl.jac") == ["jac/jaclang/cli/commands/mcp.jac"];
+    assert impl_siblings("plain.jac") == ["plain.impl.jac"];
+    assert impl_siblings("no_extension") == [];
+}
+
+test "packing pulls a finding's impl sibling into theme scope" {
+    import tempfile;
+    body: str = "[budgets]\nthemes_per_night = 1\nfiles_per_theme = 3\nloc_per_theme = 100\napply_timeout_min = 25\n[protect]\nglobs = []\n";
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as tf {
+        cfg_path: str = tf.name;
+        tf.write(body);
+    }
+    findings: list[dict] = [{"file": "gw/gateway.jac", "rule": "dead-code", "snippet": "s",
+        "summary": "x", "est_loc_saved": 40, "confidence": 4, "risk": 2, "theme_hint": "gw"}];
+    result: dict = select(findings, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999);
+    themes: list[dict] = as_list(result["themes"]);
+    assert len(themes) == 1;
+    files: list[str] = [str(f) for f in as_list(as_dict(themes[0])["files"])];
+    assert "gw/gateway.jac" in files;
+    assert "gw/gateway.impl.jac" in files;
 }
 
 test "clock shedding removes lowest-scored theme" {
