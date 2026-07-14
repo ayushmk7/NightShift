@@ -28,11 +28,20 @@ pkg_test_raw() {
 # byllm SOURCE lives under jac/jaclang/byllm/** but its TESTS live in jac-byllm/tests, so a
 # byllm-only change must gate on the (small) byllm suite, NOT the large, env-flaky jac core suite.
 # `cut -d/ -f1` got this wrong (jac/jaclang/byllm -> "jac" -> ran core tests full of CEF/pip flakes).
+#
+# jac-mcp's CLI-level integration is scattered outside jac/jaclang/byllm too (see
+# ns_audit_scope in lib/common.sh for the same real paths) and has no test suite of its own
+# (confirmed: "no tests ran" on the recorded baseline) -- without an explicit case here it fell
+# into the "jac" catch-all and triggered the ~95min core suite for a 1-file CLI change, confirmed
+# live. Route it (and jac-scale, needs k8s) to pkg_test_raw's `*) return 2` no-gate path instead,
+# same as jac-scale already got.
 gated_pkgs_from_diff() {
     git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD" | while IFS= read -r p; do
         case "$p" in
-            jac/jaclang/byllm/*|jac-byllm/*) echo jac-byllm ;;
-            jac/*)                           echo jac ;;
+            jac/jaclang/byllm/*|jac-byllm/*)                                 echo jac-byllm ;;
+            jac/jaclang/cli/mcp/*|jac/jaclang/cli/commands/*mcp*)            echo jac-mcp ;;
+            jac/jaclang/scale/*)                                            echo jac-scale ;;
+            jac/*)                                                          echo jac ;;
         esac
     done | sort -u
 }
