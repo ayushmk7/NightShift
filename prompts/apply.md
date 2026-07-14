@@ -28,10 +28,16 @@ need intent and context, not janitorial judgment.
 
 Commit message: `refactor({pkg}): <theme-name> (nightshift)`
 
-Finish with ONLY a fenced ```json object — no prose after it:
+Finish with ONLY a fenced ```json object — no prose after it. Be VERY DETAILED in `summary`: a
+reviewer who has not read the diff should understand exactly what changed, why it's behavior-
+preserving, and what you specifically checked to confirm that (not just "verified with jac
+check" — what did you actually look at: call sites, existing tests, the specific compile/type
+errors you resolved and how).
 
 {
-  "summary": "one-paragraph what/why",
+  "summary": "detailed, multiple sentences: what changed, why it's safe/behavior-preserving, and
+      the concrete verification you did (files/call sites checked, tests run, specific errors
+      resolved). Write for a reviewer with zero context on this change.",
   "files": ["every file you edited"],
   "loc_before": <int>, "loc_after": <int>,
   "risk": "low | medium",

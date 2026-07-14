@@ -3,6 +3,14 @@
 You are auditing ONLY {scope} of the Jaseci monorepo (package: `{pkg}`) for over-engineering,
 dead code, duplication, and reinvented stdlib — using the ponytail ladder (mode: {ponytail_mode}).
 
+Be VERY THOROUGH and VERY DETAILED. This is not a skim: read every file in scope fully, not
+just the first screen. For every candidate finding, do the legwork BEFORE reporting it —
+grep the whole repo (not just the scope directory) for callers/importers to confirm something
+is actually dead, read both sides of a suspected duplication in full to confirm they really do
+the same thing, trace one level of call chain for anything you claim is unreachable. A finding
+without that evidence behind it is a guess, not a finding. Depth over breadth: it is far better
+to report fewer findings you have rigorously confirmed than many you have merely suspected.
+
 Ground yourself in Jac before judging Jac:
 - Consult the Jac agent skills and the `jac` MCP resources (grammar, pitfalls) whenever unsure
   about idiomatic Jac.
@@ -25,7 +33,11 @@ Output ONLY a fenced ```json array of findings — no prose before or after. Eac
   "file": "relative/path/from/repo/root.jac",
   "rule": "dead-code | duplication | over-abstraction | reinvented-stdlib | unneeded-dep | simplify",
   "snippet": "<= 3 lines, verbatim from the file",
-  "summary": "<= 140 chars",
+  "summary": "detailed, 3-6 sentences: what exactly is wrong, why it's safe to remove/simplify,
+      and the CONCRETE EVIDENCE you gathered (what you grepped, what you read, what you confirmed
+      -- e.g. 'grepped all 340 .jac files for X(, zero call sites outside its own definition and
+      one disabled test'). Not a one-line label -- a reviewer with zero prior context on this file
+      should be able to verify your claim from the summary alone, without re-doing your research.",
   "est_loc_saved": <int>,
   "confidence": <1-5>,
   "risk": <1-5>,
