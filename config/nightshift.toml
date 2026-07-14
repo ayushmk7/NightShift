@@ -19,11 +19,18 @@ box_verify_min     = 65
 box_ship_email_min = 10
 audit_timeout_min  = 15
 apply_timeout_min  = 25                      # per theme session
-max_turns          = 80                      # the real cost brake on a subscription
+audit_max_turns    = 45                      # audit is read-only investigation (grep/read heavy,
+                                              # no edits); 25 was too tight once the prompt started
+                                              # demanding real evidence per finding -- confirmed
+                                              # live: a real audit hit terminal_reason=max_turns
+max_turns          = 80                      # apply session cap; the real cost brake on a subscription
 max_budget_usd     = 5                       # inert on subscription; belt if ever on an API key
 
 [agent]
-model         = ""                           # empty = account default
+model         = "sonnet"                     # empty = account default, which silently drifts with
+                                              # whatever the interactive session's default is at
+                                              # 2am -- confirmed live, unnoticed model change between
+                                              # two real runs. Pin explicitly; change here, not in code.
 ponytail_mode = "full"                       # PRD 14-Q5
 
 [protect]                                    # glob deny-list; enforced twice (prompt + S4 gate)

@@ -36,19 +36,22 @@ tier2_audit() {
         "pkg=$pkg" "scope=$(ns_audit_scope "$pkg")" \
         "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
 
+    # empty NS_AGENT_MODEL (config: [agent].model) means "account default" -- that's the exact
+    # silent-drift footgun the config comment warns about, so the default ships pinned to "sonnet";
+    # only actually omit the flag if someone deliberately blanks it back out.
+    local -a model_args=()
+    [ -n "$NS_AGENT_MODEL" ] && model_args=(--model "$NS_AGENT_MODEL")
+
     # Up to 2 attempts: a transient API error (e.g. "Connection closed mid-response") shouldn't
     # burn the whole agentic tier. Each attempt is time-boxed; the parse decides success.
     for attempt in 1 2; do
         # dev jac first on PATH so the agent's Bash(jac *) and the jac MCP server hit the repo binary.
-        # --model pinned: a headless session otherwise silently inherits whatever the *interactive*
-        # default happens to be at 2am, which drifts (confirmed: was sonnet, later became fable
-        # between two real runs, unnoticed). Sonnet is what every real finding so far was produced on.
         (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
             && ns_timebox "$NS_BUDGETS_AUDIT_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
-            --model sonnet \
+            "${model_args[@]}" \
             --permission-mode dontAsk \
             --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
-            --max-turns 25 --output-format json) > "$LOG_DIR/audit.json" || true
+            --max-turns "$NS_BUDGETS_AUDIT_MAX_TURNS" --output-format json) > "$LOG_DIR/audit.json" || true
 
         ns_jac parse_result meta < "$LOG_DIR/audit.json" > "$LOG_DIR/meta-audit.json" || true
 
@@ -82,6 +85,8 @@ tier2_select() {
 # Phase C — apply: fresh branch + fresh headless session per theme
 tier2_apply() {
     local pkg=$1 slug branch theme_file prompt remaining attempt got_report
+    local -a model_args=()
+    [ -n "$NS_AGENT_MODEL" ] && model_args=(--model "$NS_AGENT_MODEL")
     ns_jac selector split "$LOG_DIR/selection.json" "$LOG_DIR" | while IFS= read -r slug; do
         theme_file="$LOG_DIR/theme-$slug.json"
         branch="nightshift/$NS_DATE/$slug"
@@ -106,7 +111,7 @@ tier2_apply() {
 
             (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
                 && ns_timebox "$NS_BUDGETS_APPLY_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
-                --model sonnet \
+                "${model_args[@]}" \
                 --permission-mode acceptEdits \
                 --allowedTools "Read,Edit,Grep,Glob,Bash(jac fmt *),Bash(jac check *),Bash(jac code *),Bash(jac test *),Bash(git diff *),Bash(git status *),Bash(git log *),Bash(git add *),Bash(git rm *),Bash(git commit *),mcp__jac__*" \
                 --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \
