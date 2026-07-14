@@ -51,5 +51,9 @@ ship_branch() {
     ns_jac ledger by-branch "$branch" "$LEDGER" | while IFS= read -r fp; do
         ns_jac ledger set-status "$fp" drafted "$LEDGER" >/dev/null
     done
+
+    dataset_record_refactor "$branch" "$pkg" "$theme" "$report" "$added" "$removed" \
+        "$tests_line" "https://github.com/$NS_REPO_FORK/tree/$branch"
+
     ns_log S5 "shipped $branch + draft $(basename "$draft_path")"
 }

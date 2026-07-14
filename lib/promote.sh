@@ -65,6 +65,8 @@ promote_main() {
     git -C "$DRAFTS" commit -m "promote: $branch -> #$pr_num"
     git -C "$DRAFTS" push origin nightshift/drafts
     git -C "$REPO" checkout "$NS_REPO_DEFAULT_BRANCH"
+
+    dataset_record_review "$branch" true "promoted: $pr_url"
 }
 
 discard_main() {
@@ -84,6 +86,8 @@ discard_main() {
     git -C "$DRAFTS" commit -m "discard: $branch ($reason_sane)"
     git -C "$DRAFTS" push origin nightshift/drafts
     ns_log S7 "discarded $branch — the finding will never resurface"
+
+    dataset_record_review "$branch" false "$reason_sane"
 }
 
 demote_branch() {

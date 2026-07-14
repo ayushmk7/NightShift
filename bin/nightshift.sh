@@ -15,6 +15,7 @@ export NS_ROOT
 . "$NS_ROOT/lib/ship.sh"
 . "$NS_ROOT/lib/email.sh"
 . "$NS_ROOT/lib/promote.sh"
+. "$NS_ROOT/lib/dataset.sh"
 
 ns_on_exit() {
     local code=$?
@@ -83,6 +84,7 @@ usage: nightshift.sh run                        # the nightly pipeline (launchd 
        nightshift.sh discard <branch> [reason]  # bury the branch; the finding never resurfaces
        nightshift.sh status                     # last run summary + ledger tallies
        nightshift.sh baseline                   # record the test baseline on main (slow; M0)
+       nightshift.sh dataset-backfill           # rebuild dataset/*.jsonl from past real nights
 EOF
     exit 2
 }
@@ -97,5 +99,6 @@ case "$cmd" in
     discard)    [ $# -ge 1 ] || usage; mkdir -p "$LOG_DIR"; discard_main "$@" ;;
     status)     status_main ;;
     baseline)   mkdir -p "$LOG_DIR" "$NS_ROOT/state"; ns_load_env; baseline_main ;;
+    dataset-backfill) mkdir -p "$LOG_DIR"; dataset_backfill ;;
     *)          usage ;;
 esac

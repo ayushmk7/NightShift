@@ -24,6 +24,7 @@ tier2_main() {
     ns_log S3 "tonight's package: $pkg"
 
     tier2_audit "$pkg" || return 0        # malformed audit skips the tier; tier-1 still ships
+    dataset_record_night "$pkg"           # every real audit, 0 findings included, is training signal
     tier2_select "$pkg"
     tier2_apply "$pkg"
 }

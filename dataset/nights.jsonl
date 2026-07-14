@@ -1,0 +1,4 @@
+{"date": "2026-07-10", "package": "jac-byllm", "findings_count": 0, "themes_selected": 0, "cost_usd": 4.672138499999999, "turns": 13}
+{"date": "2026-07-11", "package": "jac-byllm", "findings_count": 10, "themes_selected": 3, "cost_usd": 5.808057000000001, "turns": 25}
+{"date": "2026-07-13", "package": "jac-byllm", "findings_count": 36, "themes_selected": 3, "cost_usd": 3.4522429500000005, "turns": 23}
+{"date": "2026-07-14", "package": "jac-mcp", "findings_count": 0, "themes_selected": 0, "cost_usd": 0.703783, "turns": 5}
