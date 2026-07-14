@@ -22,15 +22,15 @@ echo "== 3. golden-audit replay: selector must be deterministic =="
 T="$(mktemp -d)"
 jac run scripts/parse_result.jac findings < fixtures/golden-audit.json > "$T/f.json" \
     || fail "golden audit no longer parses"
-jac run scripts/selector.jac select jac config/nightshift.toml /nonexistent /nonexistent 999 \
+jac run scripts/selector.jac select jac config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
     < "$T/f.json" > "$T/s1.json"
-jac run scripts/selector.jac select jac config/nightshift.toml /nonexistent /nonexistent 999 \
+jac run scripts/selector.jac select jac config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
     < "$T/f.json" > "$T/s2.json"
 cmp -s "$T/s1.json" "$T/s2.json" || fail "selector output not deterministic"
 
 echo "== 4. scope gate: protected diff must be rejected =="
 printf '{"package":"pkg","files":["pkg/tests/fixtures/weird.jac"]}' > "$T/theme.json"
-if printf 'pkg/tests/fixtures/weird.jac\n' \
+if printf 'M\tpkg/tests/fixtures/weird.jac\n' \
     | jac run scripts/check_scope.jac check "$T/theme.json" config/nightshift.toml >/dev/null; then
     fail "scope gate let a protected path through"
 fi

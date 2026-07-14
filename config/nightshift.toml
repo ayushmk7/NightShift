@@ -9,9 +9,16 @@ default_branch = "main"
 packages = ["jac", "jac-byllm", "jac-mcp", "jac-scale"]   # the 4 package dirs that exist in the repo
 
 [budgets]                                    # PRD 9 guardrails — no step may violate these
-themes_per_night   = 3
+themes_per_night   = 6                       # was 3 -- real data: 85% of real findings were being
+                                              # dropped for pure over-night-budget reasons while
+                                              # verify_estimate_min sat at 3 (180min budget, huge
+                                              # unused headroom). Revisit if a night's real
+                                              # runtime/cost grows uncomfortable.
 files_per_theme    = 10
-loc_per_theme      = 300
+loc_per_theme      = 600                     # was 300 -- was silently dropping confirmed, single-
+                                              # file, high-confidence dead-code finds outright (a
+                                              # real 492-line dead file never even got considered:
+                                              # 0 + 492 > 300 killed it before packing tried).
 wallclock_min      = 180                     # hard ceiling for the whole night
 box_sync_tier1_min = 15
 box_agentic_min    = 90

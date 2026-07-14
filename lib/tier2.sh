@@ -68,7 +68,7 @@ tier2_audit() {
 # Phase B — select (pure function in selector.jac; deterministic, unit-tested)
 tier2_select() {
     local pkg=$1
-    ns_jac selector select "$pkg" "$CONFIG" "$LEDGER" "$STATE" "$(ns_remaining_min)" \
+    ns_jac selector select "$pkg" "$CONFIG" "$LEDGER" "$STATE" "$(ns_remaining_min)" "$REPO" \
         < "$LOG_DIR/findings.json" > "$LOG_DIR/selection.json"
 
     # findings the selector shed for budget/clock reasons are remembered as deferred (TPRD 9)

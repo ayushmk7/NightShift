@@ -1,7 +1,7 @@
 """S3-B selector (TechnicalPRD 7 S3-B): merge audit findings with the ledger,
 drop the ineligible, score, and greedy-pack into budgeted themes.
 
-argv:  select <package> <config.toml> <ledger.jsonl> <state.json> <remaining_min>
+argv:  select <package> <config.toml> <ledger.jsonl> <state.json> <remaining_min> <repo_dir>
            stdin: validated findings array → stdout: {"themes": [...], "dropped": [...]}
        split <selection.json> <outdir>     write theme-<slug>.json per theme; print slugs
        dropped <selection.json>            print `fingerprint<TAB>file<TAB>reason` lines
@@ -9,11 +9,90 @@ argv:  select <package> <config.toml> <ledger.jsonl> <state.json> <remaining_min
 Deterministic: same inputs → same packing (unit-testable, TPRD 14).
 """
 import sys;
+import os;
 import json;
 import re;
+import subprocess;
 import from nslib {
     eprint, read_stdin, parse_list, parse_obj, fingerprint, load_ledger, state_read,
     state_write, load_config_toml, load_globs, is_protected, as_dict, as_list, as_float
+}
+
+"""Non-project imports a test file may keep and still be "100% about this theme's dead code" --
+stdlib, test frameworks, and common third-party libs. Deliberately short: anything NOT in here is
+treated as a real project dependency and disqualifies the file (fail closed)."""
+def import_allowlist() -> set[str] {
+    return {
+        "os", "sys", "re", "json", "time", "types", "pathlib", "tempfile", "threading",
+        "unittest", "pytest", "typing", "dataclasses", "concurrent", "futures", "testclient",
+        "fastapi", "collections", "itertools", "functools", "asyncio", "logging", "datetime",
+    };
+}
+
+def file_stem(path: str) -> str {
+    base: str = path.rsplit("/", 1)[-1];
+    for suffix in [".impl.jac", ".jac"] {
+        if base.endswith(suffix) {
+            return base[:-len(suffix)];
+        }
+    }
+    return base;
+}
+
+"""True iff every `import from <dotted.module> {...}` / bare `import <dotted.module>;` line in
+this test file resolves (by its dotted path's last segment) to either a file already in this
+theme's own scope, or the small non-project allowlist above. ANY other project import means the
+file also covers something NOT being deleted here, so it must stay protected -- this is the
+independent, orchestrator-side check; the agent's own claim is never trusted for this."""
+def is_vestigial(repo_dir: str, test_rel_path: str, allowed_stems: set[str]) -> bool {
+    try {
+        with open(repo_dir + "/" + test_rel_path, "r") as f {
+            content: str = f.read();
+        }
+    } except Exception {
+        return False;
+    }
+    allowlist: set[str] = import_allowlist();
+    # Requires at least one import that actually matches a theme stem -- a file with ZERO
+    # matching AND zero disqualifying imports (e.g. the word only appears in an unrelated string
+    # literal, never a real import) must not vacuously pass just because nothing disqualified it.
+    matched: bool = False;
+    for line in content.splitlines() {
+        m = re.match("^\\s*import(?:\\s+from)?\\s+([\\w.]+)", line);
+        if m is None {
+            continue;
+        }
+        stem: str = str(m.group(1)).rsplit(".", 1)[-1];
+        if stem in allowed_stems {
+            matched = True;
+        } elif stem not in allowlist {
+            return False;
+        }
+    }
+    return matched;
+}
+
+"""Test files that would become entirely vestigial if this theme's files were deleted --
+grep-discovered by the theme's own file stems (so it never misses a match on naming), then
+independently verified file-by-file via is_vestigial. Only ever searches already-protected paths
+(is_protected), so this can only ever EXPAND what a theme may delete, never narrow normal
+protection."""
+def vestigial_test_files(repo_dir: str, theme_files: list[str], protect_globs: list[str]) -> list[str] {
+    stems: set[str] = set([file_stem(f) for f in theme_files]);
+    if not stems or not os.path.isdir(repo_dir + "/jac") {
+        return [];
+    }
+    found = subprocess.run(
+        ["grep", "-rlE", "|".join(sorted(stems)), repo_dir + "/jac", "--include=*.jac"],
+        capture_output=True, text=True);
+    out: list[str] = [];
+    for line in found.stdout.splitlines() {
+        rel: str = line[len(repo_dir) + 1:] if line.startswith(repo_dir + "/") else line;
+        if is_protected(rel, protect_globs) and is_vestigial(repo_dir, rel, stems) {
+            out.append(rel);
+        }
+    }
+    return sorted(out);
 }
 
 def slugify(hint: str) -> str {
@@ -25,10 +104,10 @@ def slugify(hint: str) -> str {
 is a tightly-coupled pair: editing one without the other desyncs signatures from bodies and breaks
 compilation. Confirmed live: an apply session correctly refused to touch a declaration file whose
 impl file wasn't in the theme's scope, rather than risk exactly that. Returns candidate sibling
-PATHS (no filesystem check -- selector.jac has no repo access here); harmless if a guess doesn't
-exist, since only findings' own files ever actually drive an edit. Deliberately NOT extended to
-test files: **/tests/** is protected, so including a test path in scope wouldn't help -- the agent
-still can't touch it, and never should for this repo's threat model."""
+PATHS (no filesystem check -- pure string manipulation); harmless if a guess doesn't exist, since
+only findings' own files ever actually drive an edit. Deliberately not repo-aware: unlike
+vestigial_test_files below (which independently verifies before ever touching a protected path),
+guessing a sibling wrong here has zero blast radius, so no verification is needed."""
 def impl_siblings(file: str) -> list[str] {
     if file.endswith(".impl.jac") {
         base: str = file[:-len(".impl.jac")];
@@ -73,7 +152,8 @@ def drop_reason(f: dict, ledger: dict[str, dict], globs: list[str]) -> str | Non
 
 """Greedy pack (TPRD S3-B steps 3-4): group by theme_hint, budget files/LOC per theme,
 keep at most themes_per_night themes ordered by total score."""
-def pack_themes(eligible: list[dict], budgets: dict, package: str) -> (list[dict], list[dict]) {
+def pack_themes(eligible: list[dict], budgets: dict, package: str, repo_dir: str,
+                 protect_globs: list[str]) -> (list[dict], list[dict]) {
     groups: dict[str, list[dict]] = {};
     for f in eligible {
         slug: str = slugify(str(f["theme_hint"]));
@@ -114,9 +194,18 @@ def pack_themes(eligible: list[dict], budgets: dict, package: str) -> (list[dict
                     }
                 }
             }
+            # Only for pure dead-code themes (a duplication/simplify finding doesn't delete a
+            # symbol outright, so "vestigial" doesn't apply): pull in any test file that becomes
+            # entirely about this theme's now-deleted files, independently verified, never
+            # trusted to the agent's own future claim.
+            vestigial: list[str] = [];
+            if all([str(f["rule"]) == "dead-code" for f in picked]) {
+                vestigial = vestigial_test_files(repo_dir, files, protect_globs);
+            }
             themes.append({
                 "name": str(picked[0]["theme_hint"]), "slug": slug, "package": package,
-                "files": files, "findings": picked, "est_loc": est_loc,
+                "files": files, "vestigial_deletions": vestigial,
+                "findings": picked, "est_loc": est_loc,
                 "score": sum([score_of(f) for f in picked]),
             });
         }
@@ -145,7 +234,7 @@ def fit_clock(themes: list[dict], dropped: list[dict], budgets: dict,
 }
 
 def select(findings: list[dict], package: str, config_path: str, ledger_path: str,
-           state_path: str, remaining_min: int) -> dict {
+           state_path: str, remaining_min: int, repo_dir: str) -> dict {
     cfg: dict = load_config_toml(config_path);
     budgets: dict = as_dict(cfg["budgets"]);
     globs: list[str] = load_globs(config_path);
@@ -164,7 +253,7 @@ def select(findings: list[dict], package: str, config_path: str, ledger_path: st
             dropped.append({"fingerprint": f["fingerprint"], "file": f["file"], "reason": reason});
         }
     }
-    (themes, dropped2) = pack_themes(eligible, budgets, package);
+    (themes, dropped2) = pack_themes(eligible, budgets, package, repo_dir, globs);
     (themes2, dropped3) = fit_clock(themes, dropped2, budgets, verify_estimate, remaining_min);
     return {"themes": themes2, "dropped": dropped + dropped3};
 }
@@ -184,10 +273,10 @@ def rotate(config_path: str, state_path: str) -> str {
 
 with entry {
     args: list[str] = sys.argv;
-    if len(args) == 7 and args[1] == "select" {
+    if len(args) == 8 and args[1] == "select" {
         raw: list = parse_list(read_stdin());
         findings: list[dict] = [f for f in raw if isinstance(f, dict)];
-        print(json.dumps(select(findings, args[2], args[3], args[4], args[5], int(args[6]))));
+        print(json.dumps(select(findings, args[2], args[3], args[4], args[5], int(args[6]), args[7])));
     } elif args[1] == "split" and len(args) == 4 if len(args) > 1 else False {
         with open(args[2], "r") as f {
             selection: dict = parse_obj(f.read());
@@ -211,7 +300,7 @@ with entry {
     } elif args[1] == "rotate" and len(args) == 4 if len(args) > 1 else False {
         print(rotate(args[2], args[3]));
     } elif len(args) > 1 and args[1] != "test" {
-        eprint("usage: ... findings.json | jac run selector.jac select <package> <config.toml> <ledger.jsonl> <state.json> <remaining_min>");
+        eprint("usage: ... findings.json | jac run selector.jac select <package> <config.toml> <ledger.jsonl> <state.json> <remaining_min> <repo_dir>");
         eprint("       jac run selector.jac split <selection.json> <outdir>");
         eprint("       jac run selector.jac dropped <selection.json>");
         eprint("       jac run selector.jac rotate <config.toml> <state.json>");
@@ -236,7 +325,7 @@ test "packing respects caps, drops ledger-known and protected findings" {
         mk("pkg/tests/f.jac", "dead code", 40),    # protected
         mk("pkg/d.jac", "dup", 30),
     ];
-    result: dict = select(findings, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999);
+    result: dict = select(findings, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, "/nonexistent-repo");
     assert len(as_list(result["themes"])) == 2;
     reasons: list[str] = [str(d["reason"]) for d in as_list(result["dropped"])];
     assert "protected-path" in reasons;
@@ -260,12 +349,64 @@ test "packing pulls a finding's impl sibling into theme scope" {
     }
     findings: list[dict] = [{"file": "gw/gateway.jac", "rule": "dead-code", "snippet": "s",
         "summary": "x", "est_loc_saved": 40, "confidence": 4, "risk": 2, "theme_hint": "gw"}];
-    result: dict = select(findings, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999);
+    result: dict = select(findings, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, "/nonexistent-repo");
     themes: list[dict] = as_list(result["themes"]);
     assert len(themes) == 1;
     files: list[str] = [str(f) for f in as_list(as_dict(themes[0])["files"])];
     assert "gw/gateway.jac" in files;
     assert "gw/gateway.impl.jac" in files;
+}
+
+test "is_vestigial: pure test of the theme's own files passes, any other project import fails closed" {
+    import tempfile;
+    repo: str = tempfile.mkdtemp();
+    import os as _os;
+    _os.makedirs(repo + "/jac/pkg/tests");
+    with open(repo + "/jac/pkg/tests/test_only.jac", "w") as f {
+        f.write("import os;\nimport from jaclang.pkg.gateway { Gateway }\nimport from jaclang.pkg.transport { Transport }\n");
+    }
+    with open(repo + "/jac/pkg/tests/test_and_other.jac", "w") as f {
+        f.write("import from jaclang.pkg.gateway { Gateway }\nimport from jaclang.pkg.unrelated_service { Service }\n");
+    }
+    stems: set[str] = {"gateway", "transport"};
+    assert is_vestigial(repo, "jac/pkg/tests/test_only.jac", stems) == True;
+    assert is_vestigial(repo, "jac/pkg/tests/test_and_other.jac", stems) == False;
+}
+
+test "vestigial_test_files discovers the pure candidate, skips the mixed one, ignores non-dead-code themes" {
+    import tempfile;
+    import os as _os;
+    repo: str = tempfile.mkdtemp();
+    _os.makedirs(repo + "/jac/pkg/tests");
+    with open(repo + "/jac/pkg/gateway.jac", "w") as f {
+        f.write("obj Gateway {}\n");
+    }
+    with open(repo + "/jac/pkg/tests/test_only.jac", "w") as f {
+        f.write("import from jaclang.pkg.gateway { Gateway }\n");
+    }
+    with open(repo + "/jac/pkg/tests/test_and_other.jac", "w") as f {
+        f.write("import from jaclang.pkg.gateway { Gateway }\nimport from jaclang.pkg.unrelated { X }\n");
+    }
+    found: list[str] = vestigial_test_files(repo, ["jac/pkg/gateway.jac"], ["**/tests/**"]);
+    assert found == ["jac/pkg/tests/test_only.jac"];
+
+    body: str = "[budgets]\nthemes_per_night = 1\nfiles_per_theme = 5\nloc_per_theme = 100\napply_timeout_min = 25\n[protect]\nglobs = [\"**/tests/**\"]\n";
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as tf {
+        cfg_path: str = tf.name;
+        tf.write(body);
+    }
+    dead: list[dict] = [{"file": "jac/pkg/gateway.jac", "rule": "dead-code", "snippet": "s",
+        "summary": "x", "est_loc_saved": 10, "confidence": 5, "risk": 1, "theme_hint": "gw"}];
+    result: dict = select(dead, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, repo);
+    theme: dict = as_dict(as_list(result["themes"])[0]);
+    assert as_list(theme["vestigial_deletions"]) == ["jac/pkg/tests/test_only.jac"];
+
+    # a duplication (non-dead-code) finding must never get vestigial deletions, even same file
+    dup: list[dict] = [{"file": "jac/pkg/gateway.jac", "rule": "duplication", "snippet": "s2",
+        "summary": "x", "est_loc_saved": 10, "confidence": 5, "risk": 1, "theme_hint": "gw2"}];
+    result2: dict = select(dup, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, repo);
+    theme2: dict = as_dict(as_list(result2["themes"])[0]);
+    assert as_list(theme2["vestigial_deletions"]) == [];
 }
 
 test "clock shedding removes lowest-scored theme" {
@@ -282,7 +423,7 @@ test "clock shedding removes lowest-scored theme" {
          "est_loc_saved": 5, "confidence": 2, "risk": 3, "theme_hint": "small"},
     ];
     # remaining 60 min, default verify_estimate 30 → per-theme 55 → only 1 theme fits
-    result: dict = select(findings, "p", cfg_path, "/nonexistent", "/nonexistent", 60);
+    result: dict = select(findings, "p", cfg_path, "/nonexistent", "/nonexistent", 60, "/nonexistent-repo");
     assert len(as_list(result["themes"])) == 1;
     assert as_list(result["themes"])[0]["slug"] == "big";
     assert any([str(d["reason"]) == "no-clock-left" for d in as_list(result["dropped"])]);
