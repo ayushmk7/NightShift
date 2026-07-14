@@ -1,6 +1,6 @@
 /ponytail-audit
 
-You are auditing ONLY the `{pkg}/` directory of the Jaseci monorepo for over-engineering,
+You are auditing ONLY {scope} of the Jaseci monorepo (package: `{pkg}`) for over-engineering,
 dead code, duplication, and reinvented stdlib — using the ponytail ladder (mode: {ponytail_mode}).
 
 Ground yourself in Jac before judging Jac:
