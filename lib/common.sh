@@ -56,6 +56,22 @@ ns_lock_acquire() {
 }
 ns_lock_release() { rm -rf "$LOCK_DIR"; }
 
+# --- CI/CD automation: retry logic for transient failures ---
+# ns_retry <attempts> <delay_sec> <command> <args...>
+# Retries a command multiple times with delays, returns last exit code
+ns_retry() {
+    local attempts=$1 delay=$2; shift 2
+    local last_exit=1
+    for ((i=1; i<=attempts; i++)); do
+        "$@" && { last_exit=0; break; } || last_exit=$?
+        if [ "$i" -lt "$attempts" ]; then
+            ns_log RETRY "Command failed (attempt $i/$attempts), retrying in ${delay}s..."
+            sleep "$delay"
+        fi
+    done
+    return "$last_exit"
+}
+
 # --- time-boxes ---
 # gtimeout (brew coreutils) when present, scripts/timeout.jac otherwise. Arg is minutes.
 ns_timebox() {

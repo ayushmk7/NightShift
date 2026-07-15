@@ -5,6 +5,10 @@ set -euo pipefail
 NS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export NS_ROOT
 
+# CI/CD ENVIRONMENT FIX: launchd fires Terminal.app with minimal environment, missing Homebrew PATH.
+# Add common paths before anything else to ensure gh, jac, claude, etc. are found.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
 # shellcheck source=../lib/common.sh
 . "$NS_ROOT/lib/common.sh"
 . "$NS_ROOT/lib/preflight.sh"
