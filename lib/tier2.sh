@@ -67,6 +67,12 @@ tier2_audit() {
             return 0
         fi
 
+        # Hard account limit: the retry and the corrective re-prompt both fail until it resets.
+        if grep -q "hit your session limit" "$LOG_DIR/audit.json"; then
+            ns_fail "audit ($pkg)" "Claude session limit hit — agentic tier skipped tonight"
+            return 1
+        fi
+
         # Live envelope, bad JSON: one cheap single-turn corrective re-prompt before burning
         # the attempt — two whole nights died to malformed audit output with no salvage.
         ns_timebox 3 "$NS_PATHS_CLAUDE" -p "Your audit output failed validation: $(cat "$LOG_DIR/parse-err-audit.txt")
@@ -103,7 +109,7 @@ tier2_select() {
 
 # Phase C — apply: fresh branch + fresh headless session per theme
 tier2_apply() {
-    local pkg=$1 slug branch theme_file prompt remaining attempt got_report
+    local pkg=$1 slug branch theme_file prompt remaining attempt got_report limit_hit
     local -a model_args=()
     [ -n "$NS_AGENT_MODEL" ] && model_args=(--model "$NS_AGENT_MODEL")
     ns_jac selector split "$LOG_DIR/selection.json" "$LOG_DIR" | while IFS= read -r slug; do
@@ -121,25 +127,38 @@ tier2_apply() {
 
         # Up to 2 attempts, each on a FRESH branch: a transient API error mid-session (same class
         # tier2_audit already retries) shouldn't burn the whole theme for the night.
+        # checkout -f everywhere: a session killed mid-edit leaves uncommitted changes that would
+        # otherwise ride along to main and get committed fail-open by the next night's autofix.
         got_report=0
+        limit_hit=0
         for attempt in 1 2; do
             cd "$REPO"
-            git checkout "$NS_REPO_DEFAULT_BRANCH" 2>/dev/null || true
+            git checkout -f "$NS_REPO_DEFAULT_BRANCH" 2>/dev/null || true
             git branch -D "$branch" 2>/dev/null || true
             git checkout -B "$branch" "$NS_REPO_DEFAULT_BRANCH"
 
+            # </dev/null is load-bearing: claude reads stdin, and stdin here is the slug pipe
+            # from `selector split` — without it the first session EATS the remaining themes
+            # (observed live: 6 themes selected, 1 attempted, 5 silently never ran).
             (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
                 && ns_timebox "$NS_BUDGETS_APPLY_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
                 "${model_args[@]}" \
                 --permission-mode acceptEdits \
                 --allowedTools "Read,Edit,Grep,Glob,Bash(jac fmt *),Bash(jac check *),Bash(jac code *),Bash(jac test *),Bash(git diff *),Bash(git status *),Bash(git log *),Bash(git add *),Bash(git rm *),Bash(git commit *),mcp__jac__*" \
                 --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \
-                --output-format json) > "$LOG_DIR/apply-$slug.json" || true
+                --output-format json) > "$LOG_DIR/apply-$slug.json" < /dev/null || true
 
             ns_jac parse_result meta < "$LOG_DIR/apply-$slug.json" > "$LOG_DIR/meta-apply-$slug.json" || true
 
             if ns_jac parse_result report < "$LOG_DIR/apply-$slug.json" > "$LOG_DIR/report-$slug.json"; then
                 got_report=1
+                break
+            fi
+            # A hard account limit fails every retry and every later theme until it resets —
+            # observed: "You've hit your session limit · resets 7am". Stop burning the night.
+            if grep -q "hit your session limit" "$LOG_DIR/apply-$slug.json"; then
+                limit_hit=1
+                ns_log S3 "Claude session limit hit — retrying is pointless until it resets"
                 break
             fi
             ns_log S3 "apply $slug attempt $attempt failed to parse (transient API error?) — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"
@@ -148,13 +167,17 @@ tier2_apply() {
         if [ "$got_report" -ne 1 ]; then
             ns_fail "theme $slug" "apply session died or returned malformed report after retry — branch discarded"
             rm -f "$LOG_DIR/report-$slug.json"    # empty/invalid leftover from the failed redirect — sendmail's digest globs report-*.json
-            git checkout "$NS_REPO_DEFAULT_BRANCH"; git branch -D "$branch" || true
+            git checkout -f "$NS_REPO_DEFAULT_BRANCH"; git branch -D "$branch" || true
+            if [ "$limit_hit" = 1 ]; then
+                ns_fail "agentic tier" "session limit — remaining themes deferred to a future night"
+                break
+            fi
             continue
         fi
 
         if git diff --quiet "$NS_REPO_DEFAULT_BRANCH...HEAD" 2>/dev/null; then
             ns_fail "theme $slug" "agent made no committed changes — branch discarded"
-            git checkout "$NS_REPO_DEFAULT_BRANCH"; git branch -D "$branch" || true
+            git checkout -f "$NS_REPO_DEFAULT_BRANCH"; git branch -D "$branch" || true
             continue
         fi
 
@@ -168,6 +191,6 @@ tier2_apply() {
 
         ns_jac ledger upsert-theme "$theme_file" "$branch" "$LEDGER" >/dev/null
         ns_queue_branch "$branch" "$theme_file" "$LOG_DIR/report-$slug.json"
-        git checkout "$NS_REPO_DEFAULT_BRANCH"
+        git checkout -f "$NS_REPO_DEFAULT_BRANCH"
     done
 }

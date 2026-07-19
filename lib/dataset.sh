@@ -5,9 +5,12 @@
 
 DATASET_DIR="$NS_ROOT/dataset"
 
-# Called once per night right after a successful audit (findings.json exists, whether 0 or N).
+# Called once per night after select+apply (findings.json exists, whether 0 or N).
+# Dry-runs record nothing: rehearsal nights are sandbox data, same reason backfill skips
+# suffixed log dirs.
 dataset_record_night() {
     local pkg=$1
+    [ -n "${NS_DRY_RUN:-}" ] && return 0
     [ -f "$LOG_DIR/findings.json" ] || return 0
     mkdir -p "$DATASET_DIR"
     ns_jac dataset record-audit "$LOG_DIR" "$DATASET_DIR" "$NS_DATE" "$pkg" >/dev/null
@@ -16,6 +19,7 @@ dataset_record_night() {
 # Called once per shipped branch (lib/ship.sh), after it has been pushed.
 dataset_record_refactor() {
     local branch=$1 pkg=$2 theme=$3 report=$4 added=$5 removed=$6 verify_line=$7 url=$8
+    [ -n "${NS_DRY_RUN:-}" ] && return 0
     local base_ref
     base_ref="$(git -C "$REPO" merge-base "$NS_REPO_DEFAULT_BRANCH" "$branch")" || return 0
     mkdir -p "$DATASET_DIR"
