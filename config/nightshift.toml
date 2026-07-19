@@ -6,7 +6,10 @@ fork           = "ayushmk7/jaseci"          # <- set at M0
 default_branch = "main"
 
 [rotation]                                   # one package per night, round-robin (PRD 7 stage 3)
-packages = ["jac", "jac-byllm", "jac-mcp", "jac-scale"]   # the 4 package dirs that exist in the repo
+# Only packages with a real audit surface AND a test gate. jac-mcp's dir is an empty placeholder
+# (a real audit night found 0 findings) and jac-scale has no test baseline, so it shipped a branch
+# fail-open on 07-14 — both stay out of rotation until they can gate.
+packages = ["jac", "jac-byllm"]
 
 [budgets]                                    # PRD 9 guardrails — no step may violate these
 themes_per_night   = 6                       # was 3 -- real data: 85% of real findings were being
@@ -24,7 +27,7 @@ box_sync_tier1_min = 15
 box_agentic_min    = 90
 box_verify_min     = 65
 box_ship_email_min = 10
-audit_timeout_min  = 15
+audit_timeout_min  = 20                      # 15 was too tight for the jac core package: 07-18 hit the wall twice, 0-byte envelope both times
 apply_timeout_min  = 25                      # per theme session
 audit_max_turns    = 45                      # audit is read-only investigation (grep/read heavy,
                                               # no edits); 25 was too tight once the prompt started

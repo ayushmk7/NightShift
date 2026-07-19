@@ -53,13 +53,32 @@ tier2_audit() {
             --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
             --max-turns "$NS_BUDGETS_AUDIT_MAX_TURNS" --output-format json) > "$LOG_DIR/audit.json" || true
 
+        # 0-byte envelope = the timebox killed the session before it printed anything; a longer
+        # audit_timeout_min (not a re-prompt) is the lever for that failure mode.
+        if [ ! -s "$LOG_DIR/audit.json" ]; then
+            ns_log S3 "audit attempt $attempt produced no output (killed at ${NS_BUDGETS_AUDIT_TIMEOUT_MIN}m?) — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"
+            continue
+        fi
+
         ns_jac parse_result meta < "$LOG_DIR/audit.json" > "$LOG_DIR/meta-audit.json" || true
 
-        if ns_jac parse_result findings < "$LOG_DIR/audit.json" > "$LOG_DIR/findings.json"; then
+        if ns_jac parse_result findings < "$LOG_DIR/audit.json" > "$LOG_DIR/findings.json" 2> "$LOG_DIR/parse-err-audit.txt"; then
             ns_log S3 "audit produced $(ns_jac parse_result len < "$LOG_DIR/findings.json" || echo 0) findings"
             return 0
         fi
-        ns_log S3 "audit attempt $attempt failed to parse (transient API error?) — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"
+
+        # Live envelope, bad JSON: one cheap single-turn corrective re-prompt before burning
+        # the attempt — two whole nights died to malformed audit output with no salvage.
+        ns_timebox 3 "$NS_PATHS_CLAUDE" -p "Your audit output failed validation: $(cat "$LOG_DIR/parse-err-audit.txt")
+Previous output:
+$(ns_jac parse_result field result < "$LOG_DIR/audit.json")
+Re-emit ONLY the corrected \`\`\`json fenced findings array — same schema, no prose." \
+            "${model_args[@]}" --max-turns 1 --output-format json > "$LOG_DIR/audit-repair.json" || true
+        if ns_jac parse_result findings < "$LOG_DIR/audit-repair.json" > "$LOG_DIR/findings.json"; then
+            ns_log S3 "audit salvaged via corrective re-prompt — $(ns_jac parse_result len < "$LOG_DIR/findings.json" || echo 0) findings"
+            return 0
+        fi
+        ns_log S3 "audit attempt $attempt failed to parse even after corrective re-prompt — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"
     done
     ns_fail "audit ($pkg)" "malformed/failed audit after retry (exit 50) — agentic tier skipped tonight"
     return 1

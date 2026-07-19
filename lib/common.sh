@@ -125,16 +125,11 @@ ns_precommit() {
     PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" "$NS_PATHS_PRECOMMIT" "$@"
 }
 
-# Real path(s) to audit for a "package" — none of these are actual top-level directories except
-# jac-byllm (jac-mcp's dir is an empty placeholder; jac-scale and jac core both live under
-# jac/jaclang/). Same mapping problem already fixed for the test/check gates in lib/verify.sh and
-# tier1's format scope; the audit prompt was still saying "look in {pkg}/" literally, which for
-# jac-mcp points at nothing. Confirmed live: a real jac-mcp audit night found 0 findings.
+# Real path(s) to audit for a "package" — neither is an actual top-level directory (jac core
+# lives under jac/jaclang/). The audit prompt would otherwise say "look in {pkg}/" literally.
 ns_audit_scope() {
     case "$1" in
         jac-byllm) echo "jac/jaclang/byllm/" ;;
-        jac-mcp)   echo "jac/jaclang/byllm/mcp.jac, jac/jaclang/byllm/impl/mcp.impl.jac, jac/jaclang/cli/commands/mcp.jac, jac/jaclang/cli/commands/impl/mcp.impl.jac, jac/jaclang/cli/mcp/ (MCP protocol/server integration — scattered across cli and byllm, no single directory)" ;;
-        jac-scale) echo "jac/jaclang/scale/" ;;
         *)         echo "jac/jaclang/ (excluding jac/jaclang/byllm/ and jac/jaclang/scale/, which are separate packages)" ;;
     esac
 }

@@ -13,6 +13,10 @@
        one-time "Allow" click the first time this fires. -->
   <key>ProgramArguments</key><array>
     <string>/usr/bin/osascript</string>
+    <!-- Dated fire log on internal disk (no TCC): lets preflight detect a fire that never became
+         a run. launchd's own exit code only measures osascript and is useless for that. -->
+    <string>-e</string>
+    <string>do shell script "date +%F >> $HOME/Library/Logs/nightshift-fired.log"</string>
     <string>-e</string>
     <string>tell application "Terminal" to do script "/Volumes/ExtremePro/JaseciLabs/NightShift/bin/nightshift.sh run; exit"</string>
   </array>

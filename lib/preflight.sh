@@ -55,6 +55,18 @@ preflight_main() {
         ns_die "$EX_BUG" "SMTP_USER/SMTP_PASS not set — source ~/.nightshift.env or fix nightshift.env"
     fi
 
+    # Missed-night detection: launchd's exit code only measures osascript, so a fire that never
+    # became a run (TCC hang, Terminal automation prompt) is invisible to it. The installed plist
+    # appends a dated line to nightshift-fired.log on every fire; a past date with no run dir
+    # means the night vanished — warn, which flows into the next digest via warnings.txt.
+    local fired
+    if [ -f "$HOME/Library/Logs/nightshift-fired.log" ]; then
+        while IFS= read -r fired; do
+            [ -n "$fired" ] && [ "$fired" != "$NS_DATE" ] && [ ! -d "$NS_ROOT/logs/$fired" ] \
+                && ns_warn "missed night: $fired (launchd fired, no run dir)"
+        done < <(tail -7 "$HOME/Library/Logs/nightshift-fired.log" | sort -u)
+    fi
+
     # prune logs older than 60 nights (TPRD 13)
     find "$NS_ROOT/logs" -maxdepth 1 -type d -name '20*' -mtime +60 -exec rm -rf {} + 2>/dev/null || true
 }
