@@ -71,11 +71,7 @@ def gate(pkg: str, raw_path: str, baseline_dir: str) -> (int, list[str]) {
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
-    if cmd == "parse" and len(args) == 3 {
-        for i in failing_ids(read_file(args[2])) {
-            print(i);
-        }
-    } elif cmd == "record" and len(args) == 5 {
+    if cmd == "record" and len(args) == 5 {
         print(record(args[2], args[3], args[4]));
     } elif cmd == "gate" and len(args) == 5 {
         (code, new_fails) = gate(args[2], args[3], args[4]);
@@ -87,8 +83,7 @@ with entry {
         }
         sys.exit(code);
     } elif cmd != "" and cmd != "test" {
-        eprint("usage: jac run testgate.jac parse <raw.txt>");
-        eprint("       jac run testgate.jac record <pkg> <raw.txt> <baseline_dir>");
+        eprint("usage: jac run testgate.jac record <pkg> <raw.txt> <baseline_dir>");
         eprint("       jac run testgate.jac gate <pkg> <raw.txt> <baseline_dir>");
     }
 }

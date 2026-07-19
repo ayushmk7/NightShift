@@ -60,8 +60,7 @@ dataset_backfill() {
             fi
             base_ref="$(git -C "$REPO" merge-base "$NS_REPO_DEFAULT_BRANCH" "origin/$branch" 2>/dev/null)"
             [ -n "$base_ref" ] || { ns_log DATASET "skip $branch (no merge-base)"; continue; }
-            read -r added removed < <(git -C "$REPO" diff --numstat "$base_ref...origin/$branch" \
-                | awk '{if ($1 ~ /^[0-9]+$/) a+=$1; if ($2 ~ /^[0-9]+$/) r+=$2} END {print a+0, r+0}')
+            read -r added removed < <(ns_diff_numstat "$REPO" "$base_ref...origin/$branch")
             tests_line="$(cat "$d/tests-$(basename "$branch").txt" 2>/dev/null || echo "verified")"
             url="https://github.com/$NS_REPO_FORK/tree/$branch"
             [ -f "$report" ] || continue

@@ -37,8 +37,7 @@ ship_branch() {
     # said +11 net, actual diff was +90/-77). Overrides render()'s loc_before/loc_after args below --
     # same convention render_draft.jac's git_report() already uses for tier-1's own reports.
     local added removed
-    read -r added removed < <(git -C "$REPO" diff --numstat "$NS_REPO_DEFAULT_BRANCH...$branch" \
-        | awk '{if ($1 ~ /^[0-9]+$/) a+=$1; if ($2 ~ /^[0-9]+$/) r+=$2} END {print a+0, r+0}')
+    read -r added removed < <(ns_diff_numstat "$REPO" "$NS_REPO_DEFAULT_BRANCH...$branch")
 
     draft_path="$DRAFTS/drafts/$NS_DATE--$slug.md"
     ns_jac render_draft render "$report" \

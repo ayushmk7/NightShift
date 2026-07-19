@@ -2,7 +2,7 @@
 
 argv:
   render <report.json> [k=v ...]   report from parse_result.jac plus string overrides
-                                   (branch=, package=, date=, tests=, url=) so bash never
+                                   (branch=, package=, date=, tests=) so bash never
                                    composes JSON; stdout: full draft (frontmatter + body)
   git-report <repo_dir> <summary>  synthesize a report JSON from the branch's git diff
                                    (used for the tier-1 autofix branch, which has no agent report)

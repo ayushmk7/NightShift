@@ -30,7 +30,7 @@ import os;
 import json;
 import glob;
 import subprocess;
-import from nslib { eprint, parse_obj, parse_list, as_dict, as_list, as_int, fingerprint, score_of }
+import from nslib { eprint, parse_obj, parse_list, as_dict, as_list, as_int, fingerprint, score_of, append_row }
 
 def git_show(repo_dir: str, ref: str, path: str) -> str {
     r = subprocess.run(["git", "-C", repo_dir, "show", ref + ":" + path],
@@ -42,12 +42,6 @@ def git_diff(repo_dir: str, base_ref: str, branch_ref: str, path: str) -> str {
     r = subprocess.run(["git", "-C", repo_dir, "diff", base_ref, branch_ref, "--", path],
         capture_output=True, text=True);
     return r.stdout;
-}
-
-def append_row(path: str, row: dict) {
-    with open(path, "a") as f {
-        f.write(json.dumps(row) + "\n");
-    }
 }
 
 """Every raw finding an audit surfaced tonight, cross-referenced against selection.json to record

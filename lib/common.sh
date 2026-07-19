@@ -11,9 +11,8 @@ LEDGER="$NS_ROOT/state/ledger.jsonl.cache"
 CONFIG="$NS_ROOT/config/nightshift.toml"
 LOCK_DIR="/tmp/nightshift.lock"
 
-# --- exit codes (TechnicalPRD 18) ---
-EX_OK=0; EX_LOCK=40; EX_DISABLED=41; EX_AUTH=42; EX_OFFLINE=43; EX_SYNC=44
-EX_AUDIT=50; EX_ALLFAIL=51; EX_CEILING=60; EX_BUG=70
+# --- exit codes (TechnicalPRD 18; 50=audit-parse and 60=ceiling live in their tools) ---
+EX_LOCK=40; EX_DISABLED=41; EX_AUTH=42; EX_OFFLINE=43; EX_SYNC=44; EX_ALLFAIL=51; EX_BUG=70
 
 # --- config bootstrap ---
 # Chicken-and-egg: the jac binary path lives in the toml that jac itself reads.
@@ -73,14 +72,10 @@ ns_retry() {
 }
 
 # --- time-boxes ---
-# gtimeout (brew coreutils) when present, scripts/timeout.jac otherwise. Arg is minutes.
+# gtimeout (brew coreutils, hard dep — preflight checks it). Arg is minutes.
 ns_timebox() {
     local min=$1; shift
-    if command -v gtimeout >/dev/null 2>&1; then
-        gtimeout "${min}m" "$@"
-    else
-        ns_jac timeout "$((min * 60))" "$@"
-    fi
+    gtimeout "${min}m" "$@"
 }
 
 ns_remaining_min() {
@@ -108,6 +103,12 @@ ns_stage() {
 # queue.tsv line: branch<TAB>theme.json-or-"-"<TAB>report.json-or-"-"
 ns_queue_branch()   { printf '%s\t%s\t%s\n' "$1" "${2:--}" "${3:--}" >> "$LOG_DIR/queue.tsv"; }
 ns_mark_green()     { printf '%s\t%s\t%s\n' "$1" "${2:--}" "${3:--}" >> "$LOG_DIR/green.tsv"; }
+
+# summed added/removed line counts across a diff range — ship (draft stats) + dataset backfill
+ns_diff_numstat() {   # ns_diff_numstat <dir> <range>
+    git -C "$1" diff --numstat "$2" \
+        | awk '{if ($1 ~ /^[0-9]+$/) a+=$1; if ($2 ~ /^[0-9]+$/) r+=$2} END {print a+0, r+0}'
+}
 
 # --- dry-run seam: every push in the nightly path goes through this (TPRD 14) ---
 ns_git_push() {   # ns_git_push <dir> <push-args...>

@@ -1,6 +1,12 @@
 # shellcheck shell=bash
 # lib/preflight.sh — S0 (TechnicalPRD 7-S0). Any failure emails and aborts the night.
 
+claude_pong() {
+    (unset ANTHROPIC_API_KEY; ns_timebox 3 "$NS_PATHS_CLAUDE" -p "reply with exactly: pong" \
+        --max-turns 1 --output-format json 2>/dev/null) \
+        | grep -q '"result"[[:space:]]*:[[:space:]]*"pong"'
+}
+
 preflight_main() {
     if [ -f "$HOME/.nightshift/DISABLE" ]; then
         touch "$LOG_DIR/DISABLED"
@@ -36,19 +42,10 @@ preflight_main() {
     fi
     ns_jac ledger state-set last_jac_version "\"$jac_ver\"" "$STATE"
 
-    # Claude auth pong probe (subscription creds via Keychain or CLAUDE_CODE_OAUTH_TOKEN)
-    # CI/CD automation: retry transient API failures, ensure ANTHROPIC_API_KEY doesn't interfere
-    local pong pong_ok=false
-    for attempt in $(seq 1 3); do
-        pong="$(unset ANTHROPIC_API_KEY; ns_timebox 3 "$NS_PATHS_CLAUDE" -p "reply with exactly: pong" \
-                --max-turns 1 --output-format json 2>/dev/null || true)"
-        if echo "$pong" | grep -q '"result"[[:space:]]*:[[:space:]]*"pong"'; then
-            pong_ok=true
-            break
-        fi
-        [ "$attempt" -lt 3 ] && sleep 2 && ns_log RETRY "Claude pong failed (attempt $attempt/3), retrying..."
-    done
-    [ "$pong_ok" = true ] || ns_die "$EX_AUTH" "claude pong probe failed (3 attempts) — run /login or set CLAUDE_CODE_OAUTH_TOKEN"
+    # Claude auth pong probe (subscription creds via Keychain or CLAUDE_CODE_OAUTH_TOKEN);
+    # ANTHROPIC_API_KEY is unset so a stale key can't shadow the subscription auth
+    ns_retry 3 2 claude_pong \
+        || ns_die "$EX_AUTH" "claude pong probe failed (3 attempts) — run /login or set CLAUDE_CODE_OAUTH_TOKEN"
 
     # CI/CD automation: validate SMTP credentials before we need them (catch config errors early)
     if [ -z "${SMTP_USER:-}" ] || [ -z "${SMTP_PASS:-}" ]; then

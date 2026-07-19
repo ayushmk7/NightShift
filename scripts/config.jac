@@ -1,32 +1,9 @@
-"""Read config/nightshift.toml and expose it to bash: flat env lines, JSON, or one dotted key."""
+"""Read config/nightshift.toml and expose it to bash as flat NS_* env lines."""
 import sys;
 import os;
 import json;
-import tomllib;
 import from shlex { quote }
-
-def eprint(msg: str) {
-    err: any = sys.stderr;
-    err.write(msg + "\n");
-}
-
-def load_config(path: str) -> dict {
-    with open(path, "rb") as f {
-        parsed: any = tomllib.load(f);
-        if isinstance(parsed, dict) {
-            return parsed;
-        }
-    }
-    raise ValueError("not a TOML table: " + path);
-}
-
-def get_key(cfg: dict, dotted: str) -> any {
-    cur: any = cfg;
-    for part in dotted.split(".") {
-        cur = cur[part];
-    }
-    return cur;
-}
+import from nslib { eprint, load_config_toml }
 
 def env_value(value: any) -> str {
     if isinstance(value, list) or isinstance(value, dict) {
@@ -63,15 +40,11 @@ with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "env" {
-        for line in as_env_lines(load_config(config_path(args, 2))) {
+        for line in as_env_lines(load_config_toml(config_path(args, 2))) {
             print(line);
         }
-    } elif cmd == "json" {
-        print(json.dumps(load_config(config_path(args, 2))));
-    } elif cmd == "get" and len(args) > 2 {
-        print(env_value(get_key(load_config(config_path(args, 3)), args[2])));
-    } else {
-        eprint("usage: jac run config.jac env|json|get <dotted.key> [config.toml]");
+    } elif cmd != "" and cmd != "test" {
+        eprint("usage: jac run config.jac env [config.toml]");
     }
 }
 
@@ -82,8 +55,7 @@ test "env lines flatten sections and quote values" {
         tf.write(body);
         path: str = tf.name;
     }
-    lines: list[str] = as_env_lines(load_config(path));
+    lines: list[str] = as_env_lines(load_config_toml(path));
     assert "NS_REPO_FORK=me/jaseci" in lines;
     assert "NS_BUDGETS_MAX_TURNS=80" in lines;
-    assert get_key(load_config(path), "budgets.max_turns") == 80;
 }

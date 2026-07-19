@@ -83,11 +83,7 @@ def gate(main_path: str, branch_path: str) -> (int, list[str]) {
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
-    if cmd == "parse" and len(args) == 3 {
-        for i in identities(read_file(args[2])) {
-            print(i);
-        }
-    } elif cmd == "gate" and len(args) == 4 {
+    if cmd == "gate" and len(args) == 4 {
         (code, new_errs) = gate(args[2], args[3]);
         if code == 2 {
             eprint("checkgate: main-side check output missing: " + args[2]);
@@ -97,8 +93,7 @@ with entry {
         }
         sys.exit(code);
     } elif cmd != "" and cmd != "test" {
-        eprint("usage: jac run checkgate.jac parse <raw.txt>");
-        eprint("       jac run checkgate.jac gate <main_raw> <branch_raw>");
+        eprint("usage: jac run checkgate.jac gate <main_raw> <branch_raw>");
     }
 }
 

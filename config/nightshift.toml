@@ -23,10 +23,6 @@ loc_per_theme      = 600                     # was 300 -- was silently dropping 
                                               # real 492-line dead file never even got considered:
                                               # 0 + 492 > 300 killed it before packing tried).
 wallclock_min      = 180                     # hard ceiling for the whole night
-box_sync_tier1_min = 15
-box_agentic_min    = 90
-box_verify_min     = 65
-box_ship_email_min = 10
 audit_timeout_min  = 20                      # 15 was too tight for the jac core package: 07-18 hit the wall twice, 0-byte envelope both times
 apply_timeout_min  = 25                      # per theme session
 audit_max_turns    = 45                      # audit is read-only investigation (grep/read heavy,
@@ -65,5 +61,4 @@ jac      = "/Users/ayush/.local/bin/jac"
 jac_repo = "/Volumes/ExtremePro/JaseciLabs/NightShift/work/repo/jac/zig-out/bin/jac"
 claude   = "/Users/ayush/.local/bin/claude"
 gh       = "/opt/homebrew/bin/gh"
-node_dir = "/opt/homebrew/bin"
 precommit = "/Users/ayush/.local/bin/pre-commit"

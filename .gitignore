@@ -5,3 +5,6 @@ __jac_gen__/
 logs/
 work/
 state/
+# vestigial pytest cache + built paper artifact
+.pytest_cache/
+*.pdf

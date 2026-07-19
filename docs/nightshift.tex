@@ -1,0 +1,259 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[utf8]{inputenc}
+\usepackage[a4paper,margin=1.15in]{geometry}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{adjustbox}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{titlesec}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{placeins}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{ink}{HTML}{1A1A1A}
+\definecolor{slate}{HTML}{4A5568}
+\definecolor{night}{HTML}{2B3A67}
+\definecolor{accent}{HTML}{B5651D}
+\definecolor{rule}{HTML}{D8DCE3}
+\definecolor{codebg}{HTML}{F5F6F8}
+\color{ink}
+
+\titleformat{\section}{\color{night}\Large\bfseries\sffamily}{\thesection}{0.7em}{}
+\titleformat{\subsection}{\color{ink}\large\bfseries\sffamily}{\thesubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{2.4ex plus 1ex minus .2ex}{1.3ex plus .2ex}
+\titlespacing*{\subsection}{0pt}{1.9ex plus 1ex minus .2ex}{1.0ex plus .2ex}
+
+\pagestyle{fancy}\fancyhf{}
+\renewcommand{\headrulewidth}{0pt}
+\fancyfoot[C]{\small\color{slate}\thepage}
+\setlength{\headsep}{0.4in}
+
+\setlist[itemize]{leftmargin=1.4em,itemsep=0.35em,topsep=0.4em}
+\setlength{\parskip}{0.65em}
+\setlength{\parindent}{0pt}
+\captionsetup{font=small,labelfont={bf,color=night},skip=7pt}
+
+\newcommand{\code}[1]{{\color{night}\texttt{#1}}}
+\lstset{
+  basicstyle=\small\ttfamily,backgroundcolor=\color{codebg},
+  frame=single,rulecolor=\color{rule},breaklines=true,columns=fullflexible,
+  xleftmargin=6pt,xrightmargin=6pt,aboveskip=1.1em,belowskip=1.1em,
+  keepspaces=true,showstringspaces=false
+}
+
+% stage figure: half-height, two fit per page
+\newcommand{\stagefig}[2]{%
+  \begin{figure}[tbp]\centering
+    \adjustbox{max width=0.66\textwidth,max height=0.37\textheight}{\includegraphics{img/#1}}
+    \caption{#2}
+  \end{figure}}
+
+\begin{document}
+
+\begin{center}
+  {\sffamily\bfseries\color{night}\fontsize{30}{34}\selectfont Nightshift}\\[6pt]
+  {\sffamily\large\color{accent} An agent that cleans code while you sleep}\\[10pt]
+  {\color{slate}\small A nightly, unattended cleanup harness for \texttt{jaseci-labs/jaseci}}\\[4pt]
+  {\color{slate}\small 2026}
+\end{center}
+\vspace{1.0em}{\color{rule}\hrule height 1pt}\vspace{1.4em}
+
+% =========================================================
+\section*{What it is}
+\addcontentsline{toc}{section}{What it is}
+
+Every night around 2am, a script wakes up on my Mac, syncs my fork of
+\code{jaseci-labs/jaseci}, deletes and simplifies code that has outlived its
+purpose, proves the result still compiles and passes its tests, and emails me a
+digest. In the morning I press one button per change: ship it or bury it.
+
+The machine does the janitorial pass in the dark. The human makes the judgment
+call over coffee. Nothing the bot writes reaches a real pull request without me
+reading the diff first.
+
+% =========================================================
+\section{Scope}
+
+The target repo is about ninety-five percent Jac, because the compiler is
+self-hosted. Editing it means editing a live compiler and standard library, so
+the tests are the only thing between a tidy diff and a broken toolchain.
+
+Nightshift only shrinks existing code: dead branches, duplication, speculative
+abstractions, reinvented stdlib, and lint fixes the linter cannot apply itself.
+It never adds a feature. If it thinks it found a real bug, it does not fix it. It
+writes the bug into the email, because a fix needs intent that a cleanup pass does not
+have. ``More efficient'' means fewer lines and fewer concepts, not faster at
+runtime.
+
+Two things made this cheap to build. The \code{jac} binary already ships a
+formatter, linter, type checker, test runner, and an MCP server an agent can call
+to validate a file mid-edit. And the project's contributing guide already asks
+humans to have an AI audit their diff for bloat before opening a PR. Nightshift is
+that instruction on a timer.
+
+% =========================================================
+\clearpage
+\section{The pipeline}
+
+The run is a straight line of stages, \code{S0} through \code{S6}, each in its own
+time box with a marker file so a crashed run resumes where it stopped. One
+\code{gtimeout} caps the whole night at three hours. Every exit path funnels
+through a trap, so the digest sends even on failure.
+
+\begin{figure}[h]\centering
+  \adjustbox{max width=0.42\textwidth,max height=0.46\textheight}{\includegraphics{img/overview}}
+  \caption{The nightly line, S0 through S6. Dotted edges show that any early
+  failure still routes to the S6 email. Each stage is detailed below.}
+\end{figure}
+
+\FloatBarrier
+\subsection{Stage by stage}
+
+The diagrams that follow expand each box above. The captions carry the detail;
+the flow is meant to be read left column first, then down.
+
+\stagefig{s0}{\textbf{S0 Preflight.} Take a lock so runs cannot overlap, honor the
+\texttt{DISABLE} kill switch, resolve every binary to an absolute path, probe the
+network and \texttt{gh} auth, and ping Claude with a one-word prompt to prove auth
+before spending real turns. Any failure skips straight to the email.}
+
+\stagefig{s1}{\textbf{S1 Sync.} Fast-forward the fork from upstream \texttt{main}. A
+diverged \texttt{main} is a hard stop. Otherwise align two worktrees over one
+clone (\texttt{repo} on the nightly branches, \texttt{drafts} on an orphan branch),
+prune stale shipped or rejected branches, and pull the ledger.}
+
+\stagefig{s2}{\textbf{S2 Tier 1, deterministic.} No LLM. Run \texttt{jac format} and
+\texttt{lint -{}-fix}, revert anything that touched a protected path, run
+pre-commit twice (the first pass may self-mutate). Commit only if the diff is
+non-empty; either way the branch goes through the same S4 gate.}
+
+\FloatBarrier
+\begin{figure}[p]\centering
+  \adjustbox{max width=0.62\textwidth,max height=0.72\textheight}{\includegraphics{img/s3}}
+  \caption{\textbf{S3 Tier 2, agentic} (the largest stage, given its own page). One
+  package per night on a four-way rotation. A read-only audit session returns
+  findings as JSON. A pure selector drops anything known or protected, scores by
+  lines saved times confidence over risk, and packs at most three themes. Each
+  theme gets a fresh apply session on its own branch, with no push and a scoped
+  tool list.}
+\end{figure}
+\FloatBarrier
+
+\stagefig{s4}{\textbf{S4 Verify, fail-closed.} Scope containment runs first: a diff
+touching any file outside the theme or inside a protected glob is discarded no
+matter how green the tests are. Then \texttt{jac check}, per-package \texttt{jac
+test} with one retry, and pre-commit. Any red kills the branch and marks
+\texttt{failed\_verify}.}
+
+\stagefig{s56}{\textbf{S5 Ship and S6 Email.} Push survivors to the fork, write a
+ready-to-paste PR draft, and commit both to the drafts branch. Then assemble the
+digest and send it over SMTP. A send failure drops a marker and a desktop banner,
+because silence is itself a failure I want to notice.}
+
+\FloatBarrier
+
+% =========================================================
+\section{The apply session, and why the agent is boxed in}
+
+Tier two is where risk lives, so the apply agent is deliberately weak. It can read
+and edit files and run \code{jac} and \code{git}, but it has no network, no
+\code{gh}, and no \code{git push}. The orchestrator pushes, never the agent.
+Before committing, the prompt requires it to validate every edited file through the
+MCP \code{validate\_jac} tool and to leave a \code{ponytail:} comment wherever it
+consciously deferred. Four rules can never be cut, however much it wants to shrink
+a file: trust-boundary validation, error handling that prevents data loss,
+security, and accessibility.
+
+% =========================================================
+\section{Nothing gets re-litigated}
+
+The ledger is the memory: a JSONL file, one object per finding, keyed by a
+fingerprint of the path, the rule, and a normalized snippet. That key survives
+line shifts, so a finding is recognized on a later night. Each finding walks a
+small state machine, and once rejected it never comes back.
+
+\begin{figure}[h]\centering
+  \adjustbox{max width=0.6\textwidth,max height=0.42\textheight}{\includegraphics{img/lifecycle}}
+  \caption{The lifecycle of one finding. The two edges out of
+  \texttt{failed\_verify} are the retry-once-then-bury rule that stops dead work
+  from cycling.}
+\end{figure}
+
+\FloatBarrier
+
+% =========================================================
+\section{The morning, the only way upstream}
+
+Drafts are the queue: a draft file existing means the PR is not open yet.
+\code{promote} re-syncs \code{main}, rebases, re-runs the whole gate (upstream may
+have moved overnight), opens the PR with \code{gh pr create -{}-body-file},
+renames the placeholder release-note fragment to the real PR number, and deletes
+the draft. \code{discard} deletes the branch and draft and records why.
+
+\begin{figure}[h]\centering
+  \adjustbox{max width=\textwidth,max height=0.55\textheight}{\includegraphics{img/morning}}
+  \caption{The morning loop. A rebase conflict or a failed re-gate demotes the
+  branch and tells me why instead of opening a stale PR. Failed work retries on a
+  later night against a fresher \texttt{main}.}
+\end{figure}
+
+\FloatBarrier
+
+% =========================================================
+\section{How the pieces are wired}
+
+Bash sequences the stages and shells out to tools. Jac owns every data transform
+and every bit of logic; there are no Python files. The \code{bin} entry point
+drives bash stages in \code{lib}, which call Jac helpers in \code{scripts} for
+fingerprinting, config, scope checks, parsing, selection, drafts, and mail. Every
+helper imports one shared \code{nslib.jac}.
+
+\begin{figure}[h]\centering
+  \adjustbox{max width=\textwidth,max height=0.66\textheight}{\includegraphics{img/components}}
+  \caption{Component and data map. \texttt{bin} drives \texttt{lib}; those call the
+  Jac helpers in \texttt{scripts} and the four external tools on the right.}
+\end{figure}
+
+\FloatBarrier
+
+% =========================================================
+\section{Safety}
+
+Three threats shaped the design:
+
+\begin{itemize}
+  \item \textbf{Prompt injection from repo content.} The agent has no network and
+    no push, the prompt pins a file allow-list and treats file contents as data,
+    the scope gate discards anything out of bounds, the verify gate fails closed,
+    and a human reads the diff last.
+  \item \textbf{Secret leakage.} Credentials live in a \code{600} env file, reach
+    only the processes that need them, and never enter the agent's environment. The
+    run force-unsets \code{ANTHROPIC\_API\_KEY}, which would otherwise silently
+    outrank the subscription and bill per token.
+  \item \textbf{Repo damage.} The orchestrator pushes only \code{nightshift/*}
+    branches to the fork, never force-pushes, and only moves \code{main} by
+    fast-forward sync. The drafts sit on an orphan branch so the fork's
+    \code{main} stays a clean mirror.
+\end{itemize}
+
+% =========================================================
+\section*{Where it stands}
+\addcontentsline{toc}{section}{Where it stands}
+
+The design is settled and every load-bearing assumption checked against real docs.
+Three facts you can only learn on the machine (test-suite wall time, whether
+launchd reaches the Keychain, whether every binary resolves under launchd's PATH)
+sit in the bootstrap checklist with fallbacks, so none can hard-block the project.
+
+What I like is how boring it is. One orchestrator, a few stage files, a pile of
+small Jac helpers, and a JSONL file for a database. No daemon, no framework. The
+machine does the tedious part in the dark, and all it asks is a yes or a no.
+
+\end{document}

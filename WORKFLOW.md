@@ -203,7 +203,6 @@ flowchart LR
     subgraph JAC["scripts · Jac helpers"]
         NL["nslib.jac · shared · fingerprint · globs · fragment map"]
         CF["config.jac · toml to env"]
-        TO["timeout.jac"]
         LG["ledger.jac"]
         CS["check_scope.jac"]
         PRz["parse_result.jac"]
