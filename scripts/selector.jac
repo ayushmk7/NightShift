@@ -244,7 +244,7 @@ def select(findings: list[dict], package: str, config_path: str, ledger_path: st
     eligible: list[dict] = [];
     dropped: list[dict] = [];
     for f in findings {
-        f["fingerprint"] = fingerprint(str(f["file"]), str(f["rule"]), str(f["snippet"]));
+        f["fingerprint"] = fingerprint(str(f["file"]), str(f["rule"]));
         f["score"] = score_of(f);
         reason: str | None = drop_reason(f, ledger, globs);
         if reason is None {

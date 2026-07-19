@@ -84,7 +84,7 @@ def record_audit(log_dir: str, dataset_dir: str, date_s: str, package: str) -> i
         # Raw audit findings never carry a fingerprint -- the selector computes it (same formula,
         # nslib.fingerprint) only once a finding survives into selection.json. Must recompute it
         # here identically to cross-reference correctly.
-        fp: str = fingerprint(str(fd.get("file", "")), str(fd.get("rule", "")), str(fd.get("snippet", "")));
+        fp: str = fingerprint(str(fd.get("file", "")), str(fd.get("rule", "")));
         status: str = "applied" if fp in selected_fps else dropped_map.get(fp, "not_selected");
         append_row(audit_out, {
             "date": date_s, "package": package, "file": fd.get("file", ""),
@@ -178,8 +178,8 @@ test "record_audit cross-references selection status and always logs a night row
     # Raw findings never carry a fingerprint -- the selector computes it (same nslib.fingerprint
     # formula) only once a finding survives into selection.json. Compute the SAME fingerprints
     # here to build a realistic selection.json, exactly as the real pipeline would.
-    fp_a: str = fingerprint("a.jac", "dup", "snip a");
-    fp_b: str = fingerprint("b.jac", "dead", "snip b");
+    fp_a: str = fingerprint("a.jac", "dup");
+    fp_b: str = fingerprint("b.jac", "dead");
     with open(d + "/findings.json", "w") as f {
         f.write(json.dumps([
             {"file": "a.jac", "rule": "dup", "snippet": "snip a", "summary": "s1", "confidence": 4, "risk": 2, "score": 10.0},

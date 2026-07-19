@@ -114,9 +114,7 @@ def parse_value(raw: str) -> any {
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
-    if cmd == "fingerprint" and len(args) == 5 {
-        print(fingerprint(args[2], args[3], args[4]));
-    } elif cmd == "get" and len(args) == 4 {
+    if cmd == "get" and len(args) == 4 {
         rows: dict[str, dict] = load_ledger(args[3]);
         if args[2] in rows {
             print(json.dumps(rows[args[2]]));
@@ -151,7 +149,6 @@ with entry {
         state2[args[2]] = parse_value(args[3]);
         state_write(args[4], state2);
     } elif cmd != "" and cmd != "test" {
-        eprint("usage: jac run ledger.jac fingerprint <relpath> <rule> <snippet>");
         eprint("       jac run ledger.jac get <fp> <ledger.jsonl>");
         eprint("       jac run ledger.jac upsert <ledger.jsonl>            (row JSON on stdin)");
         eprint("       jac run ledger.jac set-status <fp> <status> <ledger.jsonl> [extra-json]");
@@ -169,7 +166,7 @@ test "upsert then set-status: last writer wins, attempts increment" {
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tf {
         path: str = tf.name;
     }
-    fp: str = fingerprint("a/b.jac", "dead-code", "if x { y; }");
+    fp: str = fingerprint("a/b.jac", "dead-code");
     upsert(path, {"fingerprint": fp, "package": "jac", "file": "a/b.jac",
                   "rule": "dead-code", "summary": "s"});
     set_status(path, fp, "failed_verify", {});

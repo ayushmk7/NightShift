@@ -73,10 +73,12 @@ def as_float(v: any) -> float {
     return float(str(v));
 }
 
-"""Finding identity (TechnicalPRD 8.1): sha1(relpath \\x1f rule \\x1f whitespace-normalized snippet)."""
-def fingerprint(relpath: str, rule: str, snippet: str) -> str {
-    norm: str = " ".join(snippet.split());
-    return sha1((relpath + "\x1f" + rule + "\x1f" + norm).encode("utf-8")).hexdigest();
+"""Finding identity (TechnicalPRD 8.1): sha1(relpath \\x1f rule). The snippet is deliberately
+NOT hashed: it is LLM-authored prose, re-worded every audit, and hashing it made the same
+finding a new fingerprint each night — the ledger never deduped and the same refactor shipped
+twice. Collision (two same-rule findings in one file) dedupes conservatively together."""
+def fingerprint(relpath: str, rule: str) -> str {
+    return sha1((relpath + "\x1f" + rule).encode("utf-8")).hexdigest();
 }
 
 def today() -> str {
@@ -178,9 +180,10 @@ def release_fragment(pkg: str) -> str {
     return "docs/docs/community/release_notes/unreleased/" + fragment_dir(pkg) + "/0000.refactor.md";
 }
 
-test "fingerprint normalizes whitespace" {
-    assert fingerprint("f.jac", "dup", "x   y") == fingerprint("f.jac", "dup", "x y");
-    assert fingerprint("f.jac", "dup", "x y") != fingerprint("g.jac", "dup", "x y");
+test "fingerprint is stable per (file, rule) and sensitive to both" {
+    assert fingerprint("f.jac", "dup") == fingerprint("f.jac", "dup");
+    assert fingerprint("f.jac", "dup") != fingerprint("g.jac", "dup");
+    assert fingerprint("f.jac", "dup") != fingerprint("f.jac", "dead-code");
 }
 
 test "protected globs with negation" {
