@@ -81,6 +81,12 @@ def fingerprint(relpath: str, rule: str) -> str {
     return sha1((relpath + "\x1f" + rule).encode("utf-8")).hexdigest();
 }
 
+"""Selection score (TPRD S3-B step 3): expected LOC saved, weighted by the model's own
+confidence, discounted by its risk. Shared by selector (packing) and dataset (capture)."""
+def score_of(f: dict) -> float {
+    return float(int(f["est_loc_saved"]) * int(f["confidence"])) / float(int(f["risk"]));
+}
+
 def today() -> str {
     return date.today().isoformat();
 }

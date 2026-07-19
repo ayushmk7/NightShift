@@ -15,7 +15,8 @@ import re;
 import subprocess;
 import from nslib {
     eprint, read_stdin, parse_list, parse_obj, fingerprint, load_ledger, state_read,
-    state_write, load_config_toml, load_globs, is_protected, as_dict, as_list, as_float
+    state_write, load_config_toml, load_globs, is_protected, as_dict, as_list, as_float,
+    score_of
 }
 
 """Non-project imports a test file may keep and still be "100% about this theme's dead code" --
@@ -128,10 +129,6 @@ def impl_siblings(file: str) -> list[str] {
     return [];
 }
 
-def score_of(f: dict) -> float {
-    return float(int(f["est_loc_saved"]) * int(f["confidence"])) / float(int(f["risk"]));
-}
-
 """Eligibility (TPRD S3-B step 2). Returns a drop reason, or None when the finding is in play."""
 def drop_reason(f: dict, ledger: dict[str, dict], globs: list[str]) -> str | None {
     fp: str = str(f["fingerprint"]);
@@ -174,7 +171,7 @@ def pack_themes(eligible: list[dict], budgets: dict, package: str, repo_dir: str
             new_file: int = 0 if file in files else 1;
             if len(files) + new_file > int(budgets["files_per_theme"])
                or est_loc + int(f["est_loc_saved"]) > int(budgets["loc_per_theme"]) {
-                dropped.append({"fingerprint": f["fingerprint"], "file": file, "reason": "over-theme-budget"});
+                dropped.append({"fingerprint": f["fingerprint"], "file": file, "rule": f["rule"], "reason": "over-theme-budget"});
                 continue;
             }
             if new_file == 1 {
@@ -213,7 +210,7 @@ def pack_themes(eligible: list[dict], budgets: dict, package: str, repo_dir: str
     themes.sort(key=lambda t: dict -> tuple { return (-as_float(t["score"]), str(t["slug"])); });
     for t in themes[int(budgets["themes_per_night"]):] {
         for f in as_list(t["findings"]) {
-            dropped.append({"fingerprint": f["fingerprint"], "file": f["file"], "reason": "over-night-budget"});
+            dropped.append({"fingerprint": f["fingerprint"], "file": f["file"], "rule": as_dict(f)["rule"], "reason": "over-night-budget"});
         }
     }
     return (themes[:int(budgets["themes_per_night"])], dropped);
@@ -227,7 +224,7 @@ def fit_clock(themes: list[dict], dropped: list[dict], budgets: dict,
     while themes and len(themes) * per_theme > remaining_min {
         shed: dict = themes.pop();
         for f in as_list(shed["findings"]) {
-            dropped.append({"fingerprint": f["fingerprint"], "file": f["file"], "reason": "no-clock-left"});
+            dropped.append({"fingerprint": f["fingerprint"], "file": f["file"], "rule": as_dict(f)["rule"], "reason": "no-clock-left"});
         }
     }
     return (themes, dropped);
@@ -250,7 +247,7 @@ def select(findings: list[dict], package: str, config_path: str, ledger_path: st
         if reason is None {
             eligible.append(f);
         } else {
-            dropped.append({"fingerprint": f["fingerprint"], "file": f["file"], "reason": reason});
+            dropped.append({"fingerprint": f["fingerprint"], "file": f["file"], "rule": f["rule"], "reason": reason});
         }
     }
     (themes, dropped2) = pack_themes(eligible, budgets, package, repo_dir, globs);

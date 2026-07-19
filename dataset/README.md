@@ -10,14 +10,16 @@ bloat, not real jac code).
 Append-only, one file per signal type — join by `date`/`package`/`branch`/`file`/`fingerprint` at
 training time rather than mutating historical rows.
 
+The harness deliberately does NOT auto-commit these files: the uncommitted diff in `git status`
+is the human-review surface for what last night appended. Review, then commit.
+
 ## `audit_findings.jsonl`
 
 One row per raw finding an audit surfaced, whether or not it ever shipped. `status` is one of
-`applied`, `not_selected`, or a selector drop reason (`dropped_ledger`, `over-theme-budget`,
-`over-night-budget`, `no-clock-left`, ...). `score`/`fingerprint` are only populated for findings
-the selector actually scored — empty for `not_selected` ones, since raw audit output doesn't carry
-them. A finding can appear on multiple nights before it ships (see `refactors.jsonl` and
-cross-reference by `file` + `summary`) — the selector re-surfaces anything not yet in the ledger.
+`applied`, `not_selected`, or a selector drop reason (`ledger-drafted`, `over-theme-budget`,
+`over-night-budget`, `no-clock-left`, ...). `score` is computed for every row with the same
+formula the selector packs by (`nslib.score_of`); `fingerprint` is always populated —
+`sha1(file + rule)`, stable across nights.
 
 ```
 {date, package, file, rule, summary, snippet, confidence, risk, score, est_loc_saved,
@@ -30,7 +32,8 @@ One row **per file** in a shipped branch — the core (bloated-jac -> clean-jac)
 `after` are full file contents pulled via `git show` at the branch's merge-base and tip (not the
 agent's self-reported line counts, which were confirmed inaccurate on a real run). `finding` is
 `null` for tier1 (deterministic autofix, no LLM judgment involved) and the originating finding
-object for tier2 (agentic) branches.
+object for tier2 (agentic) branches. `branch` is stored bare (`nightshift/...`), never
+`origin/`-prefixed, regardless of which path recorded it.
 
 ```
 {date, package, branch, file, before, after, diff, finding, agent_summary, risk,
@@ -39,8 +42,11 @@ object for tier2 (agentic) branches.
 
 ## `nights.jsonl`
 
-One row per night an audit actually ran, including zero-finding nights — real negative signal
-("here's real jac-byllm code, nothing worth flagging" is as informative as a finding).
+One row per night whose audit ran **and parsed**, including zero-finding nights — real negative
+signal ("here's real jac-byllm code, nothing worth flagging" is as informative as a finding).
+A failed or unparseable audit records nothing: it says the harness broke, not that the code was
+clean. At most one row per `(date, package)` — same-day re-runs don't append duplicates.
+`cost_usd`/`turns` cover the whole night (audit plus every apply session).
 
 ```
 {date, package, findings_count, themes_selected, cost_usd, turns}

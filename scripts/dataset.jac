@@ -11,8 +11,10 @@ be joined at training time rather than mutated in place:
                         diff, the finding that drove it (null for tier1 autofix), the agent's own
                         summary/risk, real added/removed line counts, and the verify-gate outcome.
                         This is the core (buggy-jac -> clean-jac) pair data.
-  nights.jsonl          one row per night's audit, including nights with zero findings (real
-                        negative signal: "here's real jac-byllm code, nothing worth flagging").
+  nights.jsonl          one row per night whose audit ran AND parsed, including zero-finding
+                        nights (real negative signal: "here's real jac-byllm code, nothing worth
+                        flagging"). Failed/unparseable audits record nothing. Idempotent per
+                        (date, package).
   human_reviews.jsonl   one row per promote/discard decision -- the highest-quality supervision
                         signal, joined to refactors.jsonl by branch name at read time. Empty until
                         `nightshift.sh promote` is actually used.
@@ -26,8 +28,9 @@ argv:
 import sys;
 import os;
 import json;
+import glob;
 import subprocess;
-import from nslib { eprint, parse_obj, parse_list, as_dict, as_list, as_int, fingerprint }
+import from nslib { eprint, parse_obj, parse_list, as_dict, as_list, as_int, fingerprint, score_of }
 
 def git_show(repo_dir: str, ref: str, path: str) -> str {
     r = subprocess.run(["git", "-C", repo_dir, "show", ref + ":" + path],
@@ -48,59 +51,103 @@ def append_row(path: str, row: dict) {
 }
 
 """Every raw finding an audit surfaced tonight, cross-referenced against selection.json to record
-what actually happened to it. A findings.json absent or empty is still a real, useful night
-(nothing to flag) -- nights.jsonl always gets a row when an audit ran at all."""
+what actually happened to it. Idempotent per (date, package) -- a same-day re-run must not append
+duplicate rows. A nights row is written only when findings.json parses as a JSON list ([] counts:
+"real code, nothing to flag" is signal); an absent or unparseable file is a FAILED audit, not a
+clean night, and records nothing."""
 def record_audit(log_dir: str, dataset_dir: str, date_s: str, package: str) -> int {
     os.makedirs(dataset_dir, exist_ok=True);
-    findings_path: str = os.path.join(log_dir, "findings.json");
-    findings: list = [];
-    if os.path.exists(findings_path) {
-        try {
-            findings = parse_list(open(findings_path, "r").read());
-        } except Exception {
-            eprint("dataset: " + findings_path + " is not valid JSON — treating as 0 findings");
+    nights_path: str = os.path.join(dataset_dir, "nights.jsonl");
+    if os.path.exists(nights_path) {
+        with open(nights_path, "r") as f {
+            for line in f {
+                stripped: str = line.strip();
+                if stripped {
+                    row: dict = parse_obj(stripped);
+                    if str(row.get("date")) == date_s and str(row.get("package")) == package {
+                        eprint("dataset: " + date_s + "/" + package + " already recorded — skipping");
+                        return 0;
+                    }
+                }
+            }
         }
     }
 
+    findings_path: str = os.path.join(log_dir, "findings.json");
+    if not os.path.exists(findings_path) {
+        return 0;
+    }
+    findings: list = [];
+    try {
+        findings = parse_list(open(findings_path, "r").read());
+    } except Exception {
+        eprint("dataset: " + findings_path + " unparseable — failed audit, no row recorded");
+        return 0;
+    }
+
+    # selection.json carries full finding objects; recompute fingerprints from (file, rule) so
+    # the join survives fingerprint-formula changes (legacy files hashed the snippet too).
+    # Dropped rows only started carrying "rule" later -- fall back to a file-level join for old ones.
     selected_fps: set[str] = set();
-    dropped_map: dict[str, str] = {};
+    dropped_by_fp: dict[str, str] = {};
+    dropped_by_file: dict[str, str] = {};
     selection_path: str = os.path.join(log_dir, "selection.json");
     if os.path.exists(selection_path) {
         selection: dict = parse_obj(open(selection_path, "r").read());
         for t in as_list(selection.get("themes", [])) {
             for f in as_list(as_dict(t).get("findings", [])) {
-                selected_fps.add(str(as_dict(f).get("fingerprint", "")));
+                sel: dict = as_dict(f);
+                selected_fps.add(fingerprint(str(sel.get("file", "")), str(sel.get("rule", ""))));
             }
         }
         for d in as_list(selection.get("dropped", [])) {
             dd: dict = as_dict(d);
-            dropped_map[str(dd.get("fingerprint", ""))] = str(dd.get("reason", ""));
+            if "rule" in dd {
+                dropped_by_fp[fingerprint(str(dd.get("file", "")), str(dd.get("rule", "")))] = str(dd.get("reason", ""));
+            } else {
+                dropped_by_file[str(dd.get("file", ""))] = str(dd.get("reason", ""));
+            }
         }
     }
 
     audit_out: str = os.path.join(dataset_dir, "audit_findings.jsonl");
     for f in findings {
         fd: dict = as_dict(f);
-        # Raw audit findings never carry a fingerprint -- the selector computes it (same formula,
-        # nslib.fingerprint) only once a finding survives into selection.json. Must recompute it
-        # here identically to cross-reference correctly.
         fp: str = fingerprint(str(fd.get("file", "")), str(fd.get("rule", "")));
-        status: str = "applied" if fp in selected_fps else dropped_map.get(fp, "not_selected");
+        status: str = "not_selected";
+        if fp in selected_fps {
+            status = "applied";
+        } elif fp in dropped_by_fp {
+            status = dropped_by_fp[fp];
+        } elif str(fd.get("file", "")) in dropped_by_file {
+            status = dropped_by_file[str(fd.get("file", ""))];
+        }
         append_row(audit_out, {
             "date": date_s, "package": package, "file": fd.get("file", ""),
             "rule": fd.get("rule", ""), "summary": fd.get("summary", ""),
             "snippet": fd.get("snippet", ""), "confidence": fd.get("confidence"),
-            "risk": fd.get("risk"), "score": fd.get("score"),
+            "risk": fd.get("risk"), "score": score_of(fd),
             "est_loc_saved": fd.get("est_loc_saved"), "fingerprint": fp, "status": status,
         });
     }
 
-    meta_path: str = os.path.join(log_dir, "meta-audit.json");
-    meta: dict = parse_obj(open(meta_path, "r").read()) if os.path.exists(meta_path) else {};
-    append_row(os.path.join(dataset_dir, "nights.jsonl"), {
+    # Whole-night cost: sum every session's meta (audit + one per applied theme), the same
+    # convention as sendmail's digest. meta-audit.json alone undercounted the night badly.
+    turns: int = 0;
+    cost: float = 0.0;
+    for mp in sorted(glob.glob(os.path.join(log_dir, "meta-*.json"))) {
+        try {
+            m: dict = parse_obj(open(mp, "r").read());
+        } except Exception {
+            continue;
+        }
+        turns += as_int(m.get("num_turns", 0) or 0);
+        cost += float(str(m.get("total_cost_usd", 0) or 0));
+    }
+    append_row(nights_path, {
         "date": date_s, "package": package, "findings_count": len(findings),
         "themes_selected": len(selected_fps),
-        "cost_usd": meta.get("total_cost_usd", 0), "turns": meta.get("num_turns", 0),
+        "cost_usd": cost, "turns": turns,
     });
     return len(findings);
 }
@@ -128,7 +175,8 @@ def record_refactor(base_ref: str, branch_ref: str, repo_dir: str, dataset_dir: 
     n: int = 0;
     for path in files {
         append_row(out_path, {
-            "date": date_s, "package": package, "branch": branch_ref, "file": path,
+            # branch_ref may arrive as origin/<branch> (backfill) or bare (live) -- store bare
+            "date": date_s, "package": package, "branch": branch_ref.removeprefix("origin/"), "file": path,
             "before": git_show(repo_dir, base_ref, path),
             "after": git_show(repo_dir, branch_ref, path),
             "diff": git_diff(repo_dir, base_ref, branch_ref, path),
@@ -172,43 +220,69 @@ with entry:__main__ {
     }
 }
 
-test "record_audit cross-references selection status and always logs a night row, even zero-finding" {
+test "record_audit joins status+score from selection, sums all metas, stays idempotent" {
     import tempfile;
     d: str = tempfile.mkdtemp();
-    # Raw findings never carry a fingerprint -- the selector computes it (same nslib.fingerprint
-    # formula) only once a finding survives into selection.json. Compute the SAME fingerprints
-    # here to build a realistic selection.json, exactly as the real pipeline would.
     fp_a: str = fingerprint("a.jac", "dup");
     fp_b: str = fingerprint("b.jac", "dead");
     with open(d + "/findings.json", "w") as f {
         f.write(json.dumps([
-            {"file": "a.jac", "rule": "dup", "snippet": "snip a", "summary": "s1", "confidence": 4, "risk": 2, "score": 10.0},
-            {"file": "b.jac", "rule": "dead", "snippet": "snip b", "summary": "s2", "confidence": 3, "risk": 3, "score": 5.0},
+            {"file": "a.jac", "rule": "dup", "snippet": "snip a", "summary": "s1", "confidence": 4, "risk": 2, "est_loc_saved": 10},
+            {"file": "b.jac", "rule": "dead", "snippet": "snip b", "summary": "s2", "confidence": 3, "risk": 3, "est_loc_saved": 6},
+            {"file": "c.jac", "rule": "simplify", "snippet": "s", "summary": "s3", "confidence": 2, "risk": 1, "est_loc_saved": 4},
         ]));
     }
     with open(d + "/selection.json", "w") as f {
         f.write(json.dumps({
-            "themes": [{"findings": [{"fingerprint": fp_a}]}],
-            "dropped": [{"fingerprint": fp_b, "file": "b.jac", "reason": "over-night-budget"}],
+            "themes": [{"findings": [{"file": "a.jac", "rule": "dup", "fingerprint": fp_a}]}],
+            "dropped": [
+                {"fingerprint": fp_b, "file": "b.jac", "rule": "dead", "reason": "over-night-budget"},
+                {"fingerprint": "legacy-snippet-hash", "file": "c.jac", "reason": "over-theme-budget"},
+            ],
         }));
+    }
+    with open(d + "/meta-audit.json", "w") as f {
+        f.write(json.dumps({"num_turns": 2, "total_cost_usd": 1.5}));
+    }
+    with open(d + "/meta-apply-x.json", "w") as f {
+        f.write(json.dumps({"num_turns": 3, "total_cost_usd": 2.0}));
     }
     ds: str = tempfile.mkdtemp();
     n: int = record_audit(d, ds, "2026-01-01", "jac-byllm");
-    assert n == 2;
+    assert n == 3;
     with open(ds + "/audit_findings.jsonl", "r") as f {
         rows: list[dict] = [as_dict(json.loads(line)) for line in f.read().splitlines()];
     }
     assert rows[0]["status"] == "applied";
+    assert rows[0]["score"] == 20.0;
     assert rows[1]["status"] == "over-night-budget";
+    # legacy dropped row without "rule" still joins by file
+    assert rows[2]["status"] == "over-theme-budget";
     with open(ds + "/nights.jsonl", "r") as f {
         night: dict = as_dict(json.loads(f.read().splitlines()[0]));
     }
-    assert night["findings_count"] == 2 and night["themes_selected"] == 1;
+    assert night["findings_count"] == 3 and night["themes_selected"] == 1;
+    assert night["turns"] == 5 and night["cost_usd"] == 3.5;
 
-    # a zero-finding night still logs (no findings.json at all)
+    # same (date, package) again: idempotent, nothing appended
+    assert record_audit(d, ds, "2026-01-01", "jac-byllm") == 0;
+    with open(ds + "/nights.jsonl", "r") as f {
+        assert len(f.read().splitlines()) == 1;
+    }
+
+    # unparseable findings.json (0-byte marker of a failed audit) records nothing
     d2: str = tempfile.mkdtemp();
-    n2: int = record_audit(d2, ds, "2026-01-02", "jac-mcp");
-    assert n2 == 0;
+    with open(d2 + "/findings.json", "w") as f {
+        f.write("");
+    }
+    assert record_audit(d2, ds, "2026-01-02", "jac") == 0;
+
+    # a real zero-finding audit ([]) still logs a night row
+    d3: str = tempfile.mkdtemp();
+    with open(d3 + "/findings.json", "w") as f {
+        f.write("[]");
+    }
+    assert record_audit(d3, ds, "2026-01-03", "jac-byllm") == 0;
     with open(ds + "/nights.jsonl", "r") as f {
         lines: list[str] = f.read().splitlines();
     }
@@ -229,7 +303,9 @@ test "record_refactor pulls real before/after content via git and counts files" 
     sp.run(["git", "-C", repo, "add", "-A"]);
     sp.run(["git", "-C", repo, "commit", "-q", "-m", "base"]);
     base_ref: str = sp.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip();
-    sp.run(["git", "-C", repo, "checkout", "-q", "-b", "feat"]);
+    # a local branch literally named origin/feat: exercises the origin/-prefix stripping the
+    # backfill path needs while keeping every git call resolvable
+    sp.run(["git", "-C", repo, "checkout", "-q", "-b", "origin/feat"]);
     with open(repo + "/x.jac", "w") as f {
         f.write("def new() -> int { return 1; }\n");
     }
@@ -239,7 +315,7 @@ test "record_refactor pulls real before/after content via git and counts files" 
     with open(ds + "/report.json", "w") as f {
         f.write(json.dumps({"summary": "renamed", "risk": "low", "files": ["x.jac"]}));
     }
-    n: int = record_refactor(base_ref, "feat", repo, ds, "2026-01-01", "jac", "-",
+    n: int = record_refactor(base_ref, "origin/feat", repo, ds, "2026-01-01", "jac", "-",
         ds + "/report.json", 1, 1, "jac check ok", "https://example.test/feat");
     assert n == 1;
     with open(ds + "/refactors.jsonl", "r") as f {
@@ -247,4 +323,5 @@ test "record_refactor pulls real before/after content via git and counts files" 
     }
     assert "def old" in row["before"] and "def new" in row["after"];
     assert row["file"] == "x.jac" and row["agent_summary"] == "renamed";
+    assert row["branch"] == "feat";
 }
