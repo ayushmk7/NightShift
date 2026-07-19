@@ -1,6 +1,4 @@
-{"date": "2026-07-10", "package": "jac-byllm", "findings_count": 0, "themes_selected": 0, "cost_usd": 4.672138499999999, "turns": 13}
-{"date": "2026-07-11", "package": "jac-byllm", "findings_count": 10, "themes_selected": 3, "cost_usd": 5.808057000000001, "turns": 25}
-{"date": "2026-07-13", "package": "jac-byllm", "findings_count": 36, "themes_selected": 3, "cost_usd": 3.4522429500000005, "turns": 23}
-{"date": "2026-07-14", "package": "jac-scale", "findings_count": 28, "themes_selected": 5, "cost_usd": 10.744525649999998, "turns": 30}
-{"date": "2026-07-14", "package": "jac-scale", "findings_count": 25, "themes_selected": 0, "cost_usd": 13.566132599999998, "turns": 1}
-{"date": "2026-07-14", "package": "jac-scale", "findings_count": 31, "themes_selected": 0, "cost_usd": 15.019917899999994, "turns": 11}
+{"date": "2026-07-11", "package": "jac-byllm", "findings_count": 10, "themes_selected": 2, "cost_usd": 6.686846000000001, "turns": 42}
+{"date": "2026-07-13", "package": "jac-byllm", "findings_count": 36, "themes_selected": 2, "cost_usd": 8.142248550000001, "turns": 103}
+{"date": "2026-07-14", "package": "jac-scale", "findings_count": 31, "themes_selected": 6, "cost_usd": 15.377925899999994, "turns": 20}
+{"date": "2026-07-19", "package": "jac-byllm", "findings_count": 4, "themes_selected": 3, "cost_usd": 4.021289400000001, "turns": 79}
