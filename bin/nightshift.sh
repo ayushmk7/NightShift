@@ -26,7 +26,7 @@ ns_on_exit() {
     if [ "$code" -ne 0 ] && [ -f "$LOG_DIR/CURRENT_STAGE" ]; then
         cp "$LOG_DIR/CURRENT_STAGE" "$LOG_DIR/ERROR_STAGE"
     fi
-    email_main || true
+    email_main >> "$LOG_DIR/S6.log" 2>&1 || true
     ns_lock_release
     # Explicitly reap our self-caffeinate/self-timebox background children instead of trusting
     # `disown` alone to let bash exit immediately — observed once (under launchd/Terminal-launch)
@@ -38,7 +38,9 @@ ns_on_exit() {
 
 ns_run() {
     mkdir -p "$LOG_DIR" "$NS_ROOT/state"
-    [ -f "$LOG_DIR/start_epoch" ] || date +%s > "$LOG_DIR/start_epoch"
+    # Unconditional: the watchdog sleeps from *process* start, so the budget clock must too.
+    # A same-day re-run inheriting the 02:00 epoch once yielded "-414m remaining" and a skipped S3.
+    date +%s > "$LOG_DIR/start_epoch"
 
     # Self-caffeinate AND self-timebox as OUR OWN background children (forked, never exec'd/wrapped).
     # Two macOS/TCC footguns on an external-volume repo, both found the hard way under launchd:

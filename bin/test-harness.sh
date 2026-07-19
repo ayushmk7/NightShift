@@ -22,6 +22,7 @@ echo "== 3. golden-audit replay: selector must be deterministic =="
 T="$(mktemp -d)"
 jac run scripts/parse_result.jac findings < fixtures/golden-audit.json > "$T/f.json" \
     || fail "golden audit no longer parses"
+[ "$(jac run scripts/parse_result.jac len < "$T/f.json")" = "1" ] || fail "parse_result len miscounts golden findings"
 jac run scripts/selector.jac select jac config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
     < "$T/f.json" > "$T/s1.json"
 jac run scripts/selector.jac select jac config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \

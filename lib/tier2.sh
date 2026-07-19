@@ -56,7 +56,7 @@ tier2_audit() {
         ns_jac parse_result meta < "$LOG_DIR/audit.json" > "$LOG_DIR/meta-audit.json" || true
 
         if ns_jac parse_result findings < "$LOG_DIR/audit.json" > "$LOG_DIR/findings.json"; then
-            ns_log S3 "audit produced $(grep -c '"file"' "$LOG_DIR/findings.json" || echo 0) findings"
+            ns_log S3 "audit produced $(ns_jac parse_result len < "$LOG_DIR/findings.json" || echo 0) findings"
             return 0
         fi
         ns_log S3 "audit attempt $attempt failed to parse (transient API error?) — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"

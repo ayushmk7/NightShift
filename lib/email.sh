@@ -12,9 +12,12 @@ email_main() {
 
     if [ -n "${NS_DRY_RUN:-}" ]; then
         printf '%s' "$summary" | ns_jac sendmail render "$CONFIG"
+        ns_log S6 "dry-run: digest rendered, not sent"
         return 0
     fi
-    if ! printf '%s' "$summary" | ns_jac sendmail send "$CONFIG"; then
+    if printf '%s' "$summary" | ns_jac sendmail send "$CONFIG"; then
+        ns_log S6 "digest sent to $NS_EMAIL_TO"
+    else
         email_last_ditch "smtp send failed"
     fi
 }

@@ -2,6 +2,7 @@
 
 argv:  findings | report | meta      (stdin: the full envelope from --output-format json)
        field <key>                   (stdin: any JSON object; print the raw value — bash's jq)
+       len                           (stdin: any JSON array; print its length)
 - findings: validate the audit's fenced JSON array; print the normalized array.
 - report:   validate the apply session's fenced JSON object; print the normalized object.
 - meta:     print {num_turns, total_cost_usd, session_id, is_error} for logging/email.
@@ -105,6 +106,8 @@ with entry {
         if value is not None {
             print(value if isinstance(value, str) else json.dumps(value));
         }
+    } elif cmd == "len" {
+        print(len(parse_list(read_stdin())));
     } elif cmd in ["findings", "report", "meta"] {
         try {
             envelope: dict = parse_obj(read_stdin());
@@ -121,7 +124,7 @@ with entry {
         }
     } elif cmd != "" and cmd != "test" {
         eprint("usage: claude -p ... --output-format json | jac run parse_result.jac findings|report|meta");
-        eprint("       ... | jac run parse_result.jac field <key>");
+        eprint("       ... | jac run parse_result.jac field <key> | len");
     }
 }
 

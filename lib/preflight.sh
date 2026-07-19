@@ -7,8 +7,12 @@ preflight_main() {
         ns_die "$EX_DISABLED" "kill switch present (~/.nightshift/DISABLE)"
     fi
 
+    # A blank NS_PATHS_* here once produced the useless "missing binary: " (empty name).
+    [ -n "${NS_PATHS_JAC:-}" ] && [ -n "${NS_PATHS_CLAUDE:-}" ] && [ -n "${NS_PATHS_GH:-}" ] \
+        || ns_die "$EX_BUG" "NS_PATHS_* empty — config not loaded (run via nightshift.sh, not sourced)"
+
     local bin
-    for bin in "$NS_PATHS_JAC" "$NS_PATHS_CLAUDE" "$NS_PATHS_GH" git python3; do
+    for bin in "$NS_PATHS_JAC" "$NS_PATHS_CLAUDE" "$NS_PATHS_GH" git python3 gtimeout; do
         command -v "$bin" >/dev/null 2>&1 || ns_die "$EX_BUG" "missing binary: $bin"
         ns_log S0 "$bin -> $("$bin" --version 2>&1 | head -1)"
     done
