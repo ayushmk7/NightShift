@@ -2,3 +2,9 @@
 {"date": "2026-07-13", "package": "jac-byllm", "findings_count": 36, "themes_selected": 2, "cost_usd": 8.142248550000001, "turns": 103}
 {"date": "2026-07-14", "package": "jac-scale", "findings_count": 31, "themes_selected": 6, "cost_usd": 15.377925899999994, "turns": 20}
 {"date": "2026-07-19", "package": "jac-byllm", "findings_count": 4, "themes_selected": 3, "cost_usd": 4.021289400000001, "turns": 79}
+{"date": "2026-07-20", "package": "jac-byllm", "findings_count": 6, "themes_selected": 4, "cost_usd": 7.7478057, "turns": 162}
+{"date": "2026-07-21", "package": "jac", "findings_count": 23, "themes_selected": 5, "cost_usd": 22.323912299999993, "turns": 151}
+{"date": "2026-07-22", "package": "jac-byllm", "findings_count": 5, "themes_selected": 1, "cost_usd": 4.6336407, "turns": 109}
+{"date": "2026-07-23", "package": "jac", "findings_count": 26, "themes_selected": 6, "cost_usd": 26.41963245000001, "turns": 86}
+{"date": "2026-07-24", "package": "jac-byllm", "findings_count": 4, "themes_selected": 2, "cost_usd": 3.3460032, "turns": 79}
+{"date": "2026-07-30", "package": "jac-byllm", "findings_count": 22, "themes_selected": 6, "cost_usd": 12.82258005, "turns": 239}
