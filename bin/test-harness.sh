@@ -1537,4 +1537,92 @@ grep -q 'FATAL (%s)' bin/nightshift.sh \
     && fail "ns_on_exit still folds FATAL_REASON into warnings.txt; the digest would report it twice"
 echo "same-night re-run clears both fatal markers; the warnings.txt stopgap is gone"
 
+echo "== 21. merge poll: 'nothing merged' must be distinguishable from 'failed to ask' =="
+# `gh` exits 0 having written nothing under several failure modes, and an empty file word-splits
+# to zero iterations exactly like a quiet day -- the harness's recurring defect class, now in a
+# new stage. Driven against the REAL reactive_poll with a stubbed gh.
+rm -rf .jac
+P="$T/poll"; mkdir -p "$P"
+poll_probe() {          # poll_probe <gh-stdout> -> prints "rc=<n> watermark=<yes|no>"
+    printf '#!/usr/bin/env bash\nprintf %%s %s\nexit 0\n' "$(printf '%q' "$1")" > "$P/gh"
+    chmod +x "$P/gh"; echo '{}' > "$P/state.json"
+    rm -f "$P/merges.json" "$P/reactive-files.txt" "$P/failed.tsv"
+    local rc=0
+    ( . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/reactive.sh"
+      LOG_DIR="$P"; STATE="$P/state.json"; NS_DATE=2026-01-02; NS_PATHS_GH="$P/gh"
+      reactive_poll ) >/dev/null 2>&1 || rc=$?
+    if grep -q last_merge_poll "$P/state.json" 2>/dev/null; then
+        echo "rc=$rc watermark=yes"
+    else
+        echo "rc=$rc watermark=no"
+    fi
+}
+poll_probe_rc() {       # poll_probe_rc <gh-exit-code> -> same, for a gh that fails outright
+    printf '#!/usr/bin/env bash\nexit %s\n' "$1" > "$P/gh"
+    chmod +x "$P/gh"; echo '{}' > "$P/state.json"
+    rm -f "$P/merges.json" "$P/reactive-files.txt" "$P/failed.tsv"
+    local rc=0
+    ( . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/reactive.sh"
+      LOG_DIR="$P"; STATE="$P/state.json"; NS_DATE=2026-01-02; NS_PATHS_GH="$P/gh"
+      reactive_poll ) >/dev/null 2>&1 || rc=$?
+    if grep -q last_merge_poll "$P/state.json" 2>/dev/null; then
+        echo "rc=$rc watermark=yes"
+    else
+        echo "rc=$rc watermark=no"
+    fi
+}
+case "$(poll_probe '')" in
+    "rc=1 watermark=no") : ;;
+    *) fail "an EMPTY gh response was accepted as a quiet day: $(poll_probe '') -- 'did not ask' is being scored as 'nothing merged'" ;;
+esac
+# THE REASON, not just the refusal. `if <cmd>; then fail` reads any nonzero as correct rejection,
+# and this repo has already shipped one reconciliation claim that was wrong for exactly that reason.
+# The poll must refuse BECAUSE gh answered with nothing parseable -- if the count guard is deleted,
+# a later guard still returns 1 and the rc/watermark pair alone stays green. Mutation-confirmed.
+grep -q "no parseable JSON array" "$P/failed.tsv" \
+    || fail "an empty gh answer was refused for the wrong reason (or none): $(cat "$P/failed.tsv" 2>/dev/null) -- the positive 'gh really answered' assertion is gone"
+# ...and it must not have left a scope behind either: reactive_main reads reactive-files.txt, and a
+# stale one from an earlier poll would make a FAILED poll spend four sessions on yesterday's files.
+[ -e "$P/reactive-files.txt" ] && fail "a failed poll still wrote an audit scope"
+case "$(poll_probe '{"message":"Bad credentials"}')" in
+    "rc=1 watermark=no") : ;;
+    *) fail "a non-array gh response was accepted as a merge list" ;;
+esac
+grep -q "no parseable JSON array" "$P/failed.tsv" \
+    || fail "a non-array gh answer was refused for the wrong reason: $(cat "$P/failed.tsv" 2>/dev/null)"
+# A gh that FAILS outright must say so as a gh failure, not be folded into the parse arm.
+case "$(poll_probe_rc 7)" in
+    "rc=1 watermark=no") : ;;
+    *) fail "a gh that exited nonzero did not fail the poll" ;;
+esac
+grep -q "gh exited 7" "$P/failed.tsv" \
+    || fail "a nonzero gh exit was not reported as one: $(cat "$P/failed.tsv" 2>/dev/null)"
+case "$(poll_probe '[]')" in
+    "rc=0 watermark=yes") : ;;
+    *) fail "a genuinely quiet day was reported as a poll FAILURE -- it must succeed with zero merges" ;;
+esac
+[ -f "$P/reactive-files.txt" ] || fail "a successful quiet poll wrote no reactive-files.txt at all"
+[ -s "$P/reactive-files.txt" ] && fail "a quiet day wrote a NON-EMPTY audit scope"
+case "$(poll_probe '[{"number":1,"title":"t","author":{"login":"a"},"files":[{"path":"jac/jaclang/cli/a.jac"},{"path":"README.md"}]}]')" in
+    "rc=0 watermark=yes") : ;;
+    *) fail "a real merge list was rejected" ;;
+esac
+grep -q 'jac/jaclang/cli/a.jac' "$P/reactive-files.txt" \
+    || fail "reactive_poll did not write the changed-file union"
+# ...and the union is the AUDITABLE one. An unfiltered scope spends four Opus sessions on files no
+# lens has a rule for; measured 2026-07-30, the real merge day's sorted-first 40 paths were all
+# .github/**, README.md and release_notes/**.
+grep -q 'README.md' "$P/reactive-files.txt" \
+    && fail "reactive_poll's scope includes paths no shard covers; four sessions would be spent on files no lens can act on"
+# The stage entry point must NOT propagate a failed poll: ns_stage runs it as a plain command under
+# errexit, so a nonzero would abort the night at S1.5 and cost S1.6, S3, S4 and S5 as well.
+printf '#!/usr/bin/env bash\nexit 4\n' > "$P/gh"; chmod +x "$P/gh"; echo '{}' > "$P/state.json"
+(
+    set -euo pipefail
+    . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/reactive.sh"
+    LOG_DIR="$P"; STATE="$P/state.json"; NS_DATE=2026-01-02; NS_PATHS_GH="$P/gh"
+    reactive_stage
+) >/dev/null 2>&1 || fail "reactive_stage propagated a failed poll; under ns_stage's errexit that ends the night at S1.5"
+echo "merge poll distinguishes quiet, empty, malformed and real; a failed poll cannot end the night"
+
 echo "ALL HARNESS TESTS PASSED"

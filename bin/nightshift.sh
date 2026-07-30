@@ -20,6 +20,10 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 . "$NS_ROOT/lib/promote.sh"
 . "$NS_ROOT/lib/dataset.sh"
 . "$NS_ROOT/lib/cimirror.sh"
+# AFTER tier2.sh: reactive_main calls tier2_audit_shard / tier2_select / tier2_apply rather than
+# growing a second audit driver. Sourcing order only matters at CALL time in bash, but keeping it
+# here documents the dependency instead of leaving it to luck.
+. "$NS_ROOT/lib/reactive.sh"
 # AFTER verify.sh and cimirror.sh: inventory_refresh calls verify_branch (which calls cimirror_job)
 # and ns_theme_for_branch. Sourcing order only matters at CALL time in bash, but keeping it last
 # documents the dependency instead of leaving it to luck.
@@ -89,13 +93,16 @@ ns_run_inner() {
 
     ns_stage S0 preflight_main
     ns_stage S1 sync_main
+    # S1.5 — read-only `gh pr list` for what merged upstream since the last successful poll. Cheap,
+    # touches nothing, and its result (the changed-file union) has to exist before S3a can spend a
+    # session on it. It sits AHEAD of S1.6 only because it is the cheaper of the two and neither
+    # depends on the other; the PASS itself is S3a, inside tier2_main.
+    ns_stage S1.5 reactive_stage
     # S1.6 runs BEFORE any new work (spec section 4: S1.6 > S3a reactive > carry-over > tonight's
     # task): existing PRs outrank fresh findings, which is what makes the inventory converge rather
     # than grow. It needs S1's fresh main and its refreshed work/drafts worktree (the theme
     # resolver's second lookup), so it cannot move above S1. bin/test-harness.sh section 18 pins
     # both edges of that window.
-    #
-    # S1.5 (Plan 4's reactive merge poll) belongs between S1 and S1.6 and does not exist yet.
     ns_stage S1.6 inventory_main
     # S2 (tier-1 deterministic autofix) was retired 2026-07-30: a byllm-only formatting PR is noise,
     # a repo-wide one is unmergeable (~259 pre-existing violations on main), and upstream only checks
