@@ -2,7 +2,10 @@
 # lib/tier1.sh — S2 (TechnicalPRD 7-S2): deterministic clean, no LLM, near-zero risk.
 
 tier1_main() {
-    local branch="nightshift/$NS_DATE/autofix"
+    # $NS_TIER1_SLUG, not a literal "autofix": lib/promote.sh identifies the theme-less tier-1 branch
+    # by this exact slug, and a rename here that did not reach there would make every tier-1 promote
+    # die on the "tier-2 branch with no theme file" guard. bin/test-harness.sh section 9 pins it.
+    local branch="nightshift/$NS_DATE/$NS_TIER1_SLUG"
     cd "$REPO"
     git checkout -B "$branch" "$NS_REPO_DEFAULT_BRANCH"
 

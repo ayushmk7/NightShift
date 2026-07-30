@@ -169,6 +169,33 @@ assert_suite_ran() {
     esac
 }
 
+# Did one of the two conditionally-skipping mirror jobs decline to check anything?
+#
+# [jobs.fmt] and [jobs.check] both EXIT 0 after printing a skip line when the branch changed no
+# (formattable) .jac file, so their rc says nothing about whether they did work. verify_branch keys
+# the line it publishes to the PR body off this, so a wrong answer here puts "did not run" into a
+# human's review as "passed" -- this plan's dominant defect, in its most visible location.
+#
+# ANCHORED `^...$`, and that anchoring is the whole point (found the hard way while proving the fix:
+# an unanchored `grep -q 'skipping format check\.'` reported EVERY branch as skipped). cimirror_job
+# echoes each command into the capture as `$ <cmd>` BEFORE running it, and these two commands
+# contain their own skip sentence as an `echo` argument -- so the needle is always present in the
+# capture whether the job skipped or not. Only the job's real, unprefixed, whole-line output can
+# tell. Anchoring on the line rather than on cimirror_job's `$ ` prefix keeps this correct even if
+# that prefix ever changes.
+#
+# An unknown job is FATAL rather than "did not skip": every job this is not asked about would
+# otherwise be silently reported as having run. Only fmt and check have a skip path at all.
+mirror_job_skipped() {
+    local job=$1 cap=$2 needle
+    case "$job" in
+        fmt)   needle='^No formattable \.jac files changed; skipping format check\.$' ;;
+        check) needle='^No \.jac files changed; skipping jac check\.$' ;;
+        *)     ns_die "$EX_BUG" "mirror_job_skipped: '$job' has no known skip line; refusing to guess whether it ran." ;;
+    esac
+    grep -qE "$needle" "$cap"
+}
+
 # Assert `jac check` actually ran before its (empty) output is read as "clean". Sibling of
 # assert_suite_ran, for the type-check stage; see the call sites for the full reasoning. A broken
 # checker is a harness problem, night-wide and not this branch's fault, so it aborts rather than
@@ -504,6 +531,24 @@ verify_branch() {
     #    Unlike the fast three, rc=70 here is UNAMBIGUOUSLY a cimirror reader failure — no command in
     #    [jobs.contribution] exits 70 of its own accord — but it gets the same treatment for the same
     #    reason: a broken registry is night-wide and must not consume this branch's attempts.
+    #
+    #    KNOWN EXPOSURE, recorded rather than fixed (code review 2026-07-30, Minor). Three of the
+    #    five commands are branch-scoped (the AI-co-author log range, the added-.py diff, the
+    #    fragment check) but TWO validate WHOLE-REPO state regardless of the diff:
+    #      `jac run scripts/validate_docs_code.jac`  — parses every Jac block in the docs corpus
+    #                                                  (852 blocks today), branch-touched or not
+    #      the bun_installer.jac / payload.zig BUN_VERSION lockstep — two fixed files
+    #    So an UPSTREAM-introduced breakage in either reds every queued branch identically, bumps
+    #    every finding's attempts, and auto-rejects the whole ledger after two such nights — the
+    #    same harm the rc=70 handling above exists to prevent, reached by a different door. Both are
+    #    green on main today (measured 2026-07-30, whole job 21s). NOT auto-escalated to ns_die: a
+    #    branch CAN legitimately break either (editing a docs markdown block, or bumping BUN_VERSION
+    #    on one side only), and aborting the night would ungate every branch behind this one — the
+    #    disproportionate direction. Instead the failing command is matched and an ns_warn is raised,
+    #    which lands in warnings.txt and therefore in the digest, so the operator sees the pattern
+    #    before the second night rejects the ledger. If this ever bites for real, the precise fix is
+    #    to re-run just the offending command against main content and only red the branch when main
+    #    is clean.
     local cj cj_rc=0
     cj="$LOG_DIR/mirror-contribution-$(basename "$branch").txt"
     : > "$cj"
@@ -512,7 +557,11 @@ verify_branch() {
         0) : ;;
         "$EX_MIRROR_READ")
             ns_die "$EX_BUG" "CI mirror job 'contribution' returned $EX_MIRROR_READ: cimirror could not read [jobs.contribution] from config/ci-mirror.toml. That is a harness fault, identical for every queued branch, so $branch is not being blamed for it (see $(basename "$cj"))." ;;
-        *)  verify_red "$branch" "CI mirror job 'contribution' red (see $(basename "$cj"))"
+        *)  case "$CIMIRROR_FAILED_CMD" in
+                *validate_docs_code*|*BUN_VERSION*)
+                    ns_warn "$(basename "$branch"): the contribution job failed on a WHOLE-REPO check, not a branch-scoped one ($CIMIRROR_FAILED_CMD). If every branch reds here tonight the cause is upstream, not the branches — verify it against main before letting a second night auto-reject their findings." ;;
+            esac
+            verify_red "$branch" "CI mirror job 'contribution' red (see $(basename "$cj"))"
             return 1 ;;
     esac
 
@@ -529,10 +578,36 @@ verify_branch() {
     # branch until `nightshift.sh baseline` has run. Telling an upstream reviewer the tests passed
     # when nothing ran is the one failure in this file that escapes the repo.
     #
-    # The `mirror fmt+check+jir ✓` and `contribution ✓` halves ARE flat literals, and that is honest:
-    # unlike the suites, those four jobs are unconditional and every one of them `return 1`s above on
-    # anything but rc=0, so reaching this line is proof all four ran green. If either stage ever
-    # gains a legitimate skip path, this line has to grow a case arm like the ones below.
+    # `mirror fmt+check+jir ✓` USED TO BE A FLAT LITERAL HERE, and it was the sixth instance of this
+    # plan's dominant defect in the one line that escapes the repo (code review, Important). Two of
+    # those three jobs have a legitimate skip path — [jobs.fmt] prints "No formattable .jac files
+    # changed; skipping format check." and [jobs.check] prints "No .jac files changed; skipping jac
+    # check.", both EXIT 0 — which this very file already says out loud at assert_suite_ran's header
+    # ("unlike [jobs.fmt]/[jobs.check], which legitimately skip when nothing changed") and which
+    # config/ci-mirror.toml documents at [jobs.fmt]. Reproduced on a fragment-only branch: all three
+    # rc=0, two of them having checked nothing, and the PR body claimed all three passed.
+    #
+    # Keyed off THE CAPTURE, not off $changed_jac: [jobs.fmt] additionally drops /fixtures/,
+    # ^scripts/, /passes/native/llvm/ and _err.jac$ paths, so a branch touching only those has a
+    # NON-empty $changed_jac and still skips. Only the job's own printed skip line knows what it did.
+    # [jobs.jir] has no skip path — one unconditional `jac gen-jir-registry --verify` — so it always
+    # ran by the time control reaches here. bin/test-harness.sh section 9 pins both literals against
+    # config/ci-mirror.toml so a wording change upstream cannot silently turn a skip back into a ✓.
+    local mirror_ran="" mirror_skipped="" mj
+    for mj in fmt check; do
+        if mirror_job_skipped "$mj" "$mrr"; then
+            mirror_skipped="$mirror_skipped $mj"
+        else
+            mirror_ran="$mirror_ran $mj"
+        fi
+    done
+    mirror_ran="$mirror_ran jir"
+    local mirror_line="mirror (${mirror_ran# }) ✓"
+    case "$mirror_skipped" in
+        "") : ;;
+        *)  mirror_line="$mirror_line · mirror not applicable:${mirror_skipped} (no .jac files to check)" ;;
+    esac
+
     local check_line="jac check ✓" tests_line
     case "$changed_jac" in "") check_line="jac check (no .jac files changed)" ;; esac
     case "$suites" in
@@ -546,7 +621,9 @@ verify_branch() {
                     esac ;;
             esac ;;
     esac
-    echo "mirror fmt+check+jir ✓ · $check_line · $tests_line · pre-commit ✓ · contribution ✓ (${dur_min} min)" \
+    # `contribution ✓` stays a flat literal, and that one IS honest: all five of its commands are
+    # unconditional (none prints a skip), and the stage `return 1`s above on anything but rc=0.
+    echo "$mirror_line · $check_line · $tests_line · pre-commit ✓ · contribution ✓ (${dur_min} min)" \
         > "$LOG_DIR/tests-$(basename "$branch").txt"
     git checkout "$NS_REPO_DEFAULT_BRANCH"
     return 0

@@ -11,6 +11,22 @@ LEDGER="$NS_ROOT/state/ledger.jsonl.cache"
 CONFIG="$NS_ROOT/config/nightshift.toml"
 LOCK_DIR="/tmp/nightshift.lock"
 
+# The slug of tier-1's agent-less autofix branch (`nightshift/<date>/autofix`). SINGLE SOURCE OF
+# TRUTH: lib/tier1.sh builds its branch name from it, lib/promote.sh tests against it, and
+# bin/test-harness.sh section 9 asserts the two stay in lockstep.
+#
+# It exists because "this branch has no theme file" is AMBIGUOUS and the two meanings need opposite
+# handling. Tier-1 legitimately has none — it is deterministic `jac fmt --lintfix` output with no
+# agent and nothing to scope-check. A tier-2 branch always had one, but $LOG_DIR is DATE-KEYED
+# (line 6 above), so the file is simply not where S7 looks the moment a human promotes on a
+# different calendar day than the run that produced it — the normal case for a 23:00 night. Reading
+# that absence as "no theme" would hand verify_branch a theme of "-", which makes it skip scope
+# containment entirely (lib/verify.sh stage 1) — i.e. re-gate the one class of branch an LLM wrote,
+# without the anti-injection check. So tier-1 is recognised POSITIVELY, by name, and every other
+# branch must produce its theme file or die loudly.
+NS_TIER1_SLUG="autofix"
+ns_is_tier1_branch() { [ "$(basename "$1")" = "$NS_TIER1_SLUG" ]; }
+
 # --- exit codes (TechnicalPRD 18; 50=audit-parse and 60=ceiling live in their tools) ---
 EX_LOCK=40; EX_DISABLED=41; EX_AUTH=42; EX_OFFLINE=43; EX_SYNC=44; EX_ALLFAIL=51; EX_BUG=70
 
@@ -146,8 +162,16 @@ ns_precommit() {
 
 # --- secrets ---
 ns_load_env() {
-    # shellcheck disable=SC1090
-    [ -f "$HOME/.nightshift.env" ] && . "$HOME/.nightshift.env"
+    # `if`, never `[ -f x ] && . x`: a false `&&` list is itself a nonzero return, and this function
+    # is called BARE (not from an `if`) by bin/nightshift.sh's promote / baseline / mirror arms,
+    # where errexit is live and ns_run_inner's EXIT trap does not exist — so a missing env file
+    # would abort the command with status 1, no [FATAL] line and no autopsy email. Latent only
+    # because the file happens to exist on this host; Plan 5's move to ~/nightshift is exactly the
+    # kind of change that makes it not.
+    if [ -f "$HOME/.nightshift.env" ]; then
+        # shellcheck disable=SC1090
+        . "$HOME/.nightshift.env"
+    fi
     # A set ANTHROPIC_API_KEY silently outranks the subscription (TPRD feasibility row 7).
     unset ANTHROPIC_API_KEY
 }

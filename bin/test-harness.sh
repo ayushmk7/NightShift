@@ -238,4 +238,96 @@ case "$fast_list" in
 esac
 echo "gate order correct (fast mirror jobs $fast_ln < suites $suite_ln < contribution $contrib_ln)"
 
+echo "== 9a. S7 theme resolution: tier-1 by NAME, tier-2 by FILE, absence is never 'no theme' =="
+# lib/promote.sh used to do `[ -f "$LOG_DIR/theme-….json" ] && theme=…`, which under promote_main's
+# live errexit (it is called bare from bin/nightshift.sh, and ns_run_inner's EXIT trap does not
+# exist on that path) aborted `nightshift.sh promote` with a bare status 1 whenever the file was
+# absent -- i.e. for EVERY tier-1 branch, and for every tier-2 branch promoted on a different
+# calendar day than its date-keyed $LOG_DIR. The naive fix is worse than the bug: a theme of "-"
+# makes verify_branch skip scope containment, so an aged-out tier-2 theme would silently re-gate an
+# LLM-written branch with the anti-injection check off. Hence: tier-1 recognised POSITIVELY by slug,
+# everything else must produce its file or ns_die.
+case "$(grep -c '^[[:space:]]*\[ -f .*\] &&[[:space:]]*theme=' lib/promote.sh || true)" in
+    0) : ;;
+    *) fail "lib/promote.sh resolves the theme with a '[ -f … ] && theme=…' list again -- a false && list is a nonzero return, and promote_main runs with errexit live and no EXIT trap" ;;
+esac
+grep -q 'ns_is_tier1_branch "\$branch"' lib/promote.sh \
+    || fail "lib/promote.sh no longer identifies the tier-1 branch positively by slug; absence of a theme file must never be read as 'no theme'"
+grep -q 'ns_die "\$EX_BUG" "no theme file for' lib/promote.sh \
+    || fail "lib/promote.sh no longer dies on a missing tier-2 theme file -- it would re-gate an agent-written branch without scope containment"
+grep -q 'local branch="nightshift/\$NS_DATE/\$NS_TIER1_SLUG"' lib/tier1.sh \
+    || fail "lib/tier1.sh no longer builds its branch from \$NS_TIER1_SLUG; a rename here would make every tier-1 promote die on the tier-2 guard"
+
+# The lockstep itself, driven rather than grepped: rebuild tier-1's branch name from lib/tier1.sh's
+# OWN expression and ask lib/common.sh's predicate about it. If either side is renamed alone, this
+# fails. `if … then exit 1; fi`, never `pred && exit 1`: under set -e a false && list would exit the
+# subshell 1 by itself and manufacture the very failure it is testing for.
+tier1_expr="$(sed -n 's/.*local branch="\(nightshift[^"]*\)".*/\1/p' lib/tier1.sh | head -1)"
+case "$tier1_expr" in
+    "") fail "could not extract lib/tier1.sh's branch expression -- the lockstep check below would have been vacuous" ;;
+esac
+(
+    . "$NS_ROOT/lib/common.sh"
+    NS_DATE=2026-01-02
+    eval "b=\"$tier1_expr\""
+    ns_is_tier1_branch "$b" || { echo "tier-1 branch '$b' not recognised as tier-1" >&2; exit 1; }
+    if ns_is_tier1_branch "nightshift/2026-01-02/unused-imports"; then
+        echo "a tier-2 slug was misidentified as tier-1 -- it would re-gate with no theme" >&2; exit 1
+    fi
+) || fail "lib/tier1.sh's branch name and lib/common.sh's ns_is_tier1_branch have drifted apart"
+echo "theme resolution explicit: tier-1 '$tier1_expr' matches \$NS_TIER1_SLUG, tier-2 absence is fatal"
+
+echo "== 9b. mirror skip-detection must track the strings the mirror actually prints =="
+# [jobs.fmt] and [jobs.check] both EXIT 0 after printing a skip line when the branch changed no
+# (formattable) .jac file. lib/verify.sh keys the PR-body tests line off those two literals, so if
+# config/ci-mirror.toml rewords them the gate would silently go back to publishing
+# "mirror fmt+check+jir ✓" for jobs that checked nothing -- into a PR body a human reads.
+rm -rf .jac
+for pair in 'fmt|No formattable .jac files changed; skipping format check.|Formatting jac/jaclang/x.jac' \
+            'check|No .jac files changed; skipping jac check.|=========== 1 passed in 0.52s ==========='; do
+    mjob="$(printf '%s' "$pair" | cut -d'|' -f1)"
+    printed="$(printf '%s' "$pair" | cut -d'|' -f2)"
+    did_work="$(printf '%s' "$pair" | cut -d'|' -f3)"
+    mcmd="$(jac run scripts/cimirror.jac cmds "$mjob" config/ci-mirror.toml | head -1)"
+    case "$mcmd" in
+        "") fail "could not read [jobs.$mjob]'s command -- the skip-string check would have been vacuous" ;;
+        *"$printed"*) : ;;
+        *) fail "[jobs.$mjob] no longer prints '$printed'; lib/verify.sh keys its honest tests line off that exact string" ;;
+    esac
+    # Behavioural, not a grep-for-a-grep: drive the REAL mirror_job_skipped against two synthetic
+    # captures built the way lib/cimirror.sh actually writes one.
+    #
+    # Capture A is the trap this test exists for. cimirror_job echoes each command as `$ <cmd>`
+    # BEFORE running it, and [jobs.fmt]/[jobs.check] carry their own skip sentence inside an `echo`
+    # argument -- so the needle is in the capture even when the job did full work. The first version
+    # of this feature used an unanchored grep and therefore reported EVERY branch as "skipped";
+    # caught only by running it against a real capture. Anchoring is what makes it right, and this
+    # is the assertion that keeps it that way.
+    printf '\n$ %s\n%s\n' "$mcmd" "$did_work" > "$T/cap-ran-$mjob.txt"
+    printf '\n$ %s\n%s\n' "$mcmd" "$printed"  > "$T/cap-skip-$mjob.txt"
+    if ( . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/verify.sh"; mirror_job_skipped "$mjob" "$T/cap-ran-$mjob.txt" ); then
+        fail "mirror_job_skipped calls [jobs.$mjob] SKIPPED on a capture where it did work -- it is matching the echoed command text, so every branch would under-report"
+    fi
+    ( . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/verify.sh"; mirror_job_skipped "$mjob" "$T/cap-skip-$mjob.txt" ) \
+        || fail "mirror_job_skipped missed [jobs.$mjob]'s real skip line -- a job that checked nothing would be published as passed"
+done
+# An unrecognised job must be FATAL, never a silent answer. Checking only "nonzero" is not enough
+# and was itself caught by mutation: a `*) return 1` arm is nonzero AND means "did not skip", so it
+# would publish a brand-new conditionally-skipping job as having run. Demand the ns_die exit code.
+mjs_rc=0
+( . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/verify.sh"; mirror_job_skipped byllm /dev/null ) \
+    >/dev/null 2>&1 || mjs_rc=$?
+case "$mjs_rc" in
+    70) : ;;
+    *) fail "mirror_job_skipped answered rc=$mjs_rc for a job with no known skip line; it must ns_die (70) instead, or a future job with a skip path would silently be published as having run" ;;
+esac
+rm -rf .jac
+# Comment lines stripped first: the block above this line in lib/verify.sh quotes the old literal
+# while explaining why it was wrong, and matching that prose would fail the check forever.
+case "$(grep -vE '^[[:space:]]*#' lib/verify.sh | grep -c 'mirror fmt+check+jir ✓' || true)" in
+    0) : ;;
+    *) fail "lib/verify.sh publishes the flat literal 'mirror fmt+check+jir ✓' again -- fmt and check legitimately skip, so it must name only the jobs that ran" ;;
+esac
+echo "skip strings in lockstep with config/ci-mirror.toml; no flat mirror ✓ literal"
+
 echo "ALL HARNESS TESTS PASSED"

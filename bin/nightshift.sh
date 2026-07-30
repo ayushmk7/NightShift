@@ -124,8 +124,25 @@ case "$cmd" in
     # cannot be reported against this one, and its two reader sentinels are handled by name
     # (lib/cimirror.sh writes "(job-list-read-failure)" / "(empty-job-list)" there instead of a job).
     mirror)     mkdir -p "$LOG_DIR"; ns_load_env
+                # Refuse to run underneath a live night. This is the command an operator is most
+                # tempted to fire mid-run, and it would `git checkout` in $REPO out from under
+                # S2/S3/S4 and share $LOG_DIR/mirror-home with them. It deliberately does NOT call
+                # ns_lock_acquire: that reclaims a stale lock and there is no EXIT trap on this path
+                # to release it, so a manual mirror would leave /tmp/nightshift.lock held forever
+                # and block every subsequent night. Read-only liveness check instead.
+                if [ -f "$LOCK_DIR/pid" ]; then
+                    holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+                    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+                        ns_die "$EX_LOCK" "a nightly run (pid $holder) is live; 'mirror' would git-checkout in $REPO underneath it and share its mirror-home. Wait for it to finish, or stop it first."
+                    fi
+                fi
                 rm -f "$LOG_DIR/mirror-failed-job.txt"
-                if [ $# -ge 1 ]; then git -C "$REPO" checkout "$1"; fi
+                # `|| ns_die`: a typo'd branch name otherwise exits 1 under errexit — the SAME code a
+                # genuinely red job returns — with none of this arm's diagnostics printed.
+                if [ $# -ge 1 ]; then
+                    git -C "$REPO" checkout "$1" \
+                        || ns_die "$EX_BUG" "no such branch '$1' in $REPO — nothing was mirrored."
+                fi
                 rc=0; cimirror_all "$LOG_DIR/mirror-manual.txt" || rc=$?
                 if [ -f "$LOG_DIR/mirror-failed-job.txt" ]; then
                     failed_job="$(cat "$LOG_DIR/mirror-failed-job.txt")"
