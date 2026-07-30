@@ -813,10 +813,84 @@ esac
 rm -rf .jac
 echo "routing: trivial/mechanical -> model_simple, judgement -> model, retry always -> model; covmap fails loud"
 
-# Sections 15-18 are RESERVED: docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2
-# (task registry) and 15-18 to Plan 3 (ship path); all four v2 plans independently claimed "section
-# 11". Plan 4 owns 19-23. The gap is deliberate — renumbering later would silently reorder the
-# other two plans' tripwires into someone else's range.
+echo "== 15. the gh seam: read-only always runs, writes are stubbed, merge is refused =="
+# Two functions with opposite defaults share one binary, so each one's REFUSAL is what keeps the
+# other honest: a mutating call routed through ns_gh would execute for real during a dry run, and
+# a read-only call routed through ns_gh_write would return nothing during one. Driven behaviourally
+# with $NS_PATHS_GH stubbed -- nothing here touches GitHub.
+seam() {                   # seam <label> <want-rc> <dry?> <fn> <args...>
+    local label=$1 want=$2 dry=$3 fn=$4; shift 4
+    local got=0 out
+    out="$(
+        . "$NS_ROOT/lib/common.sh"
+        LOG_DIR="$T"; NS_PATHS_GH="$T/fake-gh"; NS_REPO_DEFAULT_BRANCH=main
+        if [ "$dry" = dry ]; then NS_DRY_RUN=1; fi
+        "$fn" "$@"
+    )" 2>/dev/null || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "$fn '$label': expected rc=$want, got rc=$got" ;;
+    esac
+    seam_out="$out"
+}
+printf '#!/bin/sh\necho REAL-GH-RAN "$@"\n' > "$T/fake-gh"; chmod +x "$T/fake-gh"
+
+# read-only calls run for real, dry-run or not -- an inventory that cannot list PRs tests nothing
+seam "pr list live" 0 live ns_gh pr list --repo o/r --state open
+case "$seam_out" in *REAL-GH-RAN*) : ;; *) fail "ns_gh did not invoke gh at all: '$seam_out'" ;; esac
+seam "pr list dry"  0 dry  ns_gh pr list --repo o/r --state open
+case "$seam_out" in *REAL-GH-RAN*) : ;; *) fail "ns_gh must still run under NS_DRY_RUN" ;; esac
+# ...but a MUTATING call routed through the read-only seam is fatal, never silently executed
+seam "write via ns_gh" 70 dry ns_gh pr create --repo o/r --draft
+case "$seam_out" in *REAL-GH-RAN*) fail "ns_gh EXECUTED a mutating call before refusing it" ;; esac
+# `gh api` with an explicit method is a write however innocent the path looks
+seam "api PATCH via ns_gh" 70 live ns_gh api "repos/o/r/pulls/1" -X PATCH -f state=closed
+case "$seam_out" in *REAL-GH-RAN*) fail "ns_gh EXECUTED 'gh api -X PATCH' before refusing it" ;; esac
+seam "api GET via ns_gh"    0 live ns_gh api "repos/o/r/commits/main/check-runs?per_page=100"
+case "$seam_out" in *REAL-GH-RAN*) : ;; *) fail "ns_gh refused a plain GET; the CI gate could never read a capture" ;; esac
+
+# writes are stubbed under dry-run and produce a shape-valid, obviously fake URL
+seam "create dry" 0 dry ns_gh_write pr create --repo o/r --draft --title t --body b
+case "$seam_out" in
+    https://github.com/DRY-RUN/pull/0) : ;;
+    *) fail "ns_gh_write pr create must emit a shape-valid sentinel URL under dry-run, got '$seam_out'" ;;
+esac
+case "$seam_out" in *REAL-GH-RAN*) fail "ns_gh_write invoked gh under NS_DRY_RUN" ;; esac
+seam "create live" 0 live ns_gh_write pr create --repo o/r --draft
+case "$seam_out" in *REAL-GH-RAN*) : ;; *) fail "ns_gh_write must invoke gh when not dry-running" ;; esac
+# merging is refused in BOTH modes: a dry-run stub would let a merge call ship unnoticed
+for mode in live dry; do
+    seam "merge $mode" 70 "$mode" ns_gh_write pr merge 12 --repo o/r
+    case "$seam_out" in *REAL-GH-RAN*) fail "ns_gh_write EXECUTED 'pr merge' ($mode) before refusing it" ;; esac
+    seam "ready $mode" 70 "$mode" ns_gh_write pr ready 12 --repo o/r
+    case "$seam_out" in *REAL-GH-RAN*) fail "ns_gh_write EXECUTED 'pr ready' ($mode) before refusing it" ;; esac
+done
+
+# ns_git_push: never main, never a bare --force
+push_seam() {              # push_seam <label> <want-rc> <args...>
+    local label=$1 want=$2; shift 2
+    local got=0
+    ( . "$NS_ROOT/lib/common.sh"; LOG_DIR="$T"; NS_DRY_RUN=1; NS_REPO_DEFAULT_BRANCH=main
+      ns_git_push /nonexistent "$@" ) >/dev/null 2>&1 || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "ns_git_push '$label': expected rc=$want, got rc=$got" ;;
+    esac
+}
+push_seam "nightshift refspec"  0 origin "refs/heads/nightshift/a/b:refs/heads/nightshift/a/b"
+push_seam "force-with-lease"    0 --force-with-lease origin "refs/heads/nightshift/a/b:refs/heads/nightshift/a/b"
+push_seam "bare force"         70 --force origin "refs/heads/nightshift/a/b:refs/heads/nightshift/a/b"
+push_seam "short force"        70 -f origin "refs/heads/nightshift/a/b:refs/heads/nightshift/a/b"
+push_seam "refspec onto main"  70 origin "refs/heads/nightshift/a/b:refs/heads/main"
+push_seam "short refspec main" 70 origin "refs/heads/nightshift/a/b:main"
+push_seam "bare main"          70 origin main
+echo "gh seam correct: reads live, writes stubbed, merge/ready/force/main all refused"
+
+# Sections 17-18 are RESERVED for Plan 3's remaining tasks (S1.6 inventory).
+# docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2 (task registry) and 15-18 to
+# Plan 3 (ship path); all four v2 plans independently claimed "section 11". Plan 4 owns 19-23. The
+# gap is deliberate — renumbering later would silently reorder the other two plans' tripwires into
+# someone else's range.
 
 echo "== 19. the digest's transport guards: receipt required, credentials scrubbed =="
 # scripts/sendmail.jac's own tests cover the two pure functions (section 1 runs them). What is NOT

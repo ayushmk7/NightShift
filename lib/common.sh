@@ -165,11 +165,78 @@ ns_diff_numstat() {   # ns_diff_numstat <dir> <range>
 # --- dry-run seam: every push in the nightly path goes through this (TPRD 14) ---
 ns_git_push() {   # ns_git_push <dir> <push-args...>
     local dir=$1; shift
+    # Two refusals, both cheap and both about damage that cannot be undone from here:
+    #   * a bare --force (threat T3). --force-with-lease is explicitly allowed: S1.6 rebases open
+    #     PR branches and cannot push the result without it.
+    #   * anything targeting the default branch. Nightshift pushes nightshift/* refs and the
+    #     nightshift/drafts orphan, never main -- on the fork or anywhere else.
+    # `case` inside a `for`, never `[ x ] && ns_die`: this runs on the success path of every push.
+    local a
+    for a in "$@"; do
+        case "$a" in
+            --force|-f)
+                ns_die "$EX_BUG" "ns_git_push refuses a bare --force (use --force-with-lease): git -C $dir push $*" ;;
+            "$NS_REPO_DEFAULT_BRANCH"|*":$NS_REPO_DEFAULT_BRANCH"|*":refs/heads/$NS_REPO_DEFAULT_BRANCH")
+                ns_die "$EX_BUG" "ns_git_push refuses to push to '$NS_REPO_DEFAULT_BRANCH': git -C $dir push $*" ;;
+        esac
+    done
     if [ -n "${NS_DRY_RUN:-}" ]; then
         ns_log DRY "git -C $dir push $*"
     else
         git -C "$dir" push "$@"
     fi
+}
+
+# --- gh seam ---------------------------------------------------------------------------------
+# `gh` splits into two populations with OPPOSITE dry-run behavior, so it gets two functions rather
+# than one with a flag. Read-only calls must run during a dry run (an inventory that cannot list
+# PRs rehearses nothing); mutating calls must not (a dry run that opens a real upstream PR is the
+# single worst outcome this seam exists to prevent). Each function refuses the other's population,
+# because the failure of a one-function design is silent in exactly one direction.
+#
+# `case`, never `[ ... ] && ns_die`: these are called from promote_main / discard_main, which
+# bin/nightshift.sh invokes BARE, so errexit is live and a false `&&` list would abort the command
+# with a bare status 1, no [FATAL] line and no autopsy email.
+ns_gh() {   # READ-ONLY gh. Runs even under NS_DRY_RUN.
+    local pair="${1:-} ${2:-}"
+    case "$pair" in
+        "pr list"|"pr view"|"pr checks"|"pr diff"|"repo view"|"run list") : ;;
+        "api "*)
+            # A path alone is a GET; an explicit method is a write however read-only the path looks.
+            case " $* " in
+                *" -X "*|*" --method "*)
+                    ns_die "$EX_BUG" "ns_gh: 'gh api' with an explicit HTTP method mutates GitHub and must go through ns_gh_write -- ns_gh runs even under NS_DRY_RUN, so this would have written for real during a rehearsal: gh $*" ;;
+            esac ;;
+        *)  ns_die "$EX_BUG" "ns_gh: '$pair' is not a known read-only gh call, and ns_gh runs even under NS_DRY_RUN. If it changes anything on GitHub use ns_gh_write; if it is genuinely read-only, add it to this list deliberately." ;;
+    esac
+    "$NS_PATHS_GH" "$@"
+}
+
+# MUTATING gh. Stubbed under NS_DRY_RUN (TPRD 14, same seam contract as ns_git_push).
+#
+# `pr merge` and `pr ready` are refused in BOTH modes, not just the live one: a dry-run stub would
+# let a merge call sit in the codebase looking exercised. Spec section 6 -- Nightshift never merges
+# and never takes a PR out of draft; the PR is terminal until a human merges it on GitHub.
+#
+# The dry-run branch prints a shape-valid but obviously fake URL for `pr create`, because the
+# caller's job is to assert it got a URL (a gh call that silently returns nothing must never read
+# as success) and that assertion has to be exercised in rehearsal too. The sentinel reaches only
+# gitignored state: state/ledger.jsonl.cache and $LOG_DIR, since ns_git_push stubs the drafts push
+# and lib/dataset.sh already records nothing under NS_DRY_RUN.
+ns_gh_write() {
+    local pair="${1:-} ${2:-}"
+    case "$pair" in
+        "pr merge"|"pr ready")
+            ns_die "$EX_BUG" "ns_gh_write refuses '$pair': Nightshift never merges a PR and never takes one out of draft. A human merges it on GitHub or it stays open." ;;
+    esac
+    if [ -n "${NS_DRY_RUN:-}" ]; then
+        ns_log DRY "gh $*"
+        case "$pair" in
+            "pr create") echo "https://github.com/DRY-RUN/pull/0" ;;
+        esac
+        return 0
+    fi
+    "$NS_PATHS_GH" "$@"
 }
 
 # pre-commit's system-language hooks (jac-format, validate-fragments) shell out to `jac`;
