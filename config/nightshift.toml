@@ -1,15 +1,9 @@
 # config/nightshift.toml — every knob in one file (TechnicalPRD 6). Values are defaults.
 
 [repo]
-upstream       = "jaseci-labs/jaseci"
+upstream       = "jaseci-labs/jac"          # renamed from jaseci-labs/jaseci
 fork           = "ayushmk7/jaseci"          # <- set at M0
 default_branch = "main"
-
-[rotation]                                   # one package per night, round-robin (PRD 7 stage 3)
-# Only packages with a real audit surface AND a test gate. jac-mcp's dir is an empty placeholder
-# (a real audit night found 0 findings) and jac-scale has no test baseline, so it shipped a branch
-# fail-open on 07-14 — both stay out of rotation until they can gate.
-packages = ["jac", "jac-byllm"]
 
 [budgets]                                    # PRD 9 guardrails — no step may violate these
 themes_per_night   = 6                       # was 3 -- real data: 85% of real findings were being
@@ -40,10 +34,12 @@ model         = "sonnet"                     # empty = account default, which si
 ponytail_mode = "full"                       # PRD 14-Q5
 
 [protect]                                    # glob deny-list; enforced twice (prompt + S4 gate)
+# release_notes/ is NOT listed: fragments live outside docs/ since the restructure, so they need
+# no negation entry. The old "!docs/docs/community/release_notes/unreleased/**" was dead.
 globs = [
   "**/tests/**", "**/fixtures/**", "**/*.test.jac",
   "**/jac.spec", "**/grammar/**", "**/generated/**", "**/vendor/**",
-  "docs/**", "!docs/docs/community/release_notes/unreleased/**",
+  "docs/**",
   ".github/**", "examples/**",
 ]
 

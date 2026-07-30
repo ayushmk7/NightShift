@@ -174,16 +174,20 @@ def is_protected(path: str, globs: list[str]) -> bool {
     return hit;
 }
 
-"""The repo's release-note dir names differ from package names (check-release-notes.sh):
-jac code lives in jac/jaclang -> fragment dir 'jaclang'; jac-byllm/byllm -> 'byllm'."""
-def fragment_dir(pkg: str) -> str {
-    mapping: dict[str, str] = {"jac": "jaclang", "jac-byllm": "byllm",
-                               "jac-mcp": "jac-mcp", "jac-scale": "jac-scale"};
-    return mapping[pkg] if pkg in mapping else pkg;
-}
+"""scripts/check-release-notes.sh in the target repo maps exactly one folder:
+jac/jaclang/ -> release_notes/unreleased/jaclang/. Everything else (jac-mcp/,
+jac/tests/, docs/) requires no fragment, so return "" and let callers skip it.
+The 0000 placeholder is renamed to the PR number after the PR is opened."""
+glob VALID_FRAGMENT_KINDS: list[str] = ["feature", "bugfix", "breaking", "refactor", "docs"];
 
-def release_fragment(pkg: str) -> str {
-    return "docs/docs/community/release_notes/unreleased/" + fragment_dir(pkg) + "/0000.refactor.md";
+def fragment_path(paths: list[str], kind: str) -> str {
+    safe_kind: str = kind if kind in VALID_FRAGMENT_KINDS else "refactor";
+    for p in paths {
+        if str(p).startswith("jac/jaclang/") {
+            return "release_notes/unreleased/jaclang/0000." + safe_kind + ".md";
+        }
+    }
+    return "";
 }
 
 test "fingerprint is stable per (file, rule) and sensitive to both" {
@@ -193,11 +197,28 @@ test "fingerprint is stable per (file, rule) and sensitive to both" {
 }
 
 test "protected globs with negation" {
-    globs: list[str] = ["**/tests/**", "docs/**", "!docs/docs/community/release_notes/unreleased/**"];
+    globs: list[str] = ["**/tests/**", "docs/**", "!release_notes/unreleased/**"];
     assert is_protected("jac/tests/fixtures/x.jac", globs);
     assert is_protected("docs/guide/intro.md", globs);
-    assert not is_protected("docs/docs/community/release_notes/unreleased/jac/0000.refactor.md", globs);
-    assert not is_protected("jac/compiler/passes.jac", globs);
+    # fragments live outside docs/ now, so they are simply never protected
+    assert not is_protected("release_notes/unreleased/jaclang/0000.refactor.md", globs);
+    assert not is_protected("jac/jaclang/compiler/passes.jac", globs);
+}
+
+test "fragment_path maps only jac/jaclang changes, and validates the kind" {
+    assert fragment_path(["jac/jaclang/compiler/x.jac"], "refactor")
+        == "release_notes/unreleased/jaclang/0000.refactor.md";
+    assert fragment_path(["jac/jaclang/byllm/y.jac"], "bugfix")
+        == "release_notes/unreleased/jaclang/0000.bugfix.md";
+    # jac-mcp and the top-level test tree map to nothing: no fragment required
+    assert fragment_path(["jac-mcp/server.jac"], "refactor") == "";
+    assert fragment_path(["jac/tests/test_x.jac"], "refactor") == "";
+    # first matching path wins; a mixed diff still gets exactly one fragment
+    assert fragment_path(["jac-mcp/a.jac", "jac/jaclang/cli/b.jac"], "docs")
+        == "release_notes/unreleased/jaclang/0000.docs.md";
+    # an invalid kind falls back to refactor rather than emitting a path CI will reject
+    assert fragment_path(["jac/jaclang/cli/b.jac"], "nonsense")
+        == "release_notes/unreleased/jaclang/0000.refactor.md";
 }
 
 test "ledger last-writer-wins" {

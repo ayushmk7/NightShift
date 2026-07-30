@@ -1,11 +1,10 @@
 """S3-B selector (TechnicalPRD 7 S3-B): merge audit findings with the ledger,
 drop the ineligible, score, and greedy-pack into budgeted themes.
 
-argv:  select <package> <config.toml> <ledger.jsonl> <state.json> <remaining_min> <repo_dir>
+argv:  select <config.toml> <ledger.jsonl> <state.json> <remaining_min> <repo_dir>
            stdin: validated findings array → stdout: {"themes": [...], "dropped": [...]}
        split <selection.json> <outdir>     write theme-<slug>.json per theme; print slugs
        dropped <selection.json>            print `fingerprint<TAB>file<TAB>reason` lines
-       rotate <config.toml> <state.json>   print tonight's package; advance the rotation
 Deterministic: same inputs → same packing (unit-testable, TPRD 14).
 """
 import sys;
@@ -149,7 +148,7 @@ def drop_reason(f: dict, ledger: dict[str, dict], globs: list[str]) -> str | Non
 
 """Greedy pack (TPRD S3-B steps 3-4): group by theme_hint, budget files/LOC per theme,
 keep at most themes_per_night themes ordered by total score."""
-def pack_themes(eligible: list[dict], budgets: dict, package: str, repo_dir: str,
+def pack_themes(eligible: list[dict], budgets: dict, repo_dir: str,
                  protect_globs: list[str]) -> (list[dict], list[dict]) {
     groups: dict[str, list[dict]] = {};
     for f in eligible {
@@ -200,7 +199,7 @@ def pack_themes(eligible: list[dict], budgets: dict, package: str, repo_dir: str
                 vestigial = vestigial_test_files(repo_dir, files, protect_globs);
             }
             themes.append({
-                "name": str(picked[0]["theme_hint"]), "slug": slug, "package": package,
+                "name": str(picked[0]["theme_hint"]), "slug": slug,
                 "files": files, "vestigial_deletions": vestigial,
                 "findings": picked, "est_loc": est_loc,
                 "score": sum([score_of(f) for f in picked]),
@@ -230,7 +229,7 @@ def fit_clock(themes: list[dict], dropped: list[dict], budgets: dict,
     return (themes, dropped);
 }
 
-def select(findings: list[dict], package: str, config_path: str, ledger_path: str,
+def select(findings: list[dict], config_path: str, ledger_path: str,
            state_path: str, remaining_min: int, repo_dir: str) -> dict {
     cfg: dict = load_config_toml(config_path);
     budgets: dict = as_dict(cfg["budgets"]);
@@ -250,30 +249,17 @@ def select(findings: list[dict], package: str, config_path: str, ledger_path: st
             dropped.append({"fingerprint": f["fingerprint"], "file": f["file"], "rule": f["rule"], "reason": reason});
         }
     }
-    (themes, dropped2) = pack_themes(eligible, budgets, package, repo_dir, globs);
+    (themes, dropped2) = pack_themes(eligible, budgets, repo_dir, globs);
     (themes2, dropped3) = fit_clock(themes, dropped2, budgets, verify_estimate, remaining_min);
     return {"themes": themes2, "dropped": dropped + dropped3};
 }
 
-"""Round-robin package rotation (TPRD S3): print tonight's package, persist the next one."""
-def rotate(config_path: str, state_path: str) -> str {
-    packages: list[str] = [str(pkg) for pkg in as_list(as_dict(load_config_toml(config_path)["rotation"])["packages"])];
-    state: dict = state_read(state_path);
-    current: str = str(state.get("next_package", packages[0]));
-    if current not in packages {
-        current = packages[0];
-    }
-    state["next_package"] = packages[(packages.index(current) + 1) % len(packages)];
-    state_write(state_path, state);
-    return current;
-}
-
 with entry {
     args: list[str] = sys.argv;
-    if len(args) == 8 and args[1] == "select" {
+    if len(args) == 7 and args[1] == "select" {
         raw: list = parse_list(read_stdin());
         findings: list[dict] = [f for f in raw if isinstance(f, dict)];
-        print(json.dumps(select(findings, args[2], args[3], args[4], args[5], int(args[6]), args[7])));
+        print(json.dumps(select(findings, args[2], args[3], args[4], int(args[5]), args[6])));
     } elif args[1] == "split" and len(args) == 4 if len(args) > 1 else False {
         with open(args[2], "r") as f {
             selection: dict = parse_obj(f.read());
@@ -294,13 +280,10 @@ with entry {
             item: dict = as_dict(d);
             print(str(item["fingerprint"]) + "\t" + str(item["file"]) + "\t" + str(item["reason"]));
         }
-    } elif args[1] == "rotate" and len(args) == 4 if len(args) > 1 else False {
-        print(rotate(args[2], args[3]));
     } elif len(args) > 1 and args[1] != "test" {
-        eprint("usage: ... findings.json | jac run selector.jac select <package> <config.toml> <ledger.jsonl> <state.json> <remaining_min> <repo_dir>");
+        eprint("usage: ... findings.json | jac run selector.jac select <config.toml> <ledger.jsonl> <state.json> <remaining_min> <repo_dir>");
         eprint("       jac run selector.jac split <selection.json> <outdir>");
         eprint("       jac run selector.jac dropped <selection.json>");
-        eprint("       jac run selector.jac rotate <config.toml> <state.json>");
     }
 }
 
@@ -322,7 +305,7 @@ test "packing respects caps, drops ledger-known and protected findings" {
         mk("pkg/tests/f.jac", "dead code", 40),    # protected
         mk("pkg/d.jac", "dup", 30),
     ];
-    result: dict = select(findings, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, "/nonexistent-repo");
+    result: dict = select(findings, cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, "/nonexistent-repo");
     assert len(as_list(result["themes"])) == 2;
     reasons: list[str] = [str(d["reason"]) for d in as_list(result["dropped"])];
     assert "protected-path" in reasons;
@@ -346,7 +329,7 @@ test "packing pulls a finding's impl sibling into theme scope" {
     }
     findings: list[dict] = [{"file": "gw/gateway.jac", "rule": "dead-code", "snippet": "s",
         "summary": "x", "est_loc_saved": 40, "confidence": 4, "risk": 2, "theme_hint": "gw"}];
-    result: dict = select(findings, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, "/nonexistent-repo");
+    result: dict = select(findings, cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, "/nonexistent-repo");
     themes: list[dict] = as_list(result["themes"]);
     assert len(themes) == 1;
     files: list[str] = [str(f) for f in as_list(as_dict(themes[0])["files"])];
@@ -394,14 +377,14 @@ test "vestigial_test_files discovers the pure candidate, skips the mixed one, ig
     }
     dead: list[dict] = [{"file": "jac/pkg/gateway.jac", "rule": "dead-code", "snippet": "s",
         "summary": "x", "est_loc_saved": 10, "confidence": 5, "risk": 1, "theme_hint": "gw"}];
-    result: dict = select(dead, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, repo);
+    result: dict = select(dead, cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, repo);
     theme: dict = as_dict(as_list(result["themes"])[0]);
     assert as_list(theme["vestigial_deletions"]) == ["jac/pkg/tests/test_only.jac"];
 
     # a duplication (non-dead-code) finding must never get vestigial deletions, even same file
     dup: list[dict] = [{"file": "jac/pkg/gateway.jac", "rule": "duplication", "snippet": "s2",
         "summary": "x", "est_loc_saved": 10, "confidence": 5, "risk": 1, "theme_hint": "gw2"}];
-    result2: dict = select(dup, "pkg", cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, repo);
+    result2: dict = select(dup, cfg_path, "/nonexistent-ledger", "/nonexistent-state", 999, repo);
     theme2: dict = as_dict(as_list(result2["themes"])[0]);
     assert as_list(theme2["vestigial_deletions"]) == [];
 }
@@ -420,7 +403,7 @@ test "clock shedding removes lowest-scored theme" {
          "est_loc_saved": 5, "confidence": 2, "risk": 3, "theme_hint": "small"},
     ];
     # remaining 60 min, default verify_estimate 30 → per-theme 55 → only 1 theme fits
-    result: dict = select(findings, "p", cfg_path, "/nonexistent", "/nonexistent", 60, "/nonexistent-repo");
+    result: dict = select(findings, cfg_path, "/nonexistent", "/nonexistent", 60, "/nonexistent-repo");
     assert len(as_list(result["themes"])) == 1;
     assert as_list(result["themes"])[0]["slug"] == "big";
     assert any([str(d["reason"]) == "no-clock-left" for d in as_list(result["dropped"])]);

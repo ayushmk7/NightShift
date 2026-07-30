@@ -33,7 +33,7 @@ tier2_main() {
 tier2_audit() {
     local pkg=$1 prompt attempt
     prompt="$(render_prompt "$NS_ROOT/prompts/audit.md" \
-        "pkg=$pkg" "scope=$(ns_audit_scope "$pkg")" \
+        "pkg=$pkg" "scope=jac/jaclang/ and jac-mcp/" \
         "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
 
     # empty NS_AGENT_MODEL (config: [agent].model) means "account default" -- that's the exact

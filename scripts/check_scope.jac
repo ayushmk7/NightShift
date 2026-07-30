@@ -13,11 +13,17 @@ this theme, that the file is entirely about code the theme is deleting) AND the 
 clean deletion (status "D"), never a modification.
 """
 import sys;
-import from nslib { eprint, read_stdin, parse_obj, as_list, is_protected, load_globs, release_fragment }
+import from nslib { eprint, read_stdin, parse_obj, as_list, is_protected, load_globs, fragment_path }
 
 def violations(changed: list[tuple[str, str]], theme: dict, globs: list[str]) -> list[str] {
     allowed: list[str] = [str(f) for f in theme["files"]];
-    allowed.append(release_fragment(str(theme["package"])));
+    # The orchestrator, not the agent, writes the fragment -- but the gate must still allow it
+    # through. Kind comes from the theme; fragment_path clamps an invalid kind to refactor, so a
+    # tampered theme cannot smuggle an arbitrary filename past the regex CI enforces.
+    frag: str = fragment_path(allowed, str(theme.get("fragment_kind", "refactor")));
+    if frag {
+        allowed.append(frag);
+    }
     vestigial: list[str] = [str(f) for f in as_list(theme.get("vestigial_deletions", []))];
     out: list[str] = [];
     for (status, path) in changed {
@@ -79,12 +85,12 @@ with entry {
 }
 
 test "diff outside allow-list is a violation, fragment is allowed" {
-    theme: dict = {"package": "jac-client", "files": ["jac-client/render/pipe.jac"]};
+    theme: dict = {"package": "jac", "files": ["jac/jaclang/cli/pipe.jac"]};
     globs: list[str] = ["**/tests/**"];
     changed: list[tuple[str, str]] = [
-        ("M", "jac-client/render/pipe.jac"),
-        ("A", "docs/docs/community/release_notes/unreleased/jac-client/0000.refactor.md"),
-        ("M", "jac-client/render/rogue.jac"),
+        ("M", "jac/jaclang/cli/pipe.jac"),
+        ("A", "release_notes/unreleased/jaclang/0000.refactor.md"),
+        ("M", "jac/jaclang/cli/rogue.jac"),
     ];
     found: list[str] = violations(changed, theme, globs);
     assert len(found) == 1;

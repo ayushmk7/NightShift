@@ -12,7 +12,15 @@ argv:
 import sys;
 import json;
 import subprocess;
-import from nslib { eprint, read_stdin, parse_obj, as_list, as_int, release_fragment }
+import from nslib { eprint, read_stdin, parse_obj, as_list, as_int, fragment_path }
+
+"""TEMPORARY bridge: render_draft and lib/tier2.sh still speak in package terms (rotation is
+gone, but Task 3 hasn't yet reworked the apply loop around shards). Delegates to the corrected
+fragment_path so the path itself is never stale, even though "one package -> one fragment" is
+itself the concept Task 3 replaces with "one theme's actual files -> one fragment"."""
+def package_fragment(pkg: str) -> str {
+    return fragment_path(["jac/jaclang/" + pkg + "/_"], "refactor") if pkg != "jac-mcp" else "";
+}
 
 """Frontmatter values are JSON literals, so `meta` can parse every value with json.loads."""
 def frontmatter_lines(d: dict) -> list[str] {
@@ -81,7 +89,7 @@ def render(d: dict) -> str {
         d["title"] = "refactor(" + str(d["package"]) + "): " + str(d["summary"])[:60];
     }
     if "release_note" not in d {
-        d["release_note"] = release_fragment(str(d["package"]));
+        d["release_note"] = package_fragment(str(d["package"]));
     }
     return "\n".join(frontmatter_lines(d) + [""] + body_lines(d)) + "\n";
 }
@@ -134,7 +142,7 @@ with entry:__main__ {   # only dispatch the CLI on direct `jac run`; sendmail.ja
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "frag" and len(args) == 3 {
-        print(release_fragment(args[2]));
+        print(package_fragment(args[2]));
     } elif cmd == "git-report" and len(args) == 4 {
         print(json.dumps(git_report(args[2], args[3])));
     } elif cmd == "render" and len(args) >= 3 {
@@ -180,7 +188,7 @@ test "render then split roundtrips the frontmatter" {
     assert meta["loc"]["removed"] == 512;
     assert meta["loc"]["added"] == 143;
     assert meta["files"] == 1;
-    assert meta["release_note"] == "docs/docs/community/release_notes/unreleased/jac-client/0000.refactor.md";
+    assert meta["release_note"] == "release_notes/unreleased/jaclang/0000.refactor.md";
     assert body.startswith("# refactor(jac-client):");
     assert "+143 -512" in body;
     assert "net -369" in body;

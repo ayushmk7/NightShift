@@ -29,8 +29,7 @@ pkg_test_raw() {
 # byllm-only change must gate on the (small) byllm suite, NOT the large, env-flaky jac core suite.
 # `cut -d/ -f1` got this wrong (jac/jaclang/byllm -> "jac" -> ran core tests full of CEF/pip flakes).
 #
-# jac-mcp's CLI-level integration is scattered outside jac/jaclang/byllm too (see
-# ns_audit_scope in lib/common.sh for the same real paths) and has no test suite of its own
+# jac-mcp's CLI-level integration is scattered outside jac/jaclang/byllm too and has no test suite of its own
 # (confirmed: "no tests ran" on the recorded baseline) -- without an explicit case here it fell
 # into the "jac" catch-all and triggered the ~95min core suite for a 1-file CLI change, confirmed
 # live. Route it (and jac-scale, needs k8s) to pkg_test_raw's `*) return 2` no-gate path instead,

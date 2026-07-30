@@ -126,15 +126,6 @@ ns_precommit() {
     PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" "$NS_PATHS_PRECOMMIT" "$@"
 }
 
-# Real path(s) to audit for a "package" — neither is an actual top-level directory (jac core
-# lives under jac/jaclang/). The audit prompt would otherwise say "look in {pkg}/" literally.
-ns_audit_scope() {
-    case "$1" in
-        jac-byllm) echo "jac/jaclang/byllm/" ;;
-        *)         echo "jac/jaclang/ (excluding jac/jaclang/byllm/ and jac/jaclang/scale/, which are separate packages)" ;;
-    esac
-}
-
 # --- secrets ---
 ns_load_env() {
     # shellcheck disable=SC1090
