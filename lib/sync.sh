@@ -30,7 +30,18 @@ sync_main() {
 }
 
 # First run only: create the orphan branch so fork main stays a pristine mirror (PRD 7 stage 5).
+#
+# The prune is NOT hygiene, it is the precondition. `git worktree add` REFUSES a path that is still
+# registered even when the directory is gone -- "fatal: '../wt' is a missing but already registered
+# worktree" -- and that is exactly the state work/repo is in right now: Plan 5's reset deleted
+# work/drafts with `rm -rf` and left the registration behind (`git worktree list` shows it
+# `prunable`). Reproduced on a scratch repo 2026-07-30: add, rm -rf, add again -> rc=128; prune
+# first -> rc=0. Without this line the FIRST live S1 dies at `worktree add`, under errexit inside
+# ns_stage, so no night reaches S1.6 (whose theme resolver looks in $DRAFTS/themes) or anything
+# after it. Prune only removes registrations whose directory is already missing, so it is a no-op
+# on a healthy tree.
 drafts_bootstrap() {
+    git -C "$REPO" worktree prune
     if git -C "$REPO" ls-remote --exit-code origin refs/heads/nightshift/drafts >/dev/null 2>&1; then
         git -C "$REPO" worktree add "$DRAFTS" nightshift/drafts
         return 0

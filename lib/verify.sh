@@ -158,7 +158,16 @@ assert_suite_ran() {
     esac
     case "$sessions" in
         "$want") : ;;
-        *) ns_die "$EX_BUG" "$where $suite: expected $want test-runner session(s), one per test command in [jobs.$suite], but $(basename "$raw") has $sessions. Refusing to score a suite that did not run as a pass -- check that job's command paths and cwd in config/ci-mirror.toml." ;;
+        # The last failing command is NAMED here, and that wording is load-bearing (followups 4.2).
+        # suite_test_raw classifies a failed command as setup-vs-test by the substring `jac test`,
+        # and [jobs.compiler]/[jobs.runtime] register `cd jac && … jac test …` as ONE command -- so
+        # a failing `cd jac` matches, is classified as a TEST failure, converts to `return 0`, and
+        # arrives here rather than at the EX_MIRROR_SETUP arm above. Not a false green (the session
+        # count still aborts), but the operator was told the wrong thing. The honest fix is the
+        # message, not the classification: reclassifying would need suite_test_raw to parse compound
+        # commands, and being wrong in the other direction turns a real test failure into a
+        # night-wide abort.
+        *) ns_die "$EX_BUG" "$where $suite: expected $want test-runner session(s), one per test command in [jobs.$suite], but $(basename "$raw") has $sessions. Refusing to score a suite that did not run as a pass -- check that job's command paths and cwd in config/ci-mirror.toml. The last failing command in this job was: ${CIMIRROR_FAILED_CMD:-(none -- every command exited 0, so the runner started fewer times than there are test commands)}. Note that a compound command like 'cd jac && … jac test …' is classified as a TEST command by substring, so a failing 'cd jac' arrives here rather than as a setup failure." ;;
     esac
     # A session banner is not proof the run COLLECTED anything: a collection-error run prints
     # `collected 0 items / 1 error` under a perfectly normal banner. Left unchecked on the baseline

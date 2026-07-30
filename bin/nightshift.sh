@@ -20,6 +20,10 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 . "$NS_ROOT/lib/promote.sh"
 . "$NS_ROOT/lib/dataset.sh"
 . "$NS_ROOT/lib/cimirror.sh"
+# AFTER verify.sh and cimirror.sh: inventory_refresh calls verify_branch (which calls cimirror_job)
+# and ns_theme_for_branch. Sourcing order only matters at CALL time in bash, but keeping it last
+# documents the dependency instead of leaving it to luck.
+. "$NS_ROOT/lib/inventory.sh"
 
 ns_on_exit() {
     local code=$?
@@ -85,6 +89,14 @@ ns_run_inner() {
 
     ns_stage S0 preflight_main
     ns_stage S1 sync_main
+    # S1.6 runs BEFORE any new work (spec section 4: S1.6 > S3a reactive > carry-over > tonight's
+    # task): existing PRs outrank fresh findings, which is what makes the inventory converge rather
+    # than grow. It needs S1's fresh main and its refreshed work/drafts worktree (the theme
+    # resolver's second lookup), so it cannot move above S1. bin/test-harness.sh section 18 pins
+    # both edges of that window.
+    #
+    # S1.5 (Plan 4's reactive merge poll) belongs between S1 and S1.6 and does not exist yet.
+    ns_stage S1.6 inventory_main
     # S2 (tier-1 deterministic autofix) was retired 2026-07-30: a byllm-only formatting PR is noise,
     # a repo-wide one is unmergeable (~259 pre-existing violations on main), and upstream only checks
     # formatting repo-wide on push. Themes now format their own edits; [jobs.fmt] gates that.
@@ -103,6 +115,7 @@ usage: nightshift.sh run                        # the nightly pipeline (launchd 
        nightshift.sh status                     # last run summary + ledger tallies
        nightshift.sh baseline                   # record the test baseline on main (slow; M0)
        nightshift.sh mirror [branch]            # run the whole CI mirror against a branch (slow)
+       nightshift.sh inventory                  # run S1.6 by hand (list/rebase/re-gate open PRs)
        nightshift.sh smtp-doctor                # one live probe email; prints the server receipt
        nightshift.sh dataset-backfill           # rebuild dataset/*.jsonl from past real nights
 EOF
@@ -171,6 +184,19 @@ case "$cmd" in
                 fi
                 tail -40 "$LOG_DIR/mirror-manual.txt"
                 exit "$rc" ;;
+    # Hand-run S1.6. Same refuse-under-a-live-night check `mirror` has, and for the same reason:
+    # inventory_refresh git-checkouts and rebases in $REPO, which would land underneath a running
+    # S3/S4/S5. Like `mirror` it deliberately does NOT call ns_lock_acquire -- that reclaims a stale
+    # lock and there is no EXIT trap on this path to release it, so a manual inventory would leave
+    # /tmp/nightshift.lock held forever and block every subsequent night.
+    inventory)  mkdir -p "$LOG_DIR" "$NS_ROOT/state"; ns_load_env
+                if [ -f "$LOCK_DIR/pid" ]; then
+                    holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+                    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+                        ns_die "$EX_LOCK" "a nightly run (pid $holder) is live; 'inventory' would git-checkout and rebase in $REPO underneath it. Wait for it to finish, or stop it first."
+                    fi
+                fi
+                inventory_main ;;
     # "Does the pipe carry a byte", asked separately from "does the digest look right". Prints the
     # server's own 250 acceptance of the DATA payload; exit 0 is only reachable WITH one.
     smtp-doctor) mkdir -p "$LOG_DIR"; ns_load_env

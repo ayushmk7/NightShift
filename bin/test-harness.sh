@@ -651,6 +651,19 @@ guard_raw "setup command failed" 71 1 'jac install "litellm>=1.70.0" --global'
 guard_raw "nonzero rc, no failed command" 71 1 ""
 # a reader failure is propagated verbatim, never collapsed into "the suite ran"
 guard_raw "reader failure" 70 70 ""
+# followups 4.2: suite_test_raw classifies setup-vs-test by the substring `jac test`, and
+# [jobs.compiler]/[jobs.runtime] register `cd jac && … jac test …` as ONE command -- so a failing
+# `cd jac` is classified as a TEST failure and surfaces at assert_suite_ran's session-mismatch death
+# instead of the setup arm. Not a false green (the session count still aborts), but the operator is
+# told the wrong thing unless that death NAMES the command it actually ran.
+grep -q 'The last failing command in this job was' lib/verify.sh \
+    || fail "assert_suite_ran's session-mismatch death no longer names the failing command; a failing 'cd jac' is classified as a test command by substring and the operator is told the wrong thing"
+( . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/cimirror.sh"; . "$NS_ROOT/lib/verify.sh"
+  LOG_DIR="$G"; CIMIRROR_FAILED_CMD="cd jac && jac test tests/compiler"
+  ns_jac() { case "$2" in sessions) echo 1 ;; testcmds) echo 2 ;; collected) echo 500 ;; esac; }
+  assert_suite_ran compiler "$G/raw.txt" 0 gate ) > "$G/sess.txt" 2>&1 || true
+grep -q 'cd jac && jac test tests/compiler' "$G/sess.txt" \
+    || fail "the session-mismatch death did not name the failing command it was handed: $(cat "$G/sess.txt")"
 rm -rf .jac
 echo "did-not-run guards behave: collected-0 and session-mismatch are fatal, a healthy capture is not"
 
@@ -1389,7 +1402,89 @@ esac
 rm -rf .jac
 echo "S1.6: an empty answer is distinguishable from a failed query; heads filtered; re-gate report-only; lease-only force"
 
-# Section 18 lands with Task 8 (wiring S1.6 into the night).
+echo "== 18. S1.6 is agent-free and runs before any new work =="
+# Spec 8.1 describes rerunning failed jobs then up to two Opus repair attempts. It is NOT built --
+# see the plan's 'deliberately not built'. This is the structural version of that decision: the
+# inventory has no path to a model at all, so a red PR can only ever be reported. A future repair
+# loop has to delete this assertion on purpose, in a commit that says so. Comments are stripped
+# first: this file explains in prose WHY there is no repair loop, and matching that explanation
+# would fail the check forever.
+case "$(grep -vE '^[[:space:]]*#' lib/inventory.sh | grep -cE '\$NS_PATHS_CLAUDE|claude |run rerun' || true)" in
+    0) : ;;
+    *) fail "lib/inventory.sh invokes an agent or reruns CI jobs; the repair loop is out of scope for this plan and must be added deliberately, not smuggled in" ;;
+esac
+# The stage has to actually be wired in, and every source has to still load: `ns_stage S1.6
+# inventory_main` in a file that never sources lib/inventory.sh fails at 02:00, not here.
+grep -q '^\. "\$NS_ROOT/lib/inventory.sh"' bin/nightshift.sh \
+    || fail "bin/nightshift.sh does not source lib/inventory.sh, so 'ns_stage S1.6 inventory_main' would die with 'command not found' on the first live night"
+ns_probe_rc=0
+bin/nightshift.sh __harness_source_probe__ >/dev/null 2>&1 || ns_probe_rc=$?
+case "$ns_probe_rc" in
+    2) : ;;
+    *) fail "bin/nightshift.sh exited $ns_probe_rc on an unknown command instead of 2 (usage); one of its sourced libs no longer loads" ;;
+esac
+# ORDERING. RECONCILIATION: the planned version of this guard fired only when BOTH line numbers were
+# empty, and anchored on `ns_stage S2 tier1_main`, which no longer exists -- so post-retirement it
+# fell through to `[ "93" -lt "" ]`, a malformed integer comparison rather than a verdict. Re-anchored
+# on S1 and S3, and EACH variable is validated on its own. `|| true` on both pipelines because
+# grep exits 1 when it matches nothing and this harness runs under `set -o pipefail`: without it the
+# tripwire would abort the run with no message at all, which is a tripwire that cannot report.
+s1_ln="$(grep -n 'ns_stage S1 sync_main' bin/nightshift.sh | cut -d: -f1 || true)"
+inv_ln="$(grep -n 'ns_stage S1\.6 inventory_main' bin/nightshift.sh | cut -d: -f1 || true)"
+s3_ln="$(grep -n 'ns_stage S3 tier2_main' bin/nightshift.sh | cut -d: -f1 || true)"
+case "$s1_ln"  in ''|*[!0-9]*) fail "no 'ns_stage S1 sync_main' line in bin/nightshift.sh (got '$s1_ln') -- the S1.6 ordering check has nothing to anchor on" ;; esac
+case "$inv_ln" in ''|*[!0-9]*) fail "no 'ns_stage S1.6 inventory_main' line in bin/nightshift.sh (got '$inv_ln') -- S1.6 is not wired into the night at all" ;; esac
+case "$s3_ln"  in ''|*[!0-9]*) fail "no 'ns_stage S3 tier2_main' line in bin/nightshift.sh (got '$s3_ln') -- the S1.6 ordering check has nothing to anchor on" ;; esac
+[ "$s1_ln" -lt "$inv_ln" ] \
+    || fail "S1.6 (line $inv_ln) must run AFTER S1 (line $s1_ln): it rebases onto fresh main and resolves themes out of the work/drafts worktree, both of which S1 refreshes"
+[ "$inv_ln" -lt "$s3_ln" ] \
+    || fail "S1.6 (line $inv_ln) must run BEFORE S3 (line $s3_ln): existing PRs outrank new work, or the inventory never converges"
+# `nightshift.sh inventory` must refuse to run underneath a live night (it git-checkouts and rebases
+# in work/repo), and must NOT take the lock -- there is no EXIT trap on that path to release it.
+inv_arm="$(awk '/^    inventory\)/,/;;$/' bin/nightshift.sh)"
+case "$inv_arm" in
+    "") fail "bin/nightshift.sh has no 'inventory)' arm; S1.6 cannot be hand-run" ;;
+esac
+case "$inv_arm" in
+    *'$LOCK_DIR/pid'*) : ;;
+    *) fail "the 'inventory' arm does not check for a live night; it would git-checkout and rebase in work/repo underneath a running S3/S4/S5" ;;
+esac
+case "$inv_arm" in
+    *ns_lock_acquire*) fail "the 'inventory' arm calls ns_lock_acquire; there is no EXIT trap on that path to release it, so /tmp/nightshift.lock would be held forever and block every subsequent night" ;;
+esac
+case "$inv_arm" in
+    *'$EX_LOCK'*) : ;;
+    *) fail "the 'inventory' arm detects a live night but does not ns_die EX_LOCK on it" ;;
+esac
+# S1.6's theme resolver looks in $DRAFTS/themes second, and S1 is what puts $DRAFTS on disk -- so
+# S1.6 inherits drafts_bootstrap's one hard precondition. Driven against a real scratch repo, not
+# grepped: `git worktree add` REFUSES a path that is still registered after the directory was
+# rm -rf'd, which is precisely the state Plan 5's reset left work/repo in (`git worktree list` shows
+# work/drafts `prunable` today). Without the prune the first live S1 dies at rc=128 under errexit
+# and no night ever reaches S1.6.
+WT="$T/wt"; mkdir -p "$WT"
+( cd "$WT" && git init -q r && cd r && git config user.email t@t && git config user.name t \
+    && echo a > a && git add -A && git commit -qm a && git worktree add -q ../gone \
+    && rm -rf ../gone ) >/dev/null 2>&1 \
+    || fail "could not build the worktree scratch repo -- this assertion would be vacuous"
+wt_rc=0
+( cd "$WT/r" && git worktree add ../gone ) >/dev/null 2>&1 || wt_rc=$?
+case "$wt_rc" in
+    0) fail "git no longer refuses to re-add a rm -rf'd worktree, so this assertion no longer proves anything -- re-derive it before deleting it" ;;
+esac
+( cd "$WT/r" && git worktree prune && git worktree add ../gone ) >/dev/null 2>&1 \
+    || fail "git worktree prune did not clear the stale registration; drafts_bootstrap's fix is built on a premise that no longer holds"
+db_body="$(awk '/^drafts_bootstrap\(\)/,/^}/' lib/sync.sh)"
+case "$db_body" in
+    "") fail "no drafts_bootstrap in lib/sync.sh -- S1 cannot create work/drafts at all" ;;
+esac
+prune_ln="$(printf '%s\n' "$db_body" | grep -n 'worktree prune' | cut -d: -f1 || true)"
+add_ln="$(printf '%s\n' "$db_body" | grep -n 'worktree add' | head -1 | cut -d: -f1 || true)"
+case "$prune_ln" in ''|*[!0-9]*) fail "drafts_bootstrap does not 'git worktree prune' before adding work/drafts; work/repo currently carries a stale registration for it, so the first live S1 dies at rc=128 and no night reaches S1.6" ;; esac
+case "$add_ln"   in ''|*[!0-9]*) fail "drafts_bootstrap no longer calls 'git worktree add' -- the ordering check below would be vacuous" ;; esac
+[ "$prune_ln" -lt "$add_ln" ] \
+    || fail "drafts_bootstrap prunes (line $prune_ln of the function) AFTER adding the worktree (line $add_ln); the add is what fails, so the prune has to precede it"
+echo "S1.6 is agent-free, sourced, ordered S1 < S1.6 < S3, hand-runnable only outside a live night; drafts_bootstrap prunes first"
 
 echo "== 19. the digest's transport guards: receipt required, credentials scrubbed =="
 # scripts/sendmail.jac's own tests cover the two pure functions (section 1 runs them). What is NOT
