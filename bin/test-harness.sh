@@ -733,6 +733,86 @@ grep -q 'test-weakening guard: compared' lib/verify.sh \
     || fail "lib/verify.sh no longer logs how many files the test-weakening guard compared; a stage that silently compared zero is the failure this guard exists to prevent"
 echo "test-weakening guard fires on assert count and test count independently"
 
+echo "== 14. apply model routing: complexity decides attempt 1, escalation is ONE-WAY =="
+route() { ( . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/tier2.sh"
+            NS_AGENT_MODEL=opus; NS_AGENT_MODEL_SIMPLE=sonnet; ns_attempt_model "$1" "$2" ); }
+# attempt 1 routes on complexity
+[ "$(route 1 trivial)"    = sonnet ] || fail "trivial did not route to model_simple"
+[ "$(route 1 mechanical)" = sonnet ] || fail "mechanical did not route to model_simple"
+[ "$(route 1 judgement)"  = opus ]   || fail "judgement did not route to model"
+# an unknown or empty complexity fails SAFE to the expensive model
+[ "$(route 1 "")"         = opus ]   || fail "an empty complexity must fail safe to model, not model_simple"
+[ "$(route 1 wat)"        = opus ]   || fail "an unknown complexity must fail safe to model"
+# attempt 2 is ALWAYS the expensive model: a cheap theme escalates, an expensive one never demotes.
+# Both directions are asserted, because an implementation that just returns $NS_AGENT_MODEL for
+# everything passes the judgement cases above and would silently stop routing anything cheaply.
+[ "$(route 2 trivial)"    = opus ]   || fail "a failed cheap attempt did not escalate to model"
+[ "$(route 2 judgement)"  = opus ]   || fail "a judgement retry left the expensive model"
+case "$(route 1 trivial)$(route 2 trivial)" in
+    sonnetopus) : ;;
+    *) fail "escalation is not one-way: attempt1/attempt2 for a trivial theme was '$(route 1 trivial)/$(route 2 trivial)'" ;;
+esac
+
+# ns_attempt_model being correct proves nothing if tier2_apply consults it ONCE, outside the retry
+# loop: every assertion above still passes while attempt 2 silently reuses attempt 1's model, and
+# escalation -- the whole point -- is gone. Source-level ordering, stated plainly as a grep: a
+# behavioural test would have to run tier2_apply, which checks out branches in work/repo.
+# Plan 2 Task 9 Step 7 rehearses the real loop against a stub `claude` once, by hand.
+one_line() {           # one_line <label> <ere> -> the single matching line number in lib/tier2.sh
+    local label=$1 pat=$2 hits n
+    hits="$(grep -nE -- "$pat" lib/tier2.sh || true)"
+    case "$hits" in
+        "") fail "routing anchor '$label' not found in lib/tier2.sh (pattern: $pat) -- the ordering check would be vacuous" ;;
+    esac
+    n="$(printf '%s\n' "$hits" | wc -l | tr -d ' ')"
+    case "$n" in
+        1) : ;;
+        *) fail "routing anchor '$label' matched $n lines in lib/tier2.sh; it must be unique" ;;
+    esac
+    printf '%s\n' "$hits" | cut -d: -f1
+}
+apply_loop_ln="$(grep -n 'for attempt in 1 2; do' lib/tier2.sh | tail -1 | cut -d: -f1)"
+case "$apply_loop_ln" in
+    ''|*[!0-9]*) fail "could not find tier2_apply's retry loop in lib/tier2.sh" ;;
+esac
+route_ln="$(one_line "per-attempt route" 'attempt_model="\$\(ns_attempt_model "\$attempt"')"
+use_ln="$(one_line "apply --model" '\-\-model "\$attempt_model"')"
+[ "$apply_loop_ln" -lt "$route_ln" ] \
+    || fail "ns_attempt_model is called at line $route_ln, BEFORE tier2_apply's retry loop at $apply_loop_ln -- attempt 2 would reuse attempt 1's model and escalation would never happen"
+[ "$route_ln" -lt "$use_ln" ] \
+    || fail "the apply session's --model (line $use_ln) is not the value routed at line $route_ln"
+# The audit is the expensive model unconditionally; the old conditional model_args array is gone.
+grep -q 'local audit_model="\$NS_AGENT_MODEL"' lib/tier2.sh \
+    || fail "the audit no longer pins \$NS_AGENT_MODEL; an unset --model means 'account default', which drifts silently"
+# Comments stripped first: lib/tier2.sh explains in prose why the array is gone, and matching that
+# explanation would fail this check forever (same shape as section 9b's stripped grep).
+grep -vE '^[[:space:]]*#' lib/tier2.sh | grep -q 'model_args' \
+    && fail "the model_args array is back in lib/tier2.sh -- under set -u bash 3.2 aborts on an empty one, and both sessions now take an explicit --model"
+
+# covmap's fail-loud contract, which tier2_main's coverage arm is built on: `rank` must NOT come
+# back as an empty array when `jac code map` fails. Both directions, so the failure assertion
+# cannot be satisfied by a covmap that never produces anything.
+rm -rf .jac
+CVR="$T/covrepo"; mkdir -p "$CVR/jac/jaclang/cli"
+cat > "$CVR/fakejac" <<EOF
+#!/usr/bin/env bash
+printf '{"schema_version":1,"command":"map","archetypes":[{"name":"WidgetNoTests","kind":"obj","file":"$CVR/jac/jaclang/cli/w.jac","line":4,"fields":["a: int"],"abilities":["go()"]}]}\n'
+EOF
+chmod +x "$CVR/fakejac"
+jac run scripts/covmap.jac rank "$CVR" "$CVR/fakejac" > "$CVR/ok.json" \
+    || fail "covmap rank failed against a working map stub -- the failure assertion below would be vacuous"
+grep -q 'WidgetNoTests' "$CVR/ok.json" \
+    || fail "covmap rank produced no untested symbol for a map with exactly one: $(cat "$CVR/ok.json")"
+cov_rc=0
+jac run scripts/covmap.jac rank "$CVR" /usr/bin/false > "$CVR/fail.json" 2>/dev/null || cov_rc=$?
+case "$cov_rc" in
+    0) fail "covmap rank exited 0 for a FAILED jac code map; its output ('$(cat "$CVR/fail.json")') reads to the audit as 'everything is tested'" ;;
+esac
+[ ! -s "$CVR/fail.json" ] \
+    || fail "covmap rank wrote output for a failed map: $(cat "$CVR/fail.json")"
+rm -rf .jac
+echo "routing: trivial/mechanical -> model_simple, judgement -> model, retry always -> model; covmap fails loud"
+
 # Sections 15-18 are RESERVED: docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2
 # (task registry) and 15-18 to Plan 3 (ship path); all four v2 plans independently claimed "section
 # 11". Plan 4 owns 19-23. The gap is deliberate — renumbering later would silently reorder the

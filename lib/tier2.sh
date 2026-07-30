@@ -13,12 +13,27 @@ render_prompt() {
     printf '%s' "$text"
 }
 
-# BRIDGE, Plan 2 Tasks 1-5. Task 9 replaces the whole of S3 (per-task audit + apply, carry-over,
-# model routing). This is the minimum that keeps the stage COHERENT with the task registry in the
-# meantime, and it is not optional: without it tier2_audit_shard renders a `prompts/audit.md` that
-# no longer exists and calls `parse_result findings` without the <task> <scoring> argv it now
-# requires, so every S3 would fail -- fail-closed, but total.
+# Which model executes one apply attempt (design spec 13).
 #
+# Attempt 1 routes on the theme's complexity: trivial/mechanical go to the cheap model, judgement
+# to the expensive one. Every later attempt is $NS_AGENT_MODEL, unconditionally -- ESCALATION IS
+# ONE-WAY. A judgement theme that failed on Opus is never retried on Sonnet in the hope of a
+# different answer, and a Sonnet theme that failed gets exactly one Opus attempt.
+#
+# `case`, not `[ ] && ...`: a trailing && list returns nonzero when its test fails, and this
+# function is called in a command substitution inside an errexit caller.
+ns_attempt_model() {   # ns_attempt_model <attempt> <complexity>
+    case "$1" in
+        1)
+            case "$2" in
+                trivial|mechanical) printf '%s\n' "$NS_AGENT_MODEL_SIMPLE" ;;
+                *)                  printf '%s\n' "$NS_AGENT_MODEL" ;;
+            esac
+            ;;
+        *) printf '%s\n' "$NS_AGENT_MODEL" ;;
+    esac
+}
+
 # `tasks next` ADVANCES the cycle as it reads (see scripts/tasks.jac): a night that dies later must
 # not make every following night repeat the same task. Resolved once here, before the fan-out, so
 # the backgrounded shards all inherit the same NS_TASK_* values.
@@ -49,7 +64,26 @@ tier2_main() {
     fi
 
     tier2_resolve_task
-    tier2_audit_all || return 0        # no usable findings skips the tier
+
+    # Coverage evidence, once for the night, before the fan-out. Only the coverage audit reads it.
+    if [ "$NS_TASK_NAME" = coverage ]; then
+        if ns_jac covmap rank "$REPO" "$NS_PATHS_JAC_REPO" > "$LOG_DIR/covmap.json"; then
+            ns_log S3 "covmap: $(ns_jac parse_result len < "$LOG_DIR/covmap.json" || echo 0) untested public archetypes"
+        else
+            # No evidence means the audit would be guessing, and an empty evidence block reads to
+            # the model exactly like "everything is tested". Skip tonight's fresh coverage audit;
+            # carried-over themes below still run, because they need no audit at all.
+            # The file is REMOVED, not left truncated: covmap.jac's own check=True already refuses
+            # to emit `[]` on failure, and tier2_audit_shard's `[ ! -s ]` test is what turns that
+            # into a skipped audit rather than an audit against nothing.
+            ns_fail "audit[coverage]" "covmap failed — no evidence, so no fresh coverage audit tonight"
+            rm -f "$LOG_DIR/covmap.json"
+        fi
+    fi
+
+    # tier2_audit_all's failure no longer returns: with carry-over, a night with zero fresh
+    # findings still has yesterday's deferred themes to apply.
+    tier2_audit_all || ns_log S3 "no fresh findings tonight — carry-over only"
     tier2_select
     tier2_apply
     dataset_record_night               # after select+apply: selection.json + every meta-*.json exist
@@ -60,21 +94,31 @@ tier2_main() {
 # Writes $LOG_DIR/findings-<shard>.json on success. Never returns nonzero for a single
 # shard failure -- a dead shard must not kill the tier, the way a dead package used to.
 tier2_audit_shard() {
-    local shard=$1 prompt attempt scope
-    scope="$(ns_jac shards scope "$shard" "$CONFIG")"
-    # {coverage_evidence} only appears in prompts/audit-coverage.md. scripts/covmap.jac (Plan 2
-    # Task 8) is what will fill it; until then the prompt says so explicitly rather than reaching
-    # the model as a live `{coverage_evidence}` placeholder.
-    prompt="$(render_prompt "$NS_ROOT/prompts/audit-$NS_TASK_NAME.md" \
-        "shard=$shard" "scope=$scope" \
-        "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_TASK_PONYTAIL" \
-        "coverage_evidence=(No static coverage evidence is available yet. Derive the gaps yourself from the source and the tests that already exist.)")"
+    local shard=$1 prompt attempt scope evidence=""
 
-    # empty NS_AGENT_MODEL (config: [agent].model) means "account default" -- that's the exact
-    # silent-drift footgun the config comment warns about, so the default ships pinned to "sonnet";
-    # only actually omit the flag if someone deliberately blanks it back out.
-    local -a model_args=()
-    [ -n "$NS_AGENT_MODEL" ] && model_args=(--model "$NS_AGENT_MODEL")
+    # A coverage audit with no evidence is a coverage audit that guesses, and `{coverage_evidence}`
+    # rendered empty reads to the model as "nothing here is untested". tier2_main removes the file
+    # when covmap fails, so absence here is unambiguous.
+    if [ "$NS_TASK_NAME" = coverage ] && [ ! -s "$LOG_DIR/covmap.json" ]; then
+        ns_log S3 "audit[$shard] skipped: coverage task with no covmap evidence"
+        return 1
+    fi
+
+    scope="$(ns_jac shards scope "$shard" "$CONFIG")"
+    if [ "$NS_TASK_NAME" = coverage ]; then
+        evidence="$(ns_jac covmap top "$LOG_DIR/covmap.json" "$shard" "$CONFIG" 40)"
+    fi
+    # {coverage_evidence} only appears in prompts/audit-coverage.md, and only the coverage task
+    # fills it. For the other three it substitutes to the empty string, which is correct: their
+    # prompts do not carry the placeholder at all (bin/test-harness.sh section 11 pins that).
+    prompt="$(render_prompt "$NS_ROOT/prompts/audit-$NS_TASK_NAME.md" \
+        "shard=$shard" "scope=$scope" "coverage_evidence=$evidence" \
+        "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_TASK_PONYTAIL")"
+
+    # The audit is ALWAYS the expensive model: it is judgement work, and a bad finding costs a
+    # whole 25-minute apply session downstream (design spec 13). No `model_args` array -- the flag
+    # is unconditional, which also removes one of the bash-3.2 empty-array hazards.
+    local audit_model="$NS_AGENT_MODEL"
 
     # Up to 2 attempts: a transient API error (e.g. "Connection closed mid-response") shouldn't
     # burn this shard. Each attempt is time-boxed; the parse decides success.
@@ -85,7 +129,7 @@ tier2_audit_shard() {
         # dev jac first on PATH so the agent's Bash(jac *) and the jac MCP server hit the repo binary.
         (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
             && ns_timebox "$NS_BUDGETS_AUDIT_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
-            ${model_args[@]+"${model_args[@]}"} \
+            --model "$audit_model" \
             --permission-mode dontAsk \
             --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
             --max-turns "$NS_BUDGETS_AUDIT_MAX_TURNS" --output-format json) \
@@ -120,7 +164,7 @@ tier2_audit_shard() {
 Previous output:
 $(ns_jac parse_result field result < "$LOG_DIR/audit-$shard.json")
 Re-emit ONLY the corrected \`\`\`json fenced findings array — same schema, no prose." \
-            ${model_args[@]+"${model_args[@]}"} --max-turns 1 --output-format json \
+            --model "$audit_model" --max-turns 1 --output-format json \
             > "$LOG_DIR/audit-repair-$shard.json" < /dev/null || true
         if ns_jac parse_result findings "$NS_TASK_NAME" "$NS_TASK_SCORING" < "$LOG_DIR/audit-repair-$shard.json" > "$LOG_DIR/findings-$shard.json"; then
             ns_log S3 "audit[$shard] salvaged via corrective re-prompt — $(ns_jac parse_result len < "$LOG_DIR/findings-$shard.json" || echo 0) findings"
@@ -223,8 +267,37 @@ tier2_audit_all() {
 
 # Phase B — select (pure function in selector.jac; deterministic, unit-tested)
 tier2_select() {
+    local carry="$NS_ROOT/state/carryover.json" input="$LOG_DIR/findings.json"
+
+    # Carried themes are packed FIRST the next night (selector.jac sorts on the carry flag), and
+    # merging them AHEAD of tonight's findings also makes the carried copy win the (file, rule)
+    # dedupe in parse_result merge -- so a re-discovered finding keeps its carry flag.
+    if [ -s "$carry" ]; then
+        if ns_jac parse_result merge "$carry" "$LOG_DIR/findings.json" > "$LOG_DIR/findings-all.json"; then
+            input="$LOG_DIR/findings-all.json"
+            ns_log S3 "carry-over: $(ns_jac parse_result len < "$carry" || echo 0) deferred finding(s) packed ahead of tonight's task"
+        else
+            ns_fail "carry-over" "could not merge $carry — proceeding with tonight's findings only"
+        fi
+    fi
+    # An absent/empty input is the normal shape of a night whose audit produced nothing AND which
+    # has no carry-over. `return 0`, not a die: S4/S5 still have work if an earlier stage queued a
+    # branch, and dataset_record_night is what reports the empty night.
+    [ -s "$input" ] || { ns_log S3 "nothing to select"; return 0; }
+
     ns_jac selector select "$CONFIG" "$LEDGER" "$STATE" "$(ns_remaining_min)" "$REPO" \
-        < "$LOG_DIR/findings.json" > "$LOG_DIR/selection.json"
+        < "$input" > "$LOG_DIR/selection.json"
+
+    # Tonight's own deferrals become tomorrow's carry-over. Written to a temp file and moved, so a
+    # failure here leaves YESTERDAY's carry-over intact rather than truncating it to nothing --
+    # the redirect would otherwise have emptied the file before the reader could fail.
+    if ns_jac parse_result field carryover < "$LOG_DIR/selection.json" > "$carry.tmp"; then
+        mv "$carry.tmp" "$carry"
+        ns_log S3 "carry-over for the next night: $(ns_jac parse_result len < "$carry" || echo 0) finding(s)"
+    else
+        rm -f "$carry.tmp"
+        ns_fail "carry-over" "could not extract tonight's carryover set — yesterday's file left untouched"
+    fi
 
     # findings the selector shed for budget/clock reasons are remembered as deferred (TPRD 9)
     local fp file reason
@@ -239,9 +312,8 @@ tier2_select() {
 
 # Phase C — apply: fresh branch + fresh headless session per theme
 tier2_apply() {
-    local slug branch theme_file prompt remaining attempt got_report limit_hit theme_task
-    local -a model_args=()
-    [ -n "$NS_AGENT_MODEL" ] && model_args=(--model "$NS_AGENT_MODEL")
+    local slug branch theme_file prompt remaining attempt got_report limit_hit
+    local theme_task theme_cx attempt_model
     ns_jac selector split "$LOG_DIR/selection.json" "$LOG_DIR" | while IFS= read -r slug; do
         theme_file="$LOG_DIR/theme-$slug.json"
         branch="nightshift/$NS_DATE/$slug"
@@ -263,6 +335,14 @@ tier2_apply() {
         esac
         [ -f "$NS_ROOT/prompts/apply-rules-$theme_task.md" ] \
             || ns_die "$EX_BUG" "no prompts/apply-rules-$theme_task.md for theme $slug"
+        # ...and that task's OWN knobs, re-evaluated per theme. A carried theme belongs to an
+        # earlier night's task and keeps its own ponytail mode: rendering it at TONIGHT's
+        # NS_TASK_PONYTAIL is how a carried coverage theme would silently be told to YAGNI away the
+        # test it exists to write. The eval is bare for the same reason tier2_resolve_task's is.
+        eval "$(ns_jac tasks env "$theme_task" "$CONFIG")"
+        # Complexity decides attempt 1's model. Empty (an old theme file from before Task 2) falls
+        # through ns_attempt_model's `*)` arm to the EXPENSIVE model, which is the safe direction.
+        theme_cx="$(ns_jac parse_result field complexity < "$theme_file")"
         prompt="$(render_prompt "$NS_ROOT/prompts/apply.md" \
             "theme=$(cat "$theme_file")" "ponytail_mode=$NS_TASK_PONYTAIL" \
             "task_apply_rules=$(cat "$NS_ROOT/prompts/apply-rules-$theme_task.md")")"
@@ -274,6 +354,8 @@ tier2_apply() {
         got_report=0
         limit_hit=0
         for attempt in 1 2; do
+            attempt_model="$(ns_attempt_model "$attempt" "$theme_cx")"
+            ns_log S3 "apply $slug attempt $attempt on $attempt_model (task=$theme_task, complexity=$theme_cx)"
             cd "$REPO"
             git checkout -f "$NS_REPO_DEFAULT_BRANCH" 2>/dev/null || true
             git branch -D "$branch" 2>/dev/null || true
@@ -284,7 +366,7 @@ tier2_apply() {
             # (observed live: 6 themes selected, 1 attempted, 5 silently never ran).
             (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
                 && ns_timebox "$NS_BUDGETS_APPLY_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
-                ${model_args[@]+"${model_args[@]}"} \
+                --model "$attempt_model" \
                 --permission-mode acceptEdits \
                 --allowedTools "Read,Edit,Grep,Glob,Bash(jac fmt *),Bash(jac check *),Bash(jac code *),Bash(jac test *),Bash(git diff *),Bash(git status *),Bash(git log *),Bash(git add *),Bash(git rm *),Bash(git commit *),mcp__jac__*" \
                 --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \
