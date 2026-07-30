@@ -82,6 +82,17 @@ esac
 case "$fmt_cmd$autofix_cmd" in
     *'jac lint --fix'*) fail "fmt/fmt_autofix regressed to 'jac lint --fix' (removed by CLI cleanup #7255)" ;;
 esac
+# The regex/tool/flag checks above would all still pass if [jobs.fmt] quietly lost its `--check`
+# flag -- the mirror's own VERIFY step would then silently start APPLYING formatting fixes
+# instead of just checking them (confirmed: a copy of this file with `--check` stripped passes
+# every check above). Pin both sides explicitly so the two guards don't depend on each other.
+case "$fmt_cmd" in
+    *'--check'*) : ;;
+    *) fail "[jobs.fmt] lost --check -- it must VERIFY formatting, not apply it" ;;
+esac
+case "$autofix_cmd" in
+    *'--check'*) fail "[jobs.fmt_autofix] gained --check -- it must APPLY formatting (tier-1's job), not just verify it" ;;
+esac
 echo "fmt and fmt_autofix share one exclusion regex ($fmt_regex), no jac format / jac lint --fix"
 
 echo "ALL HARNESS TESTS PASSED"

@@ -29,7 +29,7 @@ ci_job = "jac-check"
 # upstream CI logs (a cross-repo PR's `jac-check` job log literally prints `mode=scoped` and then
 # diffs only the PR's own changed .jac files). `jac format .` / `jac lint --fix` are NOT this
 # tool: they were removed by CLI cleanup #7255. The exclusion regex is copied verbatim from the
-# scoped branch (ci.yml:340); this branch does NOT have the whole-repo branch's extra
+# scoped branch (ci.yml:339); this branch does NOT have the whole-repo branch's extra
 # `_syntax_err\.jac$` alternative, but that alternative was already redundant there -- every
 # `_syntax_err.jac` filename also ends in `_err.jac`, so `_err\.jac$` alone matches it too. Preserves
 # CI's exact "no formattable files changed -> skip cleanly, exit 0" behavior (ci.yml:333-343),
@@ -37,8 +37,58 @@ ci_job = "jac-check"
 # empty $FILES here. See [jobs.fmt_autofix] just below: SAME tool/flags/exclusion-regex, only the
 # path SELECTION differs (diff-scoped here vs. tier-1's own jac/jaclang/byllm scope there) --
 # bin/test-harness.sh's drift guard asserts the two regexes stay byte-identical.
+#
+# CORRECTED AGAIN 2026-07-30 (code review): `BASE="$(git merge-base ...)" | ... || true` used to
+# wrap the WHOLE pipeline, INCLUDING the merge-base computation, in one `|| true`. That made a
+# broken merge-base (bad/unset $NS_REPO_DEFAULT_BRANCH, detached HEAD with no shared history,
+# etc.) collapse silently into an EMPTY $FILES -- indistinguishable from the legitimate "nothing
+# changed" skip. Reproduced: `NS_REPO_DEFAULT_BRANCH=nosuchbranch` or an unset
+# `NS_REPO_DEFAULT_BRANCH` both printed "No formattable .jac files changed; skipping format
+# check." and returned rc=0 -- a hard-broken gate reporting green. ci.yml itself cannot do this:
+# its own `BASE="$(git merge-base ...)"` (ci.yml:289) runs unguarded under `set -euo pipefail`, so
+# a real CI job just fails outright. Fixed by computing BASE as its own statement with an explicit
+# `|| { ...; exit 70; }` failure path -- `70` matches lib/common.sh's EX_BUG convention for "the
+# harness itself is broken", not "the branch under test is unformatted" -- and scoping `|| true`
+# to ONLY the `git diff | grep` pipeline that legitimately CAN be empty.
 commands = [
-  '''FILES="$(git diff --name-only --diff-filter=ACMR "$(git merge-base "$NS_REPO_DEFAULT_BRANCH" HEAD)" HEAD -- '*.jac' | grep -vE '(/fixtures/|^scripts/|/passes/native/llvm/|_err\.jac$)' || true)"; if [ -z "$FILES" ]; then echo "No formattable .jac files changed; skipping format check."; else printf '%s\n' "$FILES" | tr '\n' '\0' | xargs -0 --no-run-if-empty jac fmt --check --lintfix; fi''',
+  '''BASE="$(git merge-base "$NS_REPO_DEFAULT_BRANCH" HEAD 2>&1)" || { echo "ERROR: could not compute merge-base for jac fmt scoping: $BASE" >&2; exit 70; }; FILES="$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD -- '*.jac' | grep -vE '(/fixtures/|^scripts/|/passes/native/llvm/|_err\.jac$)' || true)"; if [ -z "$FILES" ]; then echo "No formattable .jac files changed; skipping format check."; else printf '%s\n' "$FILES" | tr '\n' '\0' | xargs -0 --no-run-if-empty jac fmt --check --lintfix; fi''',
+]
+
+[jobs.check]
+ci_job = "jac-check"
+# ci.yml:412-424, "Run jac check (using .jacignore)" -- has NO `continue-on-error`, unlike the fmt
+# step above (:71 `continue-on-error: true`), so a real CI run fails the job immediately on a
+# nonzero exit here; there is no separate "was it clean" gate to defer to. Task 4 originally
+# measured only the `else` whole-repo branch (ci.yml:423, `jac check . --ignore ... --nowarn`) and
+# recorded it RED and >1hr (see the now-superseded decision note that followed this file, deleted
+# below) -- but that is the PUSH-event branch, and Nightshift only ever opens PRs, so the branch
+# that actually gates it is the scoped one at ci.yml:421:
+# `jac check $(cat changed-jac.txt) --ignore $IGNORE_ARGS --nowarn`. Measured directly: ~0.45s for
+# one file, and RED on jac/jaclang/byllm/tool_protocol.jac specifically (3 errors, 45 warnings) --
+# one of the 9 files [jobs.fmt_autofix] will reformat on a normal autofix night. Without this
+# entry, tonight's fmt_autofix branch passes the mirror's fmt gate (formatting only) and then
+# fails real CI on a pre-existing type error the fmt pass never touched.
+#
+# NOT a literal transcription of ci.yml:421, though -- code review 2026-07-30 found that CI's own
+# form (`jac check $FILES --ignore $IGNORE_ARGS --nowarn`, IGNORE_ARGS = the 2 static globs plus
+# every non-comment .jacignore line, ~570 total) is SILENTLY BROKEN on this host: `jac check`'s
+# `--ignore` (argparse `nargs='*'`, following a required `nargs='+'` `paths`) reports a clean
+# "0 collected" (exit 0) the moment it receives roughly 100-150 values, regardless of real errors
+# in the files given -- reproduced with a bare `argparse.ArgumentParser` carrying the identical
+# shape, confirming it is a CPython 3.14.5 argparse limitation (this host's Python), not a bug in
+# jac's own CLI registration (jac/jaclang/cli/impl/registry.impl.jac is plain stdlib argparse).
+# Binary-searched: 100 ignore values still worked, 120-150 did not. .jacignore alone is ~570
+# lines, so ci.yml:421's literal form is a hard-broken false-green here -- the exact "gate reports
+# green when it cannot tell" failure mode this review round exists to close, one command further
+# in. Worked around by filtering the (always small, diff-scoped) candidate file list ourselves,
+# in Jac (scripts/cimirror.jac's filter_survivors, a port of
+# jaclang.jac0core.helpers.path_matches_exclude using Python's real fnmatch for semantic parity),
+# THEN calling `jac check <survivors> --nowarn` with NO --ignore at all -- sidestepping the
+# argparse limitation entirely rather than tripping over it more carefully.
+#
+# Same fail-loud merge-base handling as [jobs.fmt] above, for the identical reason.
+commands = [
+  '''BASE="$(git merge-base "$NS_REPO_DEFAULT_BRANCH" HEAD 2>&1)" || { echo "ERROR: could not compute merge-base for jac check scoping: $BASE" >&2; exit 70; }; FILES="$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD -- '*.jac')"; if [ -z "$FILES" ]; then echo "No .jac files changed; skipping jac check."; else SURVIVORS="$(printf '%s\n' "$FILES" | "$NS_PATHS_JAC" run "$NS_ROOT/scripts/cimirror.jac" filter-survivors .jacignore)"; if [ -z "$SURVIVORS" ]; then echo "All changed .jac files are ignore-listed; skipping jac check."; else printf '%s\n' "$SURVIVORS" | tr '\n' '\0' | xargs -0 --no-run-if-empty jac check --nowarn; fi; fi''',
 ]
 
 [jobs.fmt_autofix]
@@ -164,30 +214,18 @@ commands = [
   "git diff --name-only \"$NS_REPO_DEFAULT_BRANCH...HEAD\" | \"$NS_PATHS_JAC\" run \"$NS_ROOT/scripts/fragcheck.jac\" check",
 ]
 
-# Step 2b decision (whole-repo `jac check . --ignore ... --nowarn`, ci.yml:412-424):
-# NOT added as [jobs.check]. Ran CI's exact full-repo invocation against a clean `main` checkout
-# under work/repo/jac/zig-out/bin/jac on 2026-07-30:
-#
-#   IGNORE_ARGS="tests checker_*.jac *_err.jac $(grep -v '^#' .jacignore | grep -v '^[[:space:]]*$' | tr '\n' ' ')"
-#   jac check . --ignore $IGNORE_ARGS --nowarn
-#
-# Result: RED. 182 files already reported FAILED within the first ~12% of the traversal
-# (e.g. jac/jaclang/byllm/{cli,llm,mcp,mtir,parallel,schema,telemetry,tool_protocol,types,
-# visit_routing}.jac, jac/jaclang/cli/{ai_agent,banners,cli,console,help,registry}.jac,
-# jac/jaclang/compiler/passes/main/{type_checker_pass,mtir_gen_pass,pyast_load_pass}.impl.jac,
-# and more). The run was killed after this point rather than run to a natural exit: at the
-# observed rate a full traversal of the ~3000+ file corpus would take well over an hour, and it
-# cannot change the verdict -- `jac check`'s aggregate exit is nonzero the moment any file fails,
-# so the recorded exit code here is empirically certain to be nonzero even though the process
-# itself was terminated (SIGTERM) rather than left to report its own code.
-# lib/verify.sh's existing comment ("would trip the repo's broken test fixtures") no longer
-# describes the exact mechanism -- .jacignore already covers the old fixture problem -- but the
-# whole-repo check is independently red on main for a different, currently-unbaselined set of
-# files. Note also: several FAILED files above (e.g. jac/jaclang/byllm/cli.jac) are listed
-# verbatim in .jacignore yet still failed, meaning --ignore is not fully suppressing them the way
-# ci.yml's comment implies -- worth a closer look in a future task, but out of scope here since
-# it does not change the RED verdict. main's own CI run on this job is therefore not green
-# either, so per the brief's decision procedure this stays OUT of the mirror; Plan 3's CI
-# baseline-diff (checkgate.jac) remains the correct (cheaper, already-diff-aware) filter for this
-# job instead of a hard gate that would reject every branch on pre-existing breakage it never
-# touched.
+# Step 2b decision, CORRECTED 2026-07-30 (code review): the note that used to live here concluded
+# "NOT added as [jobs.check]" after measuring ONLY the whole-repo `else` branch of ci.yml:412-424
+# (`jac check . --ignore $IGNORE_ARGS --nowarn`, ci.yml:423) -- RED, 182 files failed within the
+# first ~12% of a traversal killed after taking well over an hour's projected runtime. That
+# measurement was real, but it measured the wrong branch: exactly like [jobs.fmt] above, this step
+# ALSO branches on `steps.changes.outputs.mode`, and Nightshift's PRs always take the scoped
+# branch (ci.yml:421: `jac check $(cat changed-jac.txt) --ignore $IGNORE_ARGS --nowarn`), never
+# the whole-repo one. The scoped branch is fast (~0.45s for one file, measured) and is what a real
+# PR is actually gated on -- so [jobs.check] above IS now part of the mirror. The whole-repo
+# variant's RED verdict is real but no longer relevant to this decision: it was never the thing
+# gating a Nightshift PR to begin with. (Aside from the earlier note also observed, and still
+# true: several FAILED files there, e.g. jac/jaclang/byllm/cli.jac, are listed verbatim in
+# .jacignore yet still failed under `jac check .`, meaning whole-repo `--ignore` does not fully
+# suppress them the way ci.yml's comment implies -- worth a closer look some day, but irrelevant
+# to [jobs.check]'s scoped invocation, which does not exercise that path.)

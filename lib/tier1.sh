@@ -17,10 +17,23 @@ tier1_main() {
     # suite into every autofix night via gated_pkgs_from_diff, and rewrite files with known
     # pre-existing .jacignore type-check gaps -- exactly what this scope restriction avoids.
     # `jac format .` / `jac lint --fix` are NOT this tool: removed by CLI cleanup #7255. A fork PR
-    # gets no autofix rescue from CI itself (ci.yml:303 is same-repo only), so anything left
-    # unformatted in scope becomes a hard CI failure at ci.yml:342.
-    ( cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
-        && eval "$(cimirror_fmt_autofix_cmd)" ) || true
+    # gets no autofix rescue from CI itself (the autofix-push step is ci.yml:363-367, same-repo
+    # PRs only), so anything left unformatted in scope becomes a hard CI failure at ci.yml:402-406.
+    #
+    # Assign-then-check-then-eval, not `eval "$(cimirror_fmt_autofix_cmd)"` directly: a renamed or
+    # missing [jobs.fmt_autofix] entry (or any reader failure) must not silently `eval ""` (a
+    # harmless no-op that would make tier-1 format nothing, forever, without a trace). `|| rc=$?`
+    # on the assignment itself, not a bare `x=$(...)` then `[ $? ... ]`: under this script's
+    # inherited `set -euo pipefail`, a bare failing assignment aborts the whole night immediately,
+    # before any check of it could run (verified while fixing the identical bug in cimirror_job).
+    local autofix_cmd autofix_rc=0
+    autofix_cmd="$(cimirror_fmt_autofix_cmd)" || autofix_rc=$?
+    if [ "$autofix_rc" -ne 0 ] || [ -z "$autofix_cmd" ]; then
+        ns_log S2 "WARNING: [jobs.fmt_autofix] resolved to no command (reader rc=$autofix_rc) -- formatted nothing this run; check config/ci-mirror.toml for a renamed/missing job"
+    else
+        ( cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
+            && eval "$autofix_cmd" ) || true
+    fi
 
     # Backstop even though the formatter is scoped now: protected paths must never ship edited (PRD 9).
     local protected
