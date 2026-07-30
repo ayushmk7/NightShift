@@ -138,3 +138,20 @@ day anyone adds `set -a`.
 6. **Plan 4 Tasks 3-7** — Task 4 re-derived (B1); Tasks 4-5 also fix B6 and B7.
 7. **Plan 5 Tasks 2-6, 9** — migration and cutover last, so the new tree receives finished code.
    Harden Task 5 Steps 1 and 3.
+
+## Plan 3 Task 1 result — measured 2026-07-30, no longer an open question
+
+Probe PR `jaseci-labs/jac#7802` opened from `ayushmk7:nightshift/probe-gh-2026-07-30` and closed
+within two minutes. Every premise Plan 3 rests on is confirmed:
+
+| Capability | Result |
+|---|---|
+| `gh pr create --draft` upstream, pull-only permission | works |
+| PR is genuinely a draft | `isDraft: true` |
+| CI fires on a **draft** PR | `build-jac`, `changes`, `jac-check` all pending within 25s |
+| Blacksmith jobs actually run upstream | yes — the fork's queue-forever problem is fork-specific |
+| `pre-commit.ci - pr` runs on a fork PR | pass |
+| `gh pr close` with pull-only permission | works — the discard/kill path is viable |
+
+So: **no fork-target fallback is needed** (Plan 3 Task 1 Step 9's three-line contingency is dead),
+and closing a PR is available to the `discard` path. Labelling remains unavailable, as Plan 3 found.
