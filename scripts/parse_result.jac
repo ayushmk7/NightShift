@@ -16,7 +16,9 @@ Malformed output → message on stderr, exit 50 (TPRD 18) so the caller skips th
 """
 import sys;
 import json;
-import from nslib { eprint, read_stdin, parse_obj, parse_list, as_dict, normalize_fragment_body }
+import from nslib {
+    eprint, read_stdin, parse_obj, parse_list, as_dict, normalize_fragment_body, score_of
+}
 
 """Return the body of the last ```json fenced block, or the whole text if none."""
 def extract_fenced_json(text: str) -> str {
@@ -49,28 +51,75 @@ def require(cond: bool, msg: str) {
     }
 }
 
+"""ONE union of rule strings across all four tasks, deliberately not a per-task table. The rule
+only feeds the fingerprint (nslib.fingerprint) and the digest; nothing branches on it except
+selector.jac's vestigial-test sweep, and that path independently verifies every file it touches
+(is_vestigial) rather than trusting the label. A per-task rule list would be config nothing reads."""
 def valid_rules() -> list[str] {
-    return ["dead-code", "duplication", "over-abstraction", "reinvented-stdlib", "unneeded-dep", "simplify"];
+    return ["dead-code", "duplication", "over-abstraction", "reinvented-stdlib", "unneeded-dep",
+            "simplify",                                             # dead-code / abstraction
+            "dep-drift", "todo", "doc-drift", "warning", "skipped-test",   # maintenance
+            "missing-test"];                                        # coverage
 }
 
-def validate_finding(f: dict) -> dict {
-    for key in ["file", "rule", "snippet", "summary", "est_loc_saved", "confidence", "risk", "theme_hint"] {
+glob COMPLEXITY_LEVELS: list[str] = ["trivial", "mechanical", "judgement"];
+
+"""Which keys a finding must carry, per [tasks.<task>].scoring (design spec 3.2).
+
+  loc_saved      the change REMOVES lines: est_loc_saved is both the score weight and what the
+                 theme budgets against loc_per_theme.
+  risk_weighted  the change ADDS lines: gap_severity is the weight, est_loc_added is what gets
+                 budgeted, and test_file is the path the agent intends to write -- without it a
+                 coverage theme has no legal write target at all.
+
+Returned as (required-keys, key-to-strip) so the surviving finding SELF-DESCRIBES its mode and
+nothing downstream has to be told which one it is."""
+def schema_for(mode: str) -> (list[str], str) {
+    if mode == "loc_saved" {
+        return (["est_loc_saved"], "gap_severity");
+    }
+    if mode == "risk_weighted" {
+        return (["gap_severity", "est_loc_added", "test_file"], "est_loc_saved");
+    }
+    raise ValueError("unknown scoring mode: " + mode);
+}
+
+def validate_finding(f: dict, task: str, mode: str) -> dict {
+    (extra, strip) = schema_for(mode);
+    for key in ["file", "rule", "snippet", "summary", "confidence", "risk", "theme_hint",
+                "complexity"] + extra {
         require(key in f, "finding missing key: " + key);
     }
     require(str(f["rule"]) in valid_rules(), "unknown rule: " + str(f["rule"]));
-    f["est_loc_saved"] = int(f["est_loc_saved"]);
+    for key in extra {
+        if key != "test_file" {
+            f[key] = int(f[key]);
+        }
+    }
+    if strip in f {
+        del f[strip];
+    }
     # clamp confidence/risk to [1..5] — the orchestrator, not the agent, is the authority (TPRD S3-B)
     f["confidence"] = max(1, min(5, int(f["confidence"])));
     f["risk"] = max(1, min(5, int(f["risk"])));
+    # An unrecognised complexity clamps to `judgement`, the EXPENSIVE model. Failing the other way
+    # would hand a hard refactor to the cheap model on the strength of a typo, and the one-way
+    # escalation in tier2_apply means a judgement theme never gets demoted anyway.
+    if str(f.get("complexity", "")) not in COMPLEXITY_LEVELS {
+        f["complexity"] = "judgement";
+    }
+    # The TASK is stamped by the harness, never taken from the agent: it decides which prompt, which
+    # budget, and (through the branch name) which write permissions the theme gets.
+    f["task"] = task;
     return f;
 }
 
-def validate_findings(raw: str) -> list[dict] {
+def validate_findings(raw: str, task: str, mode: str) -> list[dict] {
     items: list = parse_list(extract_fenced_json(raw));
     out: list[dict] = [];
     for item in items {
         if isinstance(item, dict) {
-            out.append(validate_finding(item));
+            out.append(validate_finding(item, task, mode));
         } else {
             raise ValueError("finding is not an object");
         }
@@ -142,7 +191,8 @@ with entry {
             if cmd == "meta" {
                 print(json.dumps(meta(envelope)));
             } elif cmd == "findings" {
-                print(json.dumps(validate_findings(envelope_result(envelope))));
+                require(len(args) == 4, "findings needs <task> <scoring>");
+                print(json.dumps(validate_findings(envelope_result(envelope), args[2], args[3])));
             } else {
                 print(json.dumps(validate_report(envelope_result(envelope))));
             }
@@ -159,19 +209,99 @@ with entry {
         }
         print(json.dumps(merge_findings(arrays)));
     } elif cmd != "" and cmd != "test" {
-        eprint("usage: claude -p ... --output-format json | jac run parse_result.jac findings|report|meta");
+        eprint("usage: claude -p ... --output-format json | jac run parse_result.jac findings <task> <scoring>");
+        eprint("       ... | jac run parse_result.jac report|meta");
         eprint("       ... | jac run parse_result.jac field <key> | fragment <key> | len");
         eprint("       jac run parse_result.jac merge <findings1.json> <findings2.json> ...");
     }
 }
 
 test "findings: fenced array validated and clamped" {
-    result: str = "prose before\n```json\n[{\"file\": \"a.jac\", \"rule\": \"dead-code\", \"snippet\": \"x\", \"summary\": \"s\", \"est_loc_saved\": 10, \"confidence\": 9, \"risk\": 0, \"theme_hint\": \"dead\"}]\n```";
+    result: str = "prose before\n```json\n[{\"file\": \"a.jac\", \"rule\": \"dead-code\", \"snippet\": \"x\", \"summary\": \"s\", \"est_loc_saved\": 10, \"confidence\": 9, \"risk\": 0, \"theme_hint\": \"dead\", \"complexity\": \"mechanical\"}]\n```";
     envelope: str = json.dumps({"result": result, "is_error": False});
-    found: list[dict] = validate_findings(envelope_result(parse_obj(envelope)));
+    found: list[dict] = validate_findings(envelope_result(parse_obj(envelope)), "dead-code", "loc_saved");
     assert len(found) == 1;
     assert found[0]["confidence"] == 5;
     assert found[0]["risk"] == 1;
+}
+
+test "loc_saved schema: est_loc_saved required, complexity clamped, task stamped" {
+    body: str = "```json\n[{\"file\": \"a.jac\", \"rule\": \"dead-code\", \"snippet\": \"x\", \"summary\": \"s\", \"est_loc_saved\": 10, \"confidence\": 4, \"risk\": 2, \"theme_hint\": \"dead\", \"complexity\": \"trivial\"}]\n```";
+    found: list[dict] = validate_findings(body, "dead-code", "loc_saved");
+    assert len(found) == 1;
+    assert found[0]["task"] == "dead-code";
+    assert found[0]["complexity"] == "trivial";
+    assert score_of(found[0]) == 20.0;
+}
+
+test "the TASK is stamped from argv, never taken from the finding the agent wrote" {
+    # The branch name -- and through it every write permission the S4 gate applies -- is built from
+    # this field. An audit that names its own task would be choosing its own permissions.
+    body: str = "```json\n[{\"file\": \"a.jac\", \"rule\": \"dead-code\", \"snippet\": \"x\", \"summary\": \"s\", \"task\": \"coverage\", \"est_loc_saved\": 10, \"confidence\": 4, \"risk\": 2, \"theme_hint\": \"d\", \"complexity\": \"trivial\"}]\n```";
+    assert validate_findings(body, "dead-code", "loc_saved")[0]["task"] == "dead-code";
+}
+
+test "an unrecognised complexity fails SAFE to judgement, not to the cheap model" {
+    body: str = "```json\n[{\"file\": \"a.jac\", \"rule\": \"simplify\", \"snippet\": \"x\", \"summary\": \"s\", \"est_loc_saved\": 4, \"confidence\": 3, \"risk\": 1, \"theme_hint\": \"t\", \"complexity\": \"easy-peasy\"}]\n```";
+    assert validate_findings(body, "abstraction", "loc_saved")[0]["complexity"] == "judgement";
+    # ...and a legitimate cheap value is NOT clamped: without this half, a validator that answered
+    # "judgement" unconditionally would satisfy the assertion above and route every night to Opus.
+    cheap: str = "```json\n[{\"file\": \"a.jac\", \"rule\": \"simplify\", \"snippet\": \"x\", \"summary\": \"s\", \"est_loc_saved\": 4, \"confidence\": 3, \"risk\": 1, \"theme_hint\": \"t\", \"complexity\": \"mechanical\"}]\n```";
+    assert validate_findings(cheap, "abstraction", "loc_saved")[0]["complexity"] == "mechanical";
+}
+
+test "risk_weighted schema: gap_severity + est_loc_added + test_file required" {
+    ok: str = "```json\n[{\"file\": \"jac/jaclang/cli/pipe.jac\", \"rule\": \"missing-test\", \"snippet\": \"x\", \"summary\": \"s\", \"gap_severity\": 40, \"est_loc_added\": 30, \"test_file\": \"jac/tests/cli/test_pipe.jac\", \"confidence\": 4, \"risk\": 2, \"theme_hint\": \"cli\", \"complexity\": \"mechanical\"}]\n```";
+    found: list[dict] = validate_findings(ok, "coverage", "risk_weighted");
+    assert found[0]["est_loc_added"] == 30;
+    assert score_of(found[0]) == 80.0;
+    # a coverage finding with no test_file has no legal path to write anything: reject it here
+    # rather than let the S4 scope gate discard the whole theme after a 25-minute apply session.
+    bad: str = "```json\n[{\"file\": \"a.jac\", \"rule\": \"missing-test\", \"snippet\": \"x\", \"summary\": \"s\", \"gap_severity\": 4, \"est_loc_added\": 3, \"confidence\": 4, \"risk\": 2, \"theme_hint\": \"t\", \"complexity\": \"trivial\"}]\n```";
+    raised: bool = False;
+    try {
+        validate_findings(bad, "coverage", "risk_weighted");
+    } except ValueError {
+        raised = True;
+    }
+    assert raised;
+}
+
+test "a loc_saved task's finding is rejected when it carries only the coverage weight" {
+    # The mirror of the case above, and the one that keeps schema_for from being a no-op: a
+    # dead-code audit that emitted gap_severity instead of est_loc_saved must not be accepted and
+    # then scored off a key its own task does not budget against.
+    body: str = "```json\n[{\"file\": \"a.jac\", \"rule\": \"dead-code\", \"snippet\": \"x\", \"summary\": \"s\", \"gap_severity\": 40, \"confidence\": 4, \"risk\": 2, \"theme_hint\": \"t\", \"complexity\": \"trivial\"}]\n```";
+    raised: bool = False;
+    try {
+        validate_findings(body, "dead-code", "loc_saved");
+    } except ValueError {
+        raised = True;
+    }
+    assert raised;
+}
+
+test "an unknown scoring mode raises rather than validating against nothing" {
+    raised: bool = False;
+    try {
+        schema_for("vibes");
+    } except ValueError {
+        raised = True;
+    }
+    assert raised;
+}
+
+test "the other mode's weight field is stripped, so score_of can never read the wrong one" {
+    # An audit that emits BOTH keys would otherwise be scored by whichever branch happens to win.
+    body: str = "```json\n[{\"file\": \"a.jac\", \"rule\": \"missing-test\", \"snippet\": \"x\", \"summary\": \"s\", \"gap_severity\": 40, \"est_loc_added\": 30, \"est_loc_saved\": 999, \"test_file\": \"jac/tests/t.jac\", \"confidence\": 1, \"risk\": 1, \"theme_hint\": \"t\", \"complexity\": \"trivial\"}]\n```";
+    f: dict = validate_findings(body, "coverage", "risk_weighted")[0];
+    assert "est_loc_saved" not in f;
+    assert score_of(f) == 40.0;
+    # ...and the same in the other direction, so "strip" cannot be hardcoded to one key.
+    body2: str = "```json\n[{\"file\": \"a.jac\", \"rule\": \"dead-code\", \"snippet\": \"x\", \"summary\": \"s\", \"gap_severity\": 999, \"est_loc_saved\": 40, \"confidence\": 1, \"risk\": 1, \"theme_hint\": \"t\", \"complexity\": \"trivial\"}]\n```";
+    g: dict = validate_findings(body2, "dead-code", "loc_saved")[0];
+    assert "gap_severity" not in g;
+    assert score_of(g) == 40.0;
 }
 
 test "report: missing key raises" {

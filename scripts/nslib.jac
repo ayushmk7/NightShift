@@ -81,10 +81,17 @@ def fingerprint(relpath: str, rule: str) -> str {
     return sha1((relpath + "\x1f" + rule).encode("utf-8")).hexdigest();
 }
 
-"""Selection score (TPRD S3-B step 3): expected LOC saved, weighted by the model's own
-confidence, discounted by its risk. Shared by selector (packing) and dataset (capture)."""
+"""Selection score (TPRD S3-B step 3, design spec 3.2): weight * confidence / risk. Shared by
+selector (packing) and dataset (capture).
+
+The WEIGHT is read off the finding itself rather than passed in, because the finding already says
+which mode it is: parse_result.validate_finding requires gap_severity for risk_weighted tasks and
+est_loc_saved for loc_saved ones, and DELETES the other. Passing a mode instead would mean
+plumbing it through selector, dataset, and every caller that only ever has one finding in hand --
+and a carry-over night legitimately holds findings of two different modes at once."""
 def score_of(f: dict) -> float {
-    return float(int(f["est_loc_saved"]) * int(f["confidence"])) / float(int(f["risk"]));
+    weight: int = int(f["gap_severity"]) if "gap_severity" in f else int(f["est_loc_saved"]);
+    return float(weight * int(f["confidence"])) / float(int(f["risk"]));
 }
 
 def today() -> str {
@@ -219,6 +226,17 @@ test "fingerprint is stable per (file, rule) and sensitive to both" {
     assert fingerprint("f.jac", "dup") == fingerprint("f.jac", "dup");
     assert fingerprint("f.jac", "dup") != fingerprint("g.jac", "dup");
     assert fingerprint("f.jac", "dup") != fingerprint("f.jac", "dead-code");
+}
+
+test "score_of reads gap_severity for coverage findings and est_loc_saved otherwise" {
+    shrink: dict = {"est_loc_saved": 30, "confidence": 4, "risk": 2};
+    grow: dict = {"gap_severity": 30, "est_loc_added": 90, "confidence": 4, "risk": 2};
+    assert score_of(shrink) == 60.0;
+    assert score_of(grow) == 60.0;
+    # est_loc_added is NOT the weight -- it is what the theme budgets. A score_of that reached for
+    # it would rank a coverage theme by how much test code it writes rather than by how much
+    # untested behaviour it protects.
+    assert score_of({"gap_severity": 10, "est_loc_added": 900, "confidence": 1, "risk": 1}) == 10.0;
 }
 
 test "protected globs with negation" {

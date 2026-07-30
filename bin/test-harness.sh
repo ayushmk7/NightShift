@@ -33,9 +33,18 @@ for f in bin/*.sh lib/*.sh; do bash -n "$f" || fail "bash -n $f"; done
 
 echo "== 3. golden-audit replay: selector must be deterministic =="
 T="$(mktemp -d)"
-jac run scripts/parse_result.jac findings < fixtures/golden-audit.json > "$T/f.json" \
+jac run scripts/parse_result.jac findings dead-code loc_saved < fixtures/golden-audit.json > "$T/f.json" \
     || fail "golden audit no longer parses"
 [ "$(jac run scripts/parse_result.jac len < "$T/f.json")" = "1" ] || fail "parse_result len miscounts golden findings"
+# Positive assertions that the per-task stamping actually HAPPENED. An unstamped finding does not
+# fail here today -- it blows up much later, in selector.jac's slugify, on a live night.
+grep -q '"task": *"dead-code"' "$T/f.json" || fail "parse_result no longer stamps the task onto findings"
+grep -q '"complexity"' "$T/f.json" || fail "parse_result no longer requires a complexity tag"
+# `findings` with no task/scoring must FAIL, not fall back to a default schema. A default would
+# silently gate every coverage night against the loc_saved shape and reject every finding.
+if jac run scripts/parse_result.jac findings < fixtures/golden-audit.json >/dev/null 2>&1; then
+    fail "parse_result findings accepted no task/scoring argv -- it must require both"
+fi
 jac run scripts/selector.jac select config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
     < "$T/f.json" > "$T/s1.json"
 jac run scripts/selector.jac select config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
