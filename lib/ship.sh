@@ -2,6 +2,13 @@
 # lib/ship.sh — S5 (TechnicalPRD 7-S5): push green branches, render drafts, update the ledger.
 
 ship_main() {
+    # Create prs.jsonl unconditionally, BEFORE the early return. The digest distinguishes "S5 ran and
+    # shipped nothing" from "S5 never ran" by the file's existence, and S1.6's pr-inventory.jsonl
+    # already works that way. Without this line an absent prs.jsonl means both, so a night that died
+    # before S5 renders exactly like a quiet one -- this project's "did not run scored as passed",
+    # arriving in the one channel nobody can cross-check. `>>` never truncates an existing file, so a
+    # same-night re-run keeps the rows it already wrote.
+    : >> "$LOG_DIR/prs.jsonl"
     [ -f "$LOG_DIR/green.tsv" ] || { ns_log S5 "nothing green to ship"; return 0; }
     local branch theme report
     while IFS=$'\t' read -r branch theme report; do
