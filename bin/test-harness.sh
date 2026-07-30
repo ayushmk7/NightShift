@@ -470,7 +470,92 @@ guard_raw "reader failure" 70 70 ""
 rm -rf .jac
 echo "did-not-run guards behave: collected-0 and session-mismatch are fatal, a healthy capture is not"
 
-# Sections 11-18 are RESERVED: docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2
+echo "== 11. task registry: every task has both prompts, and no placeholder is left unrendered =="
+rm -rf .jac
+tasks="$(jac run scripts/tasks.jac list config/nightshift.toml)" || fail "tasks.jac list failed"
+n_tasks="$(printf '%s\n' "$tasks" | grep -c .)"
+# An empty list would make every loop below pass vacuously -- the exact shape of assertion this
+# project keeps shipping. Pin the count first.
+case "$n_tasks" in
+    4) : ;;
+    *) fail "expected 4 tasks, tasks.jac list printed $n_tasks" ;;
+esac
+# The cycle order is a product decision (delete -> simplify -> fix drift -> test), so pin it here
+# too: scripts/tasks.jac's own test pins it from inside Jac, this pins what bash actually sees.
+case "$(printf '%s\n' "$tasks" | tr '\n' ' ')" in
+    "dead-code abstraction maintenance coverage ") : ;;
+    *) fail "cycle order changed: '$tasks'" ;;
+esac
+# No task name may be a prefix of another: lib/common.sh's ns_task_of_branch resolves the task from
+# the branch slug by prefix, and an ambiguous pair would silently hand a branch the wrong task --
+# and therefore the wrong write permissions.
+for a in $tasks; do
+    for b in $tasks; do
+        case "$a" in
+            "$b") : ;;
+            "$b"*) fail "task name '$b' is a prefix of '$a'; ns_task_of_branch could not tell them apart" ;;
+        esac
+    done
+done
+for t in $tasks; do
+    [ -f "prompts/audit-$t.md" ] || fail "no prompts/audit-$t.md for declared task '$t'"
+    [ -f "prompts/apply-rules-$t.md" ] || fail "no prompts/apply-rules-$t.md for declared task '$t'"
+    [ -s "prompts/apply-rules-$t.md" ] || fail "prompts/apply-rules-$t.md is empty"
+done
+# Render each prompt through the REAL render_prompt with the real substitution set and demand that
+# nothing {braced} survives. A prompt shipped with a live {placeholder} reaches the model verbatim.
+#
+# `|| true` on the grep is load-bearing in the OTHER direction from usual: the PASS case is "no
+# match", which grep reports as rc=1, and under set -e + pipefail that would abort the harness
+# before the case arm below could run. The count check underneath is what stops the `|| true` from
+# also swallowing a render_prompt that produced nothing at all.
+for t in $tasks; do
+    rendered="$( . "$NS_ROOT/lib/tier2.sh" >/dev/null 2>&1
+                 render_prompt "prompts/audit-$t.md" "shard=s" "scope=sc" "protect_globs=g" \
+                               "ponytail_mode=full" "coverage_evidence=e" )"
+    case "$rendered" in
+        "") fail "render_prompt produced nothing for prompts/audit-$t.md -- the placeholder check below would be vacuous" ;;
+    esac
+    left="$(printf '%s' "$rendered" | grep -o '{[a-z_]*}' | sort -u | tr '\n' ' ' || true)"
+    case "$left" in
+        "") : ;;
+        *) fail "prompts/audit-$t.md has unrendered placeholders: $left" ;;
+    esac
+    # ...and the substitution really happened, rather than the file never having had the
+    # placeholder. Every audit prompt names its shard and its scope.
+    case "$rendered" in
+        *"audit shard: \`s\`"*) : ;;
+        *) fail "prompts/audit-$t.md did not substitute {shard} -- it must carry the placeholder" ;;
+    esac
+done
+# apply.md, with a real theme object (NOT `{}`: the placeholder grep matches a bare `{}` and would
+# report the substituted value as an unrendered placeholder).
+rendered="$( . "$NS_ROOT/lib/tier2.sh" >/dev/null 2>&1
+             render_prompt prompts/apply.md 'theme={"slug":"t","files":[]}' "ponytail_mode=full" \
+                           "task_apply_rules=$(cat prompts/apply-rules-coverage.md)" )"
+case "$rendered" in
+    *"TASK: coverage"*) : ;;
+    *) fail "prompts/apply.md did not substitute {task_apply_rules} -- the per-task rules never reach the session" ;;
+esac
+left="$(printf '%s' "$rendered" | grep -o '{[a-z_]*}' | sort -u | tr '\n' ' ' || true)"
+case "$left" in
+    "") : ;;
+    *) fail "prompts/apply.md has unrendered placeholders: $left" ;;
+esac
+# The self-test the two loops above need to be worth anything: a prompt that DOES carry a live
+# placeholder must be detected. Without this, a render_prompt that silently stripped every brace
+# would make both loops pass.
+printf 'hello {not_substituted} world\n' > "$T/decoy.md"
+left="$( . "$NS_ROOT/lib/tier2.sh" >/dev/null 2>&1
+         render_prompt "$T/decoy.md" "shard=s" | grep -o '{[a-z_]*}' | sort -u | tr '\n' ' ' || true )"
+case "$left" in
+    "{not_substituted} ") : ;;
+    *) fail "the unrendered-placeholder detector did not fire on a prompt that has one (saw '$left'); sections 11's loops would pass vacuously" ;;
+esac
+rm -rf .jac
+echo "4 tasks, 8 prompt files, no unrendered placeholders"
+
+# Sections 12-18 are RESERVED: docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2
 # (task registry) and 15-18 to Plan 3 (ship path); all four v2 plans independently claimed "section
 # 11". Plan 4 owns 19-23. The gap is deliberate — renumbering later would silently reorder the
 # other two plans' tripwires into someone else's range.

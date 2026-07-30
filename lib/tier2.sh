@@ -13,6 +13,34 @@ render_prompt() {
     printf '%s' "$text"
 }
 
+# BRIDGE, Plan 2 Tasks 1-5. Task 9 replaces the whole of S3 (per-task audit + apply, carry-over,
+# model routing). This is the minimum that keeps the stage COHERENT with the task registry in the
+# meantime, and it is not optional: without it tier2_audit_shard renders a `prompts/audit.md` that
+# no longer exists and calls `parse_result findings` without the <task> <scoring> argv it now
+# requires, so every S3 would fail -- fail-closed, but total.
+#
+# `tasks next` ADVANCES the cycle as it reads (see scripts/tasks.jac): a night that dies later must
+# not make every following night repeat the same task. Resolved once here, before the fan-out, so
+# the backgrounded shards all inherit the same NS_TASK_* values.
+#
+# The `eval` is BARE on purpose -- no `export`, no `set -a`. These stay orchestrator-local shell
+# variables and are never inherited by a claude session. Same property ns_load_config relies on.
+tier2_resolve_task() {
+    local task rc=0 env_lines
+    task="$(ns_jac tasks next "$CONFIG" "$STATE")" || rc=$?
+    case "$rc$task" in
+        0?*) : ;;
+        *) ns_die "$EX_BUG" "could not resolve tonight's task from $CONFIG (rc=$rc, task='$task'). Refusing to guess: the task decides the audit prompt, the finding schema, and -- through the branch name -- the write permissions the S4 gate applies." ;;
+    esac
+    env_lines="$(ns_jac tasks env "$task" "$CONFIG")" || rc=$?
+    case "$rc$env_lines" in
+        0?*) : ;;
+        *) ns_die "$EX_BUG" "[tasks.$task] did not yield a usable NS_TASK_* env (rc=$rc)" ;;
+    esac
+    eval "$env_lines"
+    ns_log S3 "tonight's task: $NS_TASK_NAME (scoring=$NS_TASK_SCORING, ponytail=$NS_TASK_PONYTAIL, fragment='$NS_TASK_FRAGMENT')"
+}
+
 tier2_main() {
     local remaining; remaining="$(ns_remaining_min)"
     if [ "$remaining" -lt $(( NS_BUDGETS_AUDIT_TIMEOUT_MIN + NS_BUDGETS_APPLY_TIMEOUT_MIN )) ]; then
@@ -20,7 +48,8 @@ tier2_main() {
         return 0
     fi
 
-    tier2_audit_all || return 0        # no usable findings skips the tier; tier-1 still ships
+    tier2_resolve_task
+    tier2_audit_all || return 0        # no usable findings skips the tier
     tier2_select
     tier2_apply
     dataset_record_night               # after select+apply: selection.json + every meta-*.json exist
@@ -33,9 +62,13 @@ tier2_main() {
 tier2_audit_shard() {
     local shard=$1 prompt attempt scope
     scope="$(ns_jac shards scope "$shard" "$CONFIG")"
-    prompt="$(render_prompt "$NS_ROOT/prompts/audit.md" \
+    # {coverage_evidence} only appears in prompts/audit-coverage.md. scripts/covmap.jac (Plan 2
+    # Task 8) is what will fill it; until then the prompt says so explicitly rather than reaching
+    # the model as a live `{coverage_evidence}` placeholder.
+    prompt="$(render_prompt "$NS_ROOT/prompts/audit-$NS_TASK_NAME.md" \
         "shard=$shard" "scope=$scope" \
-        "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=full")"
+        "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_TASK_PONYTAIL" \
+        "coverage_evidence=(No static coverage evidence is available yet. Derive the gaps yourself from the source and the tests that already exist.)")"
 
     # empty NS_AGENT_MODEL (config: [agent].model) means "account default" -- that's the exact
     # silent-drift footgun the config comment warns about, so the default ships pinned to "sonnet";
@@ -67,7 +100,7 @@ tier2_audit_shard() {
 
         ns_jac parse_result meta < "$LOG_DIR/audit-$shard.json" > "$LOG_DIR/meta-audit-$shard.json" || true
 
-        if ns_jac parse_result findings < "$LOG_DIR/audit-$shard.json" \
+        if ns_jac parse_result findings "$NS_TASK_NAME" "$NS_TASK_SCORING" < "$LOG_DIR/audit-$shard.json" \
                 > "$LOG_DIR/findings-$shard.json" 2> "$LOG_DIR/parse-err-audit-$shard.txt"; then
             ns_log S3 "audit[$shard]: $(ns_jac parse_result len < "$LOG_DIR/findings-$shard.json" || echo 0) findings"
             return 0
@@ -89,7 +122,7 @@ $(ns_jac parse_result field result < "$LOG_DIR/audit-$shard.json")
 Re-emit ONLY the corrected \`\`\`json fenced findings array — same schema, no prose." \
             ${model_args[@]+"${model_args[@]}"} --max-turns 1 --output-format json \
             > "$LOG_DIR/audit-repair-$shard.json" < /dev/null || true
-        if ns_jac parse_result findings < "$LOG_DIR/audit-repair-$shard.json" > "$LOG_DIR/findings-$shard.json"; then
+        if ns_jac parse_result findings "$NS_TASK_NAME" "$NS_TASK_SCORING" < "$LOG_DIR/audit-repair-$shard.json" > "$LOG_DIR/findings-$shard.json"; then
             ns_log S3 "audit[$shard] salvaged via corrective re-prompt — $(ns_jac parse_result len < "$LOG_DIR/findings-$shard.json" || echo 0) findings"
             return 0
         fi
@@ -206,7 +239,7 @@ tier2_select() {
 
 # Phase C — apply: fresh branch + fresh headless session per theme
 tier2_apply() {
-    local slug branch theme_file prompt remaining attempt got_report limit_hit
+    local slug branch theme_file prompt remaining attempt got_report limit_hit theme_task
     local -a model_args=()
     [ -n "$NS_AGENT_MODEL" ] && model_args=(--model "$NS_AGENT_MODEL")
     ns_jac selector split "$LOG_DIR/selection.json" "$LOG_DIR" | while IFS= read -r slug; do
@@ -219,8 +252,20 @@ tier2_apply() {
             continue
         fi
 
+        # The theme's OWN task, not tonight's: a carry-over night packs themes from an earlier
+        # task alongside tonight's, and each needs its own rules block. The value is
+        # harness-written (parse_result stamps it from argv, never from the finding), so reading
+        # it back here is not trusting the agent. The security-critical read -- which write
+        # permissions the S4 gate applies -- comes from the BRANCH NAME instead (Task 6).
+        theme_task="$(ns_jac parse_result field task < "$theme_file")"
+        case "$theme_task" in
+            "") ns_die "$EX_BUG" "theme $slug carries no task; refusing to pick an apply-rules block for it" ;;
+        esac
+        [ -f "$NS_ROOT/prompts/apply-rules-$theme_task.md" ] \
+            || ns_die "$EX_BUG" "no prompts/apply-rules-$theme_task.md for theme $slug"
         prompt="$(render_prompt "$NS_ROOT/prompts/apply.md" \
-            "theme=$(cat "$theme_file")" "ponytail_mode=full")"
+            "theme=$(cat "$theme_file")" "ponytail_mode=$NS_TASK_PONYTAIL" \
+            "task_apply_rules=$(cat "$NS_ROOT/prompts/apply-rules-$theme_task.md")")"
 
         # Up to 2 attempts, each on a FRESH branch: a transient API error mid-session (same class
         # tier2_audit already retries) shouldn't burn the whole theme for the night.
