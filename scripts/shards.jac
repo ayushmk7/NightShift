@@ -15,10 +15,18 @@ def shard_names(cfg: dict) -> list[str] {
     return [str(n) for n in as_list(shards["names"])];
 }
 
-def shard_scope(cfg: dict, name: str) -> str {
+"""One shard's declared paths. Extracted so covmap.jac and the audit prompt cannot disagree about
+a shard's extent -- the evidence a coverage audit is handed must cover exactly the tree it is being
+asked to audit, or it reads as "nothing untested here" for files nobody looked at."""
+def shard_paths(cfg: dict, name: str) -> list[str] {
     shards: dict = as_dict(cfg["shards"]);
     paths_table: dict = as_dict(shards["paths"]);
-    paths: list[str] = [str(p) for p in as_list(paths_table[name])];
+    return [str(p) for p in as_list(paths_table[name])];
+}
+
+def shard_scope(cfg: dict, name: str) -> str {
+    shards: dict = as_dict(cfg["shards"]);
+    paths: list[str] = shard_paths(cfg, name);
     excl_table: dict = as_dict(shards.get("exclude", {}));
     excl: list[str] = [str(p) for p in as_list(excl_table.get(name, []))];
     scope: str = ", ".join(paths);
@@ -28,7 +36,11 @@ def shard_scope(cfg: dict, name: str) -> str {
     return scope;
 }
 
-with entry {
+# `entry:__main__`, not a bare `entry`: scripts/covmap.jac now imports shard_paths from here, and a
+# bare entry block runs on IMPORT too -- so every `covmap rank|top` invocation printed this file's
+# usage text to stderr while parsing covmap's own argv. Harmless today; not harmless the day this
+# arm gains a sys.exit(2), which tasks.jac's and check_scope.jac's already have.
+with entry:__main__ {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "list" and len(args) == 3 {
@@ -52,6 +64,22 @@ test "every declared shard name has paths, and none is empty" {
         assert n in paths_table;
         assert len(as_list(paths_table[n])) >= 1;
     }
+}
+
+test "shard_paths returns the declared paths, and an undeclared shard raises" {
+    # covmap.jac filters its evidence with this; a shard_paths that quietly returned [] for an
+    # unknown name would hand the coverage audit an EMPTY evidence block, which reads to the model
+    # exactly like "everything in this shard is tested".
+    cfg: dict = load_config_toml("config/nightshift.toml");
+    assert shard_paths(cfg, "scale") == ["jac/jaclang/scale"];
+    assert len(shard_paths(cfg, "periphery")) == 5;
+    raised: bool = False;
+    try {
+        shard_paths(cfg, "not-a-shard");
+    } except KeyError {
+        raised = True;
+    }
+    assert raised;
 }
 
 test "scope renders paths and appends exclusions only when present" {
