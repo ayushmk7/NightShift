@@ -21,6 +21,8 @@ promote_main() {
     draft="$(find_draft "$branch")" || ns_die "$EX_BUG" "no draft found for $branch"
     title="$(ns_jac render_draft meta "$draft" | ns_jac parse_result field title)"
     pkg="$(ns_jac render_draft meta "$draft" | ns_jac parse_result field package)"
+    [ -n "$pkg" ] || pkg="repo"     # drafts for sharded nights carry no package; only used in the
+                                    # docs($pkg) fragment-commit subject below
 
     # 1. re-sync + rebase + re-gate: upstream may have moved overnight (PRD 7 stage 7)
     sync_main

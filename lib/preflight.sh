@@ -2,8 +2,10 @@
 # lib/preflight.sh — S0 (TechnicalPRD 7-S0). Any failure emails and aborts the night.
 
 claude_pong() {
+    # </dev/null like every other claude invocation: nothing feeds this one a list today, but it is
+    # the last session that would inherit the caller's stdin if one ever did.
     (unset ANTHROPIC_API_KEY; ns_timebox 3 "$NS_PATHS_CLAUDE" -p "reply with exactly: pong" \
-        --max-turns 1 --output-format json 2>/dev/null) \
+        --max-turns 1 --output-format json 2>/dev/null < /dev/null) \
         | grep -q '"result"[[:space:]]*:[[:space:]]*"pong"'
 }
 

@@ -51,8 +51,13 @@ dataset_backfill() {
         case "$date_only" in *.*) continue ;; esac
 
         if [ -f "$d/findings.json" ]; then
+            # Nights from the rotation era logged their package; sharded nights do not log one at
+            # all. The fallback MUST match dataset_record_night's "repo" -- record_audit's
+            # idempotency key is exactly (date, package), so "unknown" here would make a backfill
+            # append a duplicate nights row and a duplicate audit_findings set for every night the
+            # live path already recorded.
             pkg="$(grep -m1 "tonight's package:" "$d/run.log" 2>/dev/null | sed 's/.*tonight.s package: //')"
-            [ -n "$pkg" ] || pkg="unknown"
+            [ -n "$pkg" ] || pkg="repo"
             ns_jac dataset record-audit "$d" "$DATASET_DIR" "$date_only" "$pkg" >/dev/null
             ns_log DATASET "backfilled audit findings for $date_only"
         fi

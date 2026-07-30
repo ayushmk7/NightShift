@@ -88,6 +88,20 @@ def render(d: dict) -> str {
     return "\n".join(frontmatter_lines(d) + [""] + body_lines(d)) + "\n";
 }
 
+"""What `frag <report.json>` prints: the fragment path implied by the files the agent actually
+edited (the report's `files`, not the theme's -- the theme lists what was planned).
+
+LATENT COUPLING: the kind is hardcoded "refactor" here, while the S4 scope gate
+(check_scope.jac:23) honors `theme.get("fragment_kind", "refactor")`. Identical today because
+nothing emits `fragment_kind`. The day a theme carries e.g. "bugfix", the gate will allow
+0000.bugfix.md while this writes 0000.refactor.md -- both sites must change together."""
+def frag_for_report(report_path: str) -> str {
+    with open(report_path, "r") as f {
+        rep: dict = parse_obj(f.read());
+    }
+    return fragment_path([str(p) for p in as_list(rep["files"])], "refactor");
+}
+
 """Inverse of render: (frontmatter dict, body string)."""
 def split_draft(text: str) -> (dict, str) {
     parts: list[str] = text.split("---\n");
@@ -136,10 +150,7 @@ with entry:__main__ {   # only dispatch the CLI on direct `jac run`; sendmail.ja
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "frag" and len(args) == 3 {
-        with open(args[2], "r") as f {
-            rep: dict = parse_obj(f.read());
-        }
-        print(fragment_path([str(p) for p in as_list(rep["files"])], "refactor"));
+        print(frag_for_report(args[2]));
     } elif cmd == "git-report" and len(args) == 4 {
         print(json.dumps(git_report(args[2], args[3])));
     } elif cmd == "render" and len(args) >= 3 {
@@ -193,13 +204,24 @@ test "render then split roundtrips the frontmatter" {
 }
 
 test "frag returns a jaclang path for core changes and empty for jac-mcp only" {
-    # what `frag <report.json>` computes: the fragment path is a pure function of the report's
-    # files, with kind pinned to "refactor" until per-task fragment kinds exist.
-    core: dict = {"files": ["jac/jaclang/cli/a.jac"], "fragment_kind": "refactor"};
-    assert fragment_path([str(f) for f in as_list(core["files"])], str(core["fragment_kind"]))
-        == "release_notes/unreleased/jaclang/0000.refactor.md";
-    mcp: dict = {"files": ["jac-mcp/server.jac"]};
-    assert fragment_path([str(f) for f in as_list(mcp["files"])], "refactor") == "";
+    # Exercises what the VERB computes off a real report file, not nslib.fragment_path directly
+    # (already covered in nslib.jac): pointing frag at the wrong key turns this red.
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    core_path: str = d + "/report-core.json";
+    mcp_path: str = d + "/report-mcp.json";
+    with open(core_path, "w") as f {
+        f.write(json.dumps({"summary": "s", "files": ["jac/jaclang/cli/a.jac"],
+                            "loc_before": 10, "loc_after": 2, "risk": "low",
+                            "release_note_md": "note"}));
+    }
+    with open(mcp_path, "w") as f {
+        f.write(json.dumps({"summary": "s", "files": ["jac-mcp/server.jac"],
+                            "loc_before": 10, "loc_after": 2, "risk": "low",
+                            "release_note_md": "note"}));
+    }
+    assert frag_for_report(core_path) == "release_notes/unreleased/jaclang/0000.refactor.md";
+    assert frag_for_report(mcp_path) == "";
 }
 
 test "render leaves release_note empty when no file touches jac/jaclang/" {

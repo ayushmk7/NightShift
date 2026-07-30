@@ -81,8 +81,16 @@ ns_timebox() {
 # Block until fewer than <max> of THIS shell's background jobs are still running.
 # bash 3.2 (macOS stock, confirmed 3.2.57) has no `wait -n`, so poll instead of blocking on one job.
 # ponytail: 5s poll, not a job-control state machine. Audit sessions run for minutes.
+# LOAD-BEARING DEPENDENCY: this counts *every* running job of the calling shell, so the `disown`s on
+# the caffeinate and watchdog children (bin/nightshift.sh:60,66) are what keep them out of the count.
+# Drop either disown and the two long-lived children occupy the budget forever -- ns_jobs_wait 2 then
+# blocks until the watchdog kills the night, and no audit shard ever starts.
+# max<1 (or a non-numeric [shards].concurrency) would make `-ge` always true and spin here until
+# that same watchdog fires, so clamp to 1. `case`, not `[ -lt ] &&`, because a false `&&` list is
+# itself a nonzero return that would abort any caller running with errexit active.
 ns_jobs_wait() {
     local max=$1
+    case "$max" in ''|0|*[!0-9]*) max=1 ;; esac
     while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$max" ]; do
         sleep 5
     done

@@ -23,7 +23,12 @@ ship_branch() {
 
     slug="$(basename "$branch")"
     if [ "$theme" != "-" ]; then
+        # Themes carry no `package` key since the audit went whole-repo/sharded, so this is normally
+        # empty now. Fall back to the same "repo" the tier-1 branch below uses: pkg reaches the draft
+        # title AND dataset_record_refactor's row, where "" would sit inconsistently next to
+        # nights.jsonl's "repo" and historical rows' real package names.
         pkg="$(ns_jac parse_result field package < "$theme")"
+        [ -n "$pkg" ] || pkg="repo"
     else
         pkg="repo"          # tier-1 autofix touches whichever packages drifted
     fi

@@ -52,7 +52,7 @@ tier2_audit_shard() {
         # dev jac first on PATH so the agent's Bash(jac *) and the jac MCP server hit the repo binary.
         (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
             && ns_timebox "$NS_BUDGETS_AUDIT_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
-            "${model_args[@]}" \
+            ${model_args[@]+"${model_args[@]}"} \
             --permission-mode dontAsk \
             --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
             --max-turns "$NS_BUDGETS_AUDIT_MAX_TURNS" --output-format json) \
@@ -87,7 +87,7 @@ tier2_audit_shard() {
 Previous output:
 $(ns_jac parse_result field result < "$LOG_DIR/audit-$shard.json")
 Re-emit ONLY the corrected \`\`\`json fenced findings array — same schema, no prose." \
-            "${model_args[@]}" --max-turns 1 --output-format json \
+            ${model_args[@]+"${model_args[@]}"} --max-turns 1 --output-format json \
             > "$LOG_DIR/audit-repair-$shard.json" < /dev/null || true
         if ns_jac parse_result findings < "$LOG_DIR/audit-repair-$shard.json" > "$LOG_DIR/findings-$shard.json"; then
             ns_log S3 "audit[$shard] salvaged via corrective re-prompt — $(ns_jac parse_result len < "$LOG_DIR/findings-$shard.json" || echo 0) findings"
@@ -104,14 +104,19 @@ Re-emit ONLY the corrected \`\`\`json fenced findings array — same schema, no 
 # A session limit collapses the fan-out to serial rather than aborting the tier: the old
 # behavior lost every remaining shard to one limit signal.
 tier2_audit_all() {
-    local shard conc merged=0
+    local shard conc merged
     conc="${NS_SHARDS_CONCURRENCY:-2}"
     rm -f "$LOG_DIR/.session-limit"
 
     # `for` over command substitution, NOT a pipe: a piped `while` loop would run in a subshell
     # whose `jobs -rp` cannot see the sessions, and ns_jobs_wait would never throttle anything.
+    # Concurrent shards each fork their own `ns_jac` calls, which SHARE one .jac/data/anchor_store.db;
+    # jac can print "database is locked" on stderr under that contention (exit status and stdout stay
+    # correct). That stderr lands in parse-err-audit-$shard.txt, which the corrective re-prompt below
+    # pastes verbatim — so a lock warning can show up inside a re-prompt. Cosmetic, not a failure.
     for shard in $(ns_jac shards list "$CONFIG"); do
-        if [ -f "$LOG_DIR/.session-limit" ]; then
+        # log the collapse ONCE, not once per remaining shard
+        if [ -f "$LOG_DIR/.session-limit" ] && [ "$conc" != 1 ]; then
             ns_log S3 "session limit seen — dropping to serial for the remaining shards"
             conc=1
         fi
@@ -127,7 +132,9 @@ tier2_audit_all() {
     # Collect the shards that produced findings. NOT a bash array: under `set -u` (which
     # bin/nightshift.sh sets) bash 3.2 aborts on ${#arr[@]} and "${arr[@]}" when the array is
     # EMPTY -- and "every shard failed" is exactly the case this branch has to survive.
-    # ponytail: a space-joined string is fine; these are repo-relative log paths with no spaces.
+    # ponytail: a space-joined string is fine because $NS_ROOT (and so $LOG_DIR) contains no space --
+    # a property of the install path, not of the shard names. If the harness is ever installed under a
+    # path with a space, the word-split below hands `merge` broken paths and the guard on it fires.
     local found="" n_found=0
     for shard in $(ns_jac shards list "$CONFIG"); do
         if [ -s "$LOG_DIR/findings-$shard.json" ]; then
@@ -139,8 +146,15 @@ tier2_audit_all() {
         ns_fail "audit" "every shard failed or produced nothing — agentic tier skipped tonight"
         return 1
     fi
+    # Guarded: the redirect has already TRUNCATED findings.json by the time merge can fail, and an
+    # unguarded failure here would leave 0 bytes, fail tier2_select, and abort the whole night under
+    # errexit -- taking S4/S5 and tier-1's already-queued branches with it. Skip the tier instead.
     # shellcheck disable=SC2086  # deliberate word-split into one arg per shard findings file
-    ns_jac parse_result merge $found > "$LOG_DIR/findings.json"
+    if ! ns_jac parse_result merge $found > "$LOG_DIR/findings.json"; then
+        ns_fail "audit" "merge of $n_found shard findings failed — agentic tier skipped tonight"
+        rm -f "$LOG_DIR/findings.json"
+        return 1
+    fi
     merged="$(ns_jac parse_result len < "$LOG_DIR/findings.json" || echo 0)"
     ns_log S3 "merged $n_found/$(ns_jac shards count "$CONFIG") shards into $merged findings"
     return 0
@@ -197,7 +211,7 @@ tier2_apply() {
             # (observed live: 6 themes selected, 1 attempted, 5 silently never ran).
             (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
                 && ns_timebox "$NS_BUDGETS_APPLY_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
-                "${model_args[@]}" \
+                ${model_args[@]+"${model_args[@]}"} \
                 --permission-mode acceptEdits \
                 --allowedTools "Read,Edit,Grep,Glob,Bash(jac fmt *),Bash(jac check *),Bash(jac code *),Bash(jac test *),Bash(git diff *),Bash(git status *),Bash(git log *),Bash(git add *),Bash(git rm *),Bash(git commit *),mcp__jac__*" \
                 --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \
