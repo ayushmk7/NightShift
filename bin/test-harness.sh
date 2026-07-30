@@ -1614,6 +1614,9 @@ grep -q 'jac/jaclang/cli/a.jac' "$P/reactive-files.txt" \
 # .github/**, README.md and release_notes/**.
 grep -q 'README.md' "$P/reactive-files.txt" \
     && fail "reactive_poll's scope includes paths no shard covers; four sessions would be spent on files no lens can act on"
+# ...and the digest's "which PRs merged" list, which is the only place that fact appears at all.
+grep -q '^1\tt\ta\t2$' "$P/reactive-prs.tsv" \
+    || fail "reactive_poll wrote no usable reactive-prs.tsv: $(cat "$P/reactive-prs.tsv" 2>/dev/null) -- the digest would report merge counts with no PR behind them"
 # The stage entry point must NOT propagate a failed poll: ns_stage runs it as a plain command under
 # errexit, so a nonzero would abort the night at S1.5 and cost S1.6, S3, S4 and S5 as well.
 printf '#!/usr/bin/env bash\nexit 4\n' > "$P/gh"; chmod +x "$P/gh"; echo '{}' > "$P/state.json"

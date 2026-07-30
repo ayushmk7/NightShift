@@ -134,6 +134,13 @@ def plain_body(summary: dict) -> str {
     for (lens, n) in as_dict(react2.get("lenses", {})).items() {
         lines.append("  " + str(lens) + ": " + str(n));
     }
+    for row in as_list(react2.get("merged_prs", [])) {
+        cols: list = as_list(row);
+        if len(cols) >= 4 {
+            lines.append("  merged #" + str(cols[0]) + " " + str(cols[1]) + " (" + str(cols[2])
+                         + ", " + str(cols[3]) + " file(s))");
+        }
+    }
     lines.append("");
     lines.append("PULL REQUESTS " + empty_note(summary, "prs", "prs.jsonl"));
     for pr in as_list(summary.get("prs", [])) {
@@ -224,6 +231,14 @@ def html_body(summary: dict) -> str {
     out.append("<h3>Reactive pass — " + esc(react.get("files", 0)) + " merged file(s)</h3><ul>");
     for (lens, n) in as_dict(react.get("lenses", {})).items() {
         out.append("<li>" + esc(lens) + ": " + esc(n) + "</li>");
+    }
+    out.append("</ul><p>merged upstream tonight:</p><ul>");
+    for row2 in as_list(react.get("merged_prs", [])) {
+        cols2: list = as_list(row2);
+        if len(cols2) >= 4 {
+            out.append("<li>#" + esc(cols2[0]) + " " + esc(cols2[1]) + " — " + esc(cols2[2])
+                       + ", " + esc(cols2[3]) + " file(s)</li>");
+        }
     }
     out.append("</ul>");
 
@@ -648,6 +663,10 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
         "reactive": {
             "files": len(read_lines(os.path.join(log_dir, "reactive-files.txt"))),
             "lenses": lenses,
+            # number<TAB>title<TAB>author<TAB>nfiles, straight from `merges prs` (lib/reactive.sh).
+            # WHICH PRs merged is the fact the reactive section is otherwise missing, and it costs
+            # one already-existing reader.
+            "merged_prs": read_tsv(os.path.join(log_dir, "reactive-prs.tsv")),
         },
         "prs": read_jsonl(os.path.join(log_dir, "prs.jsonl")),
         "inventory": read_jsonl(os.path.join(log_dir, "pr-inventory.jsonl")),
@@ -1064,4 +1083,29 @@ test "build_message is multipart/alternative, text first then html" {
     assert parts[0].get_content_type() == "text/plain";
     assert parts[1].get_content_type() == "text/html";
     assert msg["From"] == "probe@example.com";
+}
+
+test "the reactive section names WHICH PRs merged, escaped" {
+    # `merges prs` output is upstream-authored: PR titles come from other people's branches and go
+    # straight into an HTML document. A malformed row (fewer than four columns) is dropped rather
+    # than rendered half-way.
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    with open(os.path.join(d, "reactive-prs.tsv"), "w") as f {
+        f.write("7805\tci: fix the <b>glibc</b> floor\tmarsninja\t1\n");
+        f.write("7806\ttruncated row\n");
+    }
+    with open(os.path.join(d, "reactive-files.txt"), "w") as f {
+        f.write("jac/jaclang/cli/a.jac\n");
+    }
+    cfg: dict = {"repo": {"fork": "me/jaseci"}, "budgets": {"wallclock_min": 480}};
+    s: dict = summarize(d, tempfile.mkdtemp(), "2026-07-30", cfg);
+    rows: list = as_list(as_dict(s["reactive"])["merged_prs"]);
+    assert len(rows) == 2;
+    doc: str = html_body(s);
+    assert "#7805" in doc;
+    assert "marsninja" in doc;
+    assert "<b>glibc</b>" not in doc and "&lt;b&gt;glibc&lt;/b&gt;" in doc;
+    assert "7806" not in doc;                 # the truncated row is dropped, not half-rendered
+    assert "#7805" in plain_body(s);
 }

@@ -66,6 +66,17 @@ reactive_poll() {
         return 1
     fi
     mv "$LOG_DIR/reactive-files.txt.tmp" "$LOG_DIR/reactive-files.txt"
+
+    # WHICH PRs merged, for the digest. Never fatal and never a reason to skip the pass: losing the
+    # report must not also lose the cleanup. Same temp-file discipline, for the same reason.
+    rc=0
+    ns_jac merges prs "$LOG_DIR/merges.json" > "$LOG_DIR/reactive-prs.tsv.tmp" || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        mv "$LOG_DIR/reactive-prs.tsv.tmp" "$LOG_DIR/reactive-prs.tsv"
+    else
+        rm -f "$LOG_DIR/reactive-prs.tsv.tmp"
+        ns_warn "could not list the merged PRs for the digest (rc=$rc) — the reactive section will show counts only"
+    fi
     # The count logged is the AUDITABLE one (merges.jac files filters the union to [shards.paths]),
     # not the raw churn -- the raw churn is in merges.json for anyone who wants it, and the number
     # that decides whether a session is spent is this one.
