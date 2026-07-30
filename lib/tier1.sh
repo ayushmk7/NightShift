@@ -13,9 +13,11 @@ tier1_main() {
     # diff-scoped CHECK command; there's nothing to diff against yet). Same tool, flags (minus
     # --check), and exclusion regex as [jobs.fmt] -- kept byte-identical by
     # bin/test-harness.sh's drift guard -- scoped to jac/jaclang/byllm rather than the whole repo:
-    # a repo-wide `--lintfix` would touch ~260 files nightly, drag the ~95min "jac" core test
-    # suite into every autofix night via gated_pkgs_from_diff, and rewrite files with known
-    # pre-existing .jacignore type-check gaps -- exactly what this scope restriction avoids.
+    # a repo-wide `--lintfix` would touch ~260 files nightly, drag the huge core test suites into
+    # every autofix night via gated_suites_from_diff (Task 6 renamed it from gated_pkgs_from_diff;
+    # a repo-wide diff now routes to BOTH `runtime` (1852 tests) and `compiler` (2792), where this
+    # jac/jaclang/byllm scoping routes only to the small `byllm` suite), and rewrite files with
+    # known pre-existing .jacignore type-check gaps -- exactly what this scope restriction avoids.
     # `jac format .` / `jac lint --fix` are NOT this tool: removed by CLI cleanup #7255. A fork PR
     # gets no autofix rescue from CI itself (the autofix-push step is ci.yml:363-367, same-repo
     # PRs only), so anything left unformatted in scope becomes a hard CI failure at ci.yml:402-406.

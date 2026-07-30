@@ -8,9 +8,18 @@ Failing test ids are parsed from the bundled pytest runner's output: lines begin
 `FAILED ` or `ERROR ` (collection errors count as failures). A branch is red only if it fails a
 test that passes on main.
 
+`<pkg>` is really a MIRROR SUITE NAME since Task 6 (`compiler`, `runtime`, `byllm` -- the
+config/ci-mirror.toml job names lib/verify.sh's gated_suites_from_diff emits). The argv label and
+the JSON's "package" key keep the old spelling so already-recorded baselines stay readable.
+
 argv:
   parse  <raw.txt>                        print sorted unique failing test ids
   record <pkg> <raw.txt> <baseline_dir>   write baseline_dir/<pkg>.json from a main-branch run
+  record-union <pkg> <raw1.txt> <raw2.txt> <baseline_dir>
+                                          same, but baseline the UNION of two main-branch runs so
+                                          a test that flakes in either run stops reding branches
+  sessions <raw.txt>                      print how many runner sessions the capture contains
+                                          (0 == the suite never started; see session_count)
   gate   <pkg> <raw.txt> <baseline_dir>   exit 0 if no new failures vs baseline, 1 if new
                                           (prints the new failures), 2 if no baseline recorded
 """
@@ -37,6 +46,28 @@ def failing_ids(raw: str) -> list[str] {
     return sorted(ids);
 }
 
+"""Count the test-runner sessions in a raw capture.
+
+`failing_ids` CANNOT distinguish "the suite ran and nothing failed" from "the suite never started":
+both yield zero FAILED/ERROR lines. That ambiguity is not theoretical -- confirmed live 2026-07-30,
+[jobs.compiler]/[jobs.runtime] were registered with ci.yml's `working-directory: jac` relative paths
+but executed from the repo ROOT, so every command died on `File not found: 'tests/compiler'` and
+produced a capture with no test ids at all. Recording that as a baseline would have written
+count:0 for 4644 real tests and made the gate vacuously green forever.
+
+The runner prints exactly one `test session starts` banner per invocation, including for the
+legitimate "no tests ran" case (which correctly counts as HAVING run), so this is the signal that
+separates the two. baseline_main refuses to record a baseline when this returns 0."""
+def session_count(raw: str) -> int {
+    n: int = 0;
+    for line in raw.splitlines() {
+        if "test session starts" in line {
+            n += 1;
+        }
+    }
+    return n;
+}
+
 def read_file(path: str) -> str {
     with open(path, "r") as f {
         return f.read();
@@ -56,6 +87,24 @@ def record(pkg: str, raw_path: str, baseline_dir: str) -> int {
     return len(ids);
 }
 
+"""Baseline the UNION of two main-branch runs. A test that fails in EITHER run is treated as
+known-failing, which is the fix for the observed failure mode where the same branch reded on
+run 1, passed on run 2, and burned 2h of the night in retries (nights 07-21 and 07-23).
+
+Deliberately asymmetric with `gate`: recording is permissive (union -> the widest known-failing
+set), gating stays strict (any id not in that set is new). Intersection would be the wrong
+operator here -- it would drop every flake back out of the baseline and reintroduce the exact
+bug this exists to fix."""
+def record_union(pkg: str, raw1: str, raw2: str, baseline_dir: str) -> int {
+    os.makedirs(baseline_dir, exist_ok=True);
+    both: set[str] = set(failing_ids(read_file(raw1))) | set(failing_ids(read_file(raw2)));
+    ids: list[str] = sorted(both);
+    with open(baseline_path(baseline_dir, pkg), "w") as f {
+        f.write(json.dumps({"package": pkg, "failing": ids, "count": len(ids), "runs": 2}, indent=2) + "\n");
+    }
+    return len(ids);
+}
+
 def gate(pkg: str, raw_path: str, baseline_dir: str) -> (int, list[str]) {
     bp: str = baseline_path(baseline_dir, pkg);
     if not os.path.exists(bp) {
@@ -71,8 +120,20 @@ def gate(pkg: str, raw_path: str, baseline_dir: str) -> (int, list[str]) {
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
-    if cmd == "record" and len(args) == 5 {
+    # `parse` was documented in this file's own argv header from the start but had NO dispatch
+    # branch, so it silently fell through to the usage message and printed nothing to stdout
+    # (found 2026-07-30 while validating `sessions` against real captures). The flake-quantifying
+    # sanity check that follows a `nightshift.sh baseline` run is built on it, so it has to exist.
+    if cmd == "parse" and len(args) == 3 {
+        for f in failing_ids(read_file(args[2])) {
+            print(f);
+        }
+    } elif cmd == "record" and len(args) == 5 {
         print(record(args[2], args[3], args[4]));
+    } elif cmd == "record-union" and len(args) == 6 {
+        print(record_union(args[2], args[3], args[4], args[5]));
+    } elif cmd == "sessions" and len(args) == 3 {
+        print(session_count(read_file(args[2])));
     } elif cmd == "gate" and len(args) == 5 {
         (code, new_fails) = gate(args[2], args[3], args[4]);
         if code == 2 {
@@ -83,7 +144,10 @@ with entry {
         }
         sys.exit(code);
     } elif cmd != "" and cmd != "test" {
-        eprint("usage: jac run testgate.jac record <pkg> <raw.txt> <baseline_dir>");
+        eprint("usage: jac run testgate.jac parse <raw.txt>");
+        eprint("       jac run testgate.jac record <pkg> <raw.txt> <baseline_dir>");
+        eprint("       jac run testgate.jac record-union <pkg> <raw1.txt> <raw2.txt> <baseline_dir>");
+        eprint("       jac run testgate.jac sessions <raw.txt>");
         eprint("       jac run testgate.jac gate <pkg> <raw.txt> <baseline_dir>");
     }
 }
@@ -92,6 +156,52 @@ test "parse extracts FAILED and ERROR node ids, sorted unique" {
     raw: str = "some noise\nFAILED tests/a.jac::one\nPASSED tests/a.jac::two\nERROR tests/b.jac::setup\nFAILED tests/a.jac::one\n==== 2 failed ====";
     ids: list[str] = failing_ids(raw);
     assert ids == ["tests/a.jac::one", "tests/b.jac::setup"];
+}
+
+test "session_count tells a suite that never started apart from one that ran clean" {
+    # the real capture shape of the bug this exists to catch: cimirror ran the command, the command
+    # could not find its paths, zero test ids, zero sessions
+    never_ran: str = "\n$ JAC_TEST_JOBS=auto jac test tests/compiler\n"
+        + "✖ Error: File not found: 'tests/compiler'\n"
+        + "Make sure you are in the correct directory or provide the full path.\n";
+    assert session_count(never_ran) == 0;
+    assert failing_ids(never_ran) == [];          # indistinguishable from green WITHOUT this check
+    # a real run that happens to be green still counts as HAVING run
+    ran_clean: str = "============ test session starts ============\n"
+        + "collected 11 items\n...........\n=========== 11 passed in 4.17s ===========\n";
+    assert session_count(ran_clean) == 1;
+    assert failing_ids(ran_clean) == [];
+    # the legitimate "no tests ran" case (jac-mcp) also counts as having run
+    assert session_count("==== test session starts ====\n==== no tests ran in 0.30s ====\n") == 1;
+    # a multi-command suite ([jobs.compiler] has two) prints one banner per invocation
+    assert session_count(ran_clean + ran_clean) == 2;
+}
+
+test "record-union baselines a test that fails in EITHER run" {
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    r1: str = d + "/r1.txt";
+    with open(r1, "w") as f {
+        f.write("FAILED t.jac::always\nFAILED t.jac::flaky_a\n");
+    }
+    r2: str = d + "/r2.txt";
+    with open(r2, "w") as f {
+        f.write("FAILED t.jac::always\nFAILED t.jac::flaky_b\n");
+    }
+    n: int = record_union("pkg", r1, r2, d);
+    assert n == 3;
+    # a branch that reproduces only the known set is green
+    with open(d + "/ok.txt", "w") as f {
+        f.write("FAILED t.jac::always\nFAILED t.jac::flaky_b\n");
+    }
+    (c, new_fails) = gate("pkg", d + "/ok.txt", d);
+    assert c == 0 and new_fails == [];
+    # a genuinely new failure is still red
+    with open(d + "/bad.txt", "w") as f {
+        f.write("FAILED t.jac::always\nFAILED t.jac::regression\n");
+    }
+    (c2, n2) = gate("pkg", d + "/bad.txt", d);
+    assert c2 == 1 and n2 == ["t.jac::regression"];
 }
 
 test "gate: new failure vs baseline is red, subset is green" {

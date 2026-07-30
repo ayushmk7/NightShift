@@ -97,7 +97,8 @@ commands = [
 # (lib/tier1.sh S2): the nightly "clean up drift, near-zero risk" autofix, deliberately scoped to
 # jac/jaclang/byllm rather than the whole repo (repo-wide `--lintfix` would touch ~260 files
 # nightly, drag the ~95min "jac" core test suite into every autofix night via
-# gated_pkgs_from_diff, and rewrite files with known pre-existing .jacignore type-check gaps --
+# gated_suites_from_diff (renamed from gated_pkgs_from_diff in Task 6), and rewrite files with
+# known pre-existing .jacignore type-check gaps --
 # see lib/tier1.sh's own comment). [jobs.fmt] and this entry MUST use the identical tool, flags
 # (minus --check -- tier-1 APPLIES the fix, [jobs.fmt] only VERIFIES it), and exclusion regex;
 # only the path SELECTION (git-ls-files pathspec here vs. git-diff-scoped there) differs. Kept as
@@ -123,20 +124,77 @@ ci_job = "test-packages-and-docs"
 # (JAC_TEST_JOBS=0) in test-pypi-build because "byllm tests share a SQLite mock-LLM cache".
 # We mirror the PR-path job (608) for fidelity; the flake that serialization exists to avoid is
 # absorbed by the union-of-two-runs baseline instead (see scripts/testgate.jac record-union).
+#
+# No `cd` prefix here, unlike [jobs.compiler]/[jobs.runtime]: test-packages-and-docs declares no
+# `working-directory`, so ci.yml runs this from the repo ROOT, which is where cimirror_job already
+# runs it. Verified 2026-07-30: 219 items collected from the root.
+#
+# OPEN, MEASURED, NOT FIXED HERE (registry breadth is Task 4/5 territory; flagged for whoever owns
+# it). This entry transcribes ci.yml:608 but NOT the two steps that precede it in the same job:
+#   ci.yml:598-603  `jac install --global` for litellm, pillow, httpx, loguru
+#   ci.yml:605      `TEST_ENV=true`
+# and not ci.yml:610-611's docs-corpus step (`jac test jac/tests/cli/test_docs_content.jac
+# jac/tests/cli/test_guide_docs.jac`), which is part of the same CI job.
+#
+# The missing dep install is not cosmetic under cimirror_job's clean HOME. Those four packages live
+# in the jac GLOBAL env at $HOME/.cache/jac/rt/<hash>/python/lib/python3.14/site-packages, which is
+# HOME-derived, so a clean HOME strips them. Measured both ways on 2026-07-30, same command, same
+# cwd, only HOME differing:
+#   real HOME  (litellm 1.82.6, pillow 12.3.0, httpx 0.28.1, loguru 0.7.3 present, anyio plugin
+#               loaded):  219 items collected -> 3 failed, 215 passed, 1 skipped
+#   clean HOME (all four absent, no anyio plugin): 105 items collected -> 5 failed, 100 passed,
+#               plus three `agent error: No module named 'httpx'` lines
+# 114 tests vanish from COLLECTION with no collection-error line, so nothing downstream can notice:
+# testgate.jac's failing_ids() sees a shorter list of ids, not an error.
+#
+# This does NOT produce false reds today -- `nightshift.sh baseline` records under the same clean
+# HOME the gate later runs under, so those 5 failures get baselined and the two runs stay
+# self-consistent. The cost is COVERAGE: the local byllm gate exercises about half of what CI's
+# byllm job does, and the half it drops is exactly the LLM-facing surface. Fixing it means adding
+# ci.yml's `jac install --global` line (a one-time ~cold-cache cost per night's mirror-home) and
+# `TEST_ENV=true` to this entry. Deliberately left alone here so Task 6 does not silently rewrite
+# the registry it was told to consume.
 commands = ["jac test jac/jaclang/byllm/tests"]
 
 [jobs.compiler]
 ci_job = "test-compiler"
-# The second command is the cross-backend equivalence suite. The harness has NEVER gated it:
-# lib/verify.sh's pkg_test_raw ran only tests/ and tests/compiler.
+# The second command is the cross-backend equivalence suite. The harness had NEVER gated it before
+# Task 6: lib/verify.sh's since-replaced pkg_test_raw ran only tests/ and tests/compiler.
+#
+# `cd jac && ` IS REQUIRED AND LOAD-BEARING -- do not "simplify" it away. Both ci.yml steps that
+# these mirror (:181-193, :195-214) declare `working-directory: jac` (:182, :196), so their paths are relative
+# to $REPO/jac, NOT to the repo root. lib/cimirror.sh's cimirror_job evals every command from
+# `cd "$REPO"` (the root), which is correct for every OTHER job here (jac-check, contribution-checks
+# and test-packages-and-docs all run at the root in ci.yml) but wrong for these two and for
+# [jobs.runtime] below.
+#
+# Measured 2026-07-30, from the repo root: `jac test tests/compiler` ->
+# "Error: File not found: 'tests/compiler'", rc=1, ZERO tests collected. Same for
+# `jaclang/compiler/tests` and for [jobs.runtime]'s command -- neither `tests/` nor `jaclang/` exists
+# at the root. With `cd jac` first: 2612 items, 180 items, and 1852 items collected respectively.
+# So 4644 tests were silently not running. Because the runner emits no FAILED/ERROR lines when it
+# never starts, testgate.jac's failing_ids() parsed an EMPTY set from that capture -- identical to a
+# perfectly green run -- so `nightshift.sh baseline` would have recorded count:0 for both suites and
+# every candidate branch afterwards would have "passed" a test gate that executed nothing. Exactly
+# the silent-false-green class this whole mirror exists to prevent.
+#
+# Implemented as a `cd` inside the command string rather than a new per-job `workdir` key because
+# cimirror_job already evals each command in its own subshell -- so the `cd` cannot leak into the
+# next command (which is also why BOTH commands below need their own) -- and `&&` makes a failed
+# `cd` return nonzero, i.e. the job fails loudly instead of running the suite in the wrong place.
+# lib/verify.sh's baseline_assert_ran is the belt to this braces: it refuses to write a baseline
+# from a capture containing zero runner sessions, so a regression here fails loudly next time.
 commands = [
-  "JAC_TEST_JOBS=auto jac test tests/compiler",
-  "JAC_TEST_JOBS=auto jac test jaclang/compiler/tests",
+  "cd jac && JAC_TEST_JOBS=auto jac test tests/compiler",
+  "cd jac && JAC_TEST_JOBS=auto jac test jaclang/compiler/tests",
 ]
 
 [jobs.runtime]
 ci_job = "test-runtime"
-commands = ["JAC_TEST_JOBS=auto jac test tests/ --ignore tests/compiler"]
+# `cd jac && ` for the same reason as [jobs.compiler] above: ci.yml:250-263 declares
+# `working-directory: jac` (:251). From the repo root this command collected zero tests and reported
+# "File not found: 'tests/'"; from jac/ it collects 1852.
+commands = ["cd jac && JAC_TEST_JOBS=auto jac test tests/ --ignore tests/compiler"]
 
 [jobs.contribution]
 ci_job = "contribution-checks"

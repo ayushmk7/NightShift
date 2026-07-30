@@ -120,6 +120,28 @@ test "fmt and check both fail loud on a broken merge-base instead of silently sk
     }
 }
 
+test "the two suites ci.yml runs under `working-directory: jac` cd there; the root-run one does not" {
+    # Regression pin for a CONFIRMED silent false-green (2026-07-30). cimirror_job evals every
+    # command from the repo ROOT, but ci.yml runs test-compiler (:182) and test-runtime (:251)
+    # with `working-directory: jac`. Without the `cd jac`, all three commands died on
+    # "File not found: 'tests/compiler'" -- and because the runner emits no FAILED/ERROR lines
+    # when it never starts, testgate.jac parsed an EMPTY failing set, identical to a green run.
+    # 4644 tests would have been baselined as count:0 and every branch would have passed a gate
+    # that executed nothing.
+    cfg: dict = load_config_toml("config/ci-mirror.toml");
+    for job in ["compiler", "runtime"] {
+        for cmd in job_cmds(cfg, job) {
+            assert cmd.startswith("cd jac && ");
+        }
+    }
+    # test-packages-and-docs declares NO working-directory, so byllm must stay at the repo root
+    # with a root-relative path. A `cd jac` here would break it in the opposite direction.
+    for cmd in job_cmds(cfg, "byllm") {
+        assert not cmd.startswith("cd jac");
+        assert "jac/jaclang/byllm/tests" in cmd;
+    }
+}
+
 test "check mirrors ci.yml's literal IGNORE_ARGS shape: --ignore present, static globs present" {
     cfg: dict = load_config_toml("config/ci-mirror.toml");
     check: str = job_cmds(cfg, "check")[0];
