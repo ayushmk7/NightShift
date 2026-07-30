@@ -15,6 +15,7 @@ env:   SMTP_USER, SMTP_PASS (from ~/.nightshift.env; never exported to agent ses
 import sys;
 import os;
 import io;
+import html;
 import json;
 import time;
 import smtplib;
@@ -58,6 +59,36 @@ def branch_card(b: dict) -> list[str] {
     ];
 }
 
+"""Everything interpolated into the digest that did not come from this file is agent-authored or
+upstream-authored text -- finding summaries, PR titles, fatal reasons, file paths. It goes into an
+HTML document that a human opens in a mail client. Escape it once, here, and never build a string
+with raw interpolation anywhere in html_body."""
+def esc(v: any) -> str {
+    return html.escape(str(v), quote=True);
+}
+
+"""What an EMPTY section is allowed to say. RECONCILIATION B3: prs.jsonl and pr-inventory.jsonl
+both exist now, so "the stage ran and had nothing to report" and "the stage never wrote its file"
+are different facts -- and an empty table that renders identically for both is exactly the "did not
+run scored as passed" shape, in the one channel where nobody would ever notice it.
+
+An artifacts map with the key MISSING (an old run-summary.json, or a summarize that stopped
+recording it) is reported as unknown rather than silently as "none": the whole point is that an
+un-evidenced claim is not made."""
+def empty_note(summary: dict, key: str, artifact: str) -> str {
+    if as_list(summary.get(key, [])) {
+        return "";
+    }
+    arts: dict = as_dict(summary.get("artifacts", {}));
+    if artifact not in arts {
+        return "(nothing recorded — " + artifact + " presence unknown)";
+    }
+    if arts[artifact] {
+        return "(none)";
+    }
+    return "(NOT WRITTEN TONIGHT — the stage that writes " + artifact + " did not run)";
+}
+
 """Body order per TPRD S6: verdict → branch cards → full inline drafts → suspected bugs →
 skipped/failed → runtime/cost → warnings."""
 def plain_body(summary: dict) -> str {
@@ -96,12 +127,176 @@ def plain_body(summary: dict) -> str {
         }
         lines.append("");
     }
+    # The text part is not a courtesy: a reader on a text-only client gets the same FACTS, not a
+    # "view this in HTML" apology.
+    react2: dict = as_dict(summary.get("reactive", {}));
+    lines.append("REACTIVE: " + str(react2.get("files", 0)) + " merged file(s)");
+    for (lens, n) in as_dict(react2.get("lenses", {})).items() {
+        lines.append("  " + str(lens) + ": " + str(n));
+    }
+    lines.append("");
+    lines.append("PULL REQUESTS " + empty_note(summary, "prs", "prs.jsonl"));
+    for pr in as_list(summary.get("prs", [])) {
+        p2: dict = as_dict(pr);
+        lines.append("  #" + str(p2.get("number", "?")) + " " + str(p2.get("title", ""))
+                     + " [" + str(p2.get("task", "")) + "] mirror=" + str(p2.get("mirror", "?"))
+                     + " ci=" + str(p2.get("ci", "?")) + " attempts=" + str(p2.get("attempts", 0)));
+        lines.append("    " + str(p2.get("url", "")));
+    }
+    lines.append("");
+    lines.append("PR INVENTORY " + empty_note(summary, "inventory", "pr-inventory.jsonl"));
+    for item in as_list(summary.get("inventory", [])) {
+        i2: dict = as_dict(item);
+        lines.append("  #" + str(i2.get("number", "?")) + " " + str(i2.get("action", "?"))
+                     + " " + str(i2.get("note", "")));
+    }
+    lines.append("");
+    lines.append("DEFERRED TO A FUTURE NIGHT " + empty_note(summary, "deferred", "deferred.jsonl"));
+    for item2 in as_list(summary.get("deferred", [])) {
+        d3: dict = as_dict(item2);
+        lines.append("  " + str(d3.get("file", "?")) + " — " + str(d3.get("reason", ""))
+                     + " (" + str(d3.get("phase", "?")) + ")");
+    }
+    lines.append("");
+    clock2: dict = as_dict(summary.get("clock", {}));
+    lines.append("clock: " + str(clock2.get("consumed_min", "?")) + " of "
+                 + str(clock2.get("window_min", "?")) + " min");
     lines.append("runtime: " + str(summary.get("runtime_min", "?")) + " min · turns: "
                  + str(summary.get("turns", "?")) + " · cost: $" + str(summary.get("cost_usd", "0")));
     for w in as_list(summary.get("warnings", [])) {
         lines.append("WARNING: " + str(w));
     }
     return "\n".join(lines) + "\n";
+}
+
+"""The digest (design spec section 14). Section order is triage order: what went wrong, then what
+shipped, then what is in flight, then what was left.
+
+ponytail: this is string concatenation in Jac, not a template engine and not a "renderer"
+          abstraction. There is exactly ONE output format and email.mime is stdlib. A second
+          format (a Slack blocks payload was floated) would justify splitting the section
+          builders out; one does not.
+Inline styles, not a <style> block: Gmail strips or rewrites <style> in some clients and every
+mail-client CSS guide says the same thing. Nothing here needs more than borders and a monospace
+font, so this is the cheap correct choice rather than a compromise."""
+def html_body(summary: dict) -> str {
+    clock: dict = as_dict(summary.get("clock", {}));
+    mono: str = "font-family:ui-monospace,Menlo,monospace;font-size:13px";
+    td: str = "border:1px solid #ddd;padding:4px 8px";
+    out: list[str] = [
+        "<html><body style=\"" + mono + ";color:#222\">",
+        "<h2 style=\"margin:0 0 4px\">Nightshift " + esc(summary.get("date", "?")) + "</h2>",
+        "<p style=\"margin:0 0 12px\">" + esc(summary.get("verdict", "")) + "<br>"
+        + "clock: " + esc(clock.get("consumed_min", "?")) + " of "
+        + esc(clock.get("window_min", "?")) + " min consumed ("
+        + esc(clock.get("remaining_min", "?")) + " left) · turns "
+        + esc(summary.get("turns", "?")) + " · $" + esc(summary.get("cost_usd", 0)) + "</p>",
+    ];
+
+    # 1. WHY the night died, first, in red. 13 ns_die sites share one stage name.
+    fatal: any = summary.get("fatal_reason");
+    if fatal is not None and str(fatal) != "" {
+        out.append("<p style=\"background:#fee;border-left:4px solid #c00;padding:8px\">"
+                   + "<b>FATAL (" + esc(summary.get("error_stage", "?")) + ")</b><br>"
+                   + esc(fatal) + "</p>");
+    }
+
+    # 2. per-phase: what was audited, what was found, selected, deferred, with summaries INLINE
+    for section in as_list(summary.get("tasks", [])) {
+        s: dict = as_dict(section);
+        out.append("<h3>" + esc(s.get("phase", "?")) + " — " + esc(s.get("selected", 0))
+                   + " selected, " + esc(s.get("deferred", 0)) + " deferred</h3>");
+        out.append("<p>audited: " + esc(", ".join([str(x) for x in as_list(s.get("scopes", []))]))
+                   + "</p><ul>");
+        for theme in as_list(s.get("themes", [])) {
+            t: dict = as_dict(theme);
+            out.append("<li><b>" + esc(t.get("name", "?")) + "</b> — "
+                       + esc(t.get("summary", "")) + "</li>");
+        }
+        out.append("</ul>");
+    }
+
+    # 3. reactive pass. A FAILED lens must read differently from a lens that found nothing.
+    react: dict = as_dict(summary.get("reactive", {}));
+    # No presence note here: `files` already carries it. 0 merged files IS the quiet day, and the
+    # tsv is legitimately absent then -- the poll's own failure, which is the case that must not
+    # look quiet, arrives as a failed.tsv row and is rendered under Failures below.
+    out.append("<h3>Reactive pass — " + esc(react.get("files", 0)) + " merged file(s)</h3><ul>");
+    for (lens, n) in as_dict(react.get("lenses", {})).items() {
+        out.append("<li>" + esc(lens) + ": " + esc(n) + "</li>");
+    }
+    out.append("</ul>");
+
+    # 4. PR table. Diffstats inline so triage needs no clicks (design spec 14).
+    out.append("<h3>Pull requests " + esc(empty_note(summary, "prs", "prs.jsonl"))
+               + "</h3><table style=\"border-collapse:collapse\">"
+               + "<tr><th style=\"" + td + "\">#</th><th style=\"" + td + "\">title</th>"
+               + "<th style=\"" + td + "\">task</th><th style=\"" + td + "\">mirror</th>"
+               + "<th style=\"" + td + "\">CI</th><th style=\"" + td + "\">attempts</th></tr>");
+    for pr in as_list(summary.get("prs", [])) {
+        p: dict = as_dict(pr);
+        out.append("<tr><td style=\"" + td + "\"><a href=\"" + esc(p.get("url", "")) + "\">"
+                   + esc(p.get("number", "?")) + "</a></td>"
+                   + "<td style=\"" + td + "\">" + esc(p.get("title", "")) + "</td>"
+                   + "<td style=\"" + td + "\">" + esc(p.get("task", "")) + "</td>"
+                   + "<td style=\"" + td + "\">" + esc(p.get("mirror", "?")) + "</td>"
+                   + "<td style=\"" + td + "\">" + esc(p.get("ci", "?")) + "</td>"
+                   + "<td style=\"" + td + "\">" + esc(p.get("attempts", 0)) + "</td></tr>");
+    }
+    out.append("</table>");
+
+    # 5. branches shipped tonight, with their diffstats
+    out.append("<h3>Branches</h3><ul>");
+    for b in as_list(summary.get("branches", [])) {
+        c: dict = as_dict(b);
+        out.append("<li><b>" + esc(c.get("theme", "?")) + "</b> — "
+                   + esc(c.get("files", "?")) + " file(s), <b>+" + esc(c.get("added", 0))
+                   + " -" + esc(c.get("removed", 0)) + "</b>, tests: " + esc(c.get("tests", "?"))
+                   + ", risk: " + esc(c.get("risk", "?"))
+                   + "<br><a href=\"" + esc(c.get("url", "")) + "\">"
+                   + esc(c.get("branch", "?")) + "</a></li>");
+    }
+    out.append("</ul>");
+
+    # 6. PR inventory (S1.6): rebased / updated / conflicted
+    out.append("<h3>PR inventory " + esc(empty_note(summary, "inventory", "pr-inventory.jsonl"))
+               + "</h3><ul>");
+    for item in as_list(summary.get("inventory", [])) {
+        i: dict = as_dict(item);
+        out.append("<li>#" + esc(i.get("number", "?")) + " — <b>" + esc(i.get("action", "?"))
+                   + "</b> " + esc(i.get("note", "")) + "</li>");
+    }
+    out.append("</ul>");
+
+    # 7. failures and deferred work
+    out.append("<h3>Failures</h3><ul>");
+    for item3 in as_list(summary.get("failed", [])) {
+        d: dict = as_dict(item3);
+        out.append("<li>" + esc(d.get("what", "?")) + ": " + esc(d.get("reason", "")) + "</li>");
+    }
+    out.append("</ul><h3>Deferred to a future night "
+               + esc(empty_note(summary, "deferred", "deferred.jsonl")) + "</h3><ul>");
+    for item4 in as_list(summary.get("deferred", [])) {
+        d2: dict = as_dict(item4);
+        out.append("<li>" + esc(d2.get("file", "?")) + " — " + esc(d2.get("reason", ""))
+                   + " (" + esc(d2.get("phase", "?")) + ")</li>");
+    }
+    out.append("</ul>");
+
+    for w in as_list(summary.get("warnings", [])) {
+        out.append("<p style=\"color:#a60\">WARNING: " + esc(w) + "</p>");
+    }
+
+    # 8. full drafts last: the longest content, and the part a reader scrolls to deliberately
+    for b2 in as_list(summary.get("branches", [])) {
+        c2: dict = as_dict(b2);
+        if c2.get("draft_text", "") {
+            out.append("<h3>draft: " + esc(c2.get("branch", "?")) + "</h3><pre style=\""
+                       + td + ";white-space:pre-wrap\">" + esc(c2["draft_text"]) + "</pre>");
+        }
+    }
+    out.append("</body></html>");
+    return "\n".join(out);
 }
 
 # `any` at the MIME boundary: jac 0.16.1's email stubs lack attach/send_message members
@@ -115,8 +310,10 @@ def build_message(summary: dict, cfg: dict) -> any {
     msg["From"] = str(os.environ.get("SMTP_USER", "nightshift"));
     msg["To"] = str(email_cfg["to"]);
     text: str = plain_body(summary);
+    # text FIRST, html SECOND: RFC 2046 says the last alternative is the most preferred, so a
+    # client that understands both shows the html and a text-only client falls back cleanly.
     msg.attach(MIMEText(text, "plain"));
-    msg.attach(MIMEText("<pre>" + text.replace("&", "&amp;").replace("<", "&lt;") + "</pre>", "html"));
+    msg.attach(MIMEText(html_body(summary), "html"));
     return msg;
 }
 
@@ -758,4 +955,113 @@ test "task_sections separates the two phases and never reports a merge as a scop
     rea: dict = as_dict(by_phase["reactive"]);
     assert [str(x) for x in as_list(rea["scopes"])] == ["reactive-dead-code"];
     assert rea["selected"] == 0;
+}
+
+test "the html digest carries every section and escapes agent-authored text" {
+    summary: dict = {
+        "date": "2026-07-30",
+        "verdict": "2 branch(es) ready · 1 failed",
+        "clock": {"window_min": 480, "consumed_min": 312, "remaining_min": 168},
+        "error_stage": "S4", "fatal_reason": "mirror job 'compiler' collected 0 items",
+        "branches": [{"theme": "dead render path", "branch": "nightshift/2026-07-30/dead-code-x",
+                      "files": 3, "added": 4, "removed": 212, "tests": "green", "risk": "low",
+                      "url": "https://github.com/x", "draft_text": "# refactor: kill dead code"}],
+        "tasks": [{"phase": "reactive", "scopes": ["reactive-dead-code"], "selected": 1,
+                   "deferred": 2,
+                   "themes": [{"name": "dead render path",
+                               "summary": "<script>alert(1)</script> & a real finding"}]}],
+        "reactive": {"files": 6, "lenses": {"dead-code": "3", "maintenance": "FAILED"}},
+        "prs": [{"number": 7301, "title": "remove dead pipe <b>", "task": "dead-code",
+                 "url": "https://github.com/jaseci-labs/jac/pull/7301",
+                 "mirror": "green", "ci": "pending", "attempts": 0}],
+        "inventory": [{"number": 7288, "action": "conflicted", "note": "jac/jaclang/cli/x.jac"}],
+        "deferred": [{"fingerprint": "abc", "file": "jac/jaclang/scale/z.jac",
+                      "reason": "over-night-budget", "phase": "cycle"}],
+        "failed": [{"what": "theme y", "reason": "tests red"}],
+        "artifacts": {"prs.jsonl": True, "pr-inventory.jsonl": True, "deferred.jsonl": True,
+                      "reactive-summary.tsv": True},
+        "suspected_bugs": [], "warnings": [], "runtime_min": 312, "turns": 61, "cost_usd": 0,
+    };
+    doc: str = html_body(summary);
+    # the fatal reason is the FIRST thing an operator should see
+    assert doc.index("mirror job") < doc.index("7301");
+    # every section from design spec 14
+    for needle in ["312", "reactive-dead-code", "7301", "pending", "7288", "conflicted",
+                   "over-night-budget", "tests red", "+4", "-212"] {
+        assert needle in doc;
+    }
+    # ESCAPED. Finding summaries are agent-authored text going into an HTML document.
+    assert "<script>alert(1)</script>" not in doc;
+    assert "&lt;script&gt;" in doc;
+    assert "remove dead pipe &lt;b&gt;" in doc;
+    # ...but the harness's own markup survives
+    assert "<table" in doc and "</html>" in doc;
+}
+
+test "an ABSENT PR artifact reads differently from an empty one" {
+    # RECONCILIATION B3. prs.jsonl and pr-inventory.jsonl exist now, so an empty table that renders
+    # identically whether S5 wrote nothing or never ran is the project's own defect class landing
+    # in the one channel nobody watches.
+    ran: dict = {"date": "d", "verdict": "v", "branches": [], "failed": [], "tasks": [],
+                 "reactive": {"files": 0, "lenses": {}}, "prs": [], "inventory": [],
+                 "deferred": [], "suspected_bugs": [], "warnings": [], "runtime_min": 0,
+                 "turns": 0, "cost_usd": 0, "error_stage": None, "fatal_reason": None,
+                 "clock": {"window_min": 480, "consumed_min": 0, "remaining_min": 480},
+                 "artifacts": {"prs.jsonl": True, "pr-inventory.jsonl": True,
+                               "deferred.jsonl": True, "reactive-summary.tsv": True}};
+    assert "(none)" in html_body(ran);
+    assert "NOT WRITTEN TONIGHT" not in html_body(ran);
+    assert "(none)" in plain_body(ran);
+
+    never: dict = dict(ran);
+    never["artifacts"] = {"prs.jsonl": False, "pr-inventory.jsonl": False,
+                          "deferred.jsonl": False, "reactive-summary.tsv": False};
+    assert "NOT WRITTEN TONIGHT" in html_body(never);
+    assert "prs.jsonl" in html_body(never);
+    assert "NOT WRITTEN TONIGHT" in plain_body(never);
+
+    # ...and a summary with no artifacts map at all says so rather than claiming "none"
+    unknown: dict = dict(ran);
+    unknown["artifacts"] = {};
+    assert "presence unknown" in html_body(unknown);
+}
+
+test "the plain-text part is a real fallback, not a stub" {
+    summary: dict = {
+        "date": "2026-07-30", "verdict": "1 ready",
+        "clock": {"window_min": 480, "consumed_min": 42, "remaining_min": 438},
+        "branches": [], "tasks": [], "failed": [], "suspected_bugs": [], "warnings": [],
+        "reactive": {"files": 6, "lenses": {"dead-code": "3"}},
+        "prs": [{"number": 7301, "title": "t", "task": "dead-code", "url": "u",
+                 "mirror": "green", "ci": "pending", "attempts": 0}],
+        "inventory": [], "deferred": [], "runtime_min": 42, "turns": 5, "cost_usd": 0,
+        "error_stage": None, "fatal_reason": None,
+        "artifacts": {"prs.jsonl": True, "pr-inventory.jsonl": True, "deferred.jsonl": True,
+                      "reactive-summary.tsv": True},
+    };
+    text: str = plain_body(summary);
+    # a reader on a text-only client must get the same FACTS, not a "view in HTML" apology
+    assert "7301" in text and "pending" in text;
+    assert "6" in text;                       # the reactive file count
+    assert "clock: 42 of 480 min" in text;
+    assert "<" not in text;                   # no markup leaked into the text part
+}
+
+test "build_message is multipart/alternative, text first then html" {
+    summary: dict = {"date": "2026-07-30", "verdict": "v", "branches": [], "failed": [],
+                     "tasks": [], "reactive": {"files": 0, "lenses": {}}, "prs": [],
+                     "inventory": [], "deferred": [], "suspected_bugs": [], "warnings": [],
+                     "clock": {"window_min": 480, "consumed_min": 1, "remaining_min": 479},
+                     "artifacts": {"prs.jsonl": True, "pr-inventory.jsonl": True,
+                                   "deferred.jsonl": True, "reactive-summary.tsv": True},
+                     "runtime_min": 1, "turns": 0, "cost_usd": 0,
+                     "error_stage": None, "fatal_reason": None};
+    os.environ["SMTP_USER"] = "probe@example.com";
+    msg: any = build_message(summary, {"email": {"to": "d@e.f"}});
+    parts: list = as_list(msg.get_payload());
+    assert msg.get_content_subtype() == "alternative";
+    # RFC 2046: the LAST alternative is the most preferred, so html must come second
+    assert parts[0].get_content_type() == "text/plain";
+    assert parts[1].get_content_type() == "text/html";
+    assert msg["From"] == "probe@example.com";
 }
