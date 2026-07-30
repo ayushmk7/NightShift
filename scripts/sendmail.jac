@@ -34,6 +34,11 @@ def subject(summary: dict) -> str {
         s += " · DISABLED";
     } elif summary.get("error_stage") is not None and summary.get("error_stage") != "" {
         s += " · ERROR " + str(summary["error_stage"]);
+        reason: any = summary.get("fatal_reason");
+        if reason is not None and str(reason) != "" {
+            # truncated to keep the subject scannable; plain_body and the HTML carry it in full
+            s += ": " + str(reason)[:80];
+        }
     }
     return s;
 }
@@ -54,6 +59,12 @@ def branch_card(b: dict) -> list[str] {
 skipped/failed → runtime/cost → warnings."""
 def plain_body(summary: dict) -> str {
     lines: list[str] = [str(summary.get("verdict", "(no verdict)")), ""];
+    # WHY the night died leads the body: on a fatal night it is the only line that matters, and
+    # the operator reads this on a phone. ERROR_STAGE says WHERE, ns_die's text says WHY.
+    fatal: any = summary.get("fatal_reason");
+    if fatal is not None and str(fatal) != "" {
+        lines += ["FATAL (" + str(summary.get("error_stage", "?")) + "): " + str(fatal), ""];
+    }
     for b in as_list(summary.get("branches", [])) {
         lines += branch_card(as_dict(b));
     }
@@ -320,6 +331,7 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
         runtime = int((time.time() - float(start_lines[0])) / 60.0);
     }
     error_lines: list[str] = read_lines(os.path.join(log_dir, "ERROR_STAGE"));
+    fatal_lines: list[str] = read_lines(os.path.join(log_dir, "FATAL_REASON"));
     return {
         "date": date_s,
         "verdict": str(len(branches)) + " branch(es) ready · " + str(len(failed)) + " failed",
@@ -332,6 +344,9 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
         "warnings": read_lines(os.path.join(log_dir, "warnings.txt")),
         "disabled": os.path.exists(os.path.join(log_dir, "DISABLED")),
         "error_stage": error_lines[0] if error_lines else None,
+        # WHY the night died, not just where. ns_die (lib/common.sh) writes the message it was
+        # called with; ERROR_STAGE alone is shared by 13 ns_die sites in lib/verify.sh.
+        "fatal_reason": " ".join(fatal_lines) if fatal_lines else None,
     };
 }
 
@@ -482,6 +497,40 @@ test "the message body itself is scrubbed, receipt survives" {
     scrubbed: str = scrub_smtp_debug(raw);
     assert "secret-body-text" not in scrubbed;
     assert receipt_from_debug(scrubbed) == "2.0.0 OK  1 q1 - gsmtp";
+}
+
+test "the subject names the fatal reason, not just the stage" {
+    summary: dict = {
+        "date": "2026-07-10", "branches": [], "failed": [],
+        "error_stage": "S4", "fatal_reason": None,
+    };
+    assert subject(summary).endswith("· ERROR S4");
+    summary["fatal_reason"] = "mirror job 'compiler' collected 0 items — the runner never started";
+    # the stage alone is almost no information: 13 ns_die sites in lib/verify.sh share it
+    assert "ERROR S4: mirror job 'compiler' collected 0 items" in subject(summary);
+    # bounded, because a subject line is not a log: the full text lives in the body
+    assert len(subject(summary)) <= 160;
+}
+
+test "summarize reads FATAL_REASON and ERROR_STAGE as separate facts" {
+    import tempfile;
+    log_dir: str = tempfile.mkdtemp();
+    drafts_dir: str = tempfile.mkdtemp();
+    with open(os.path.join(log_dir, "ERROR_STAGE"), "w") as f {
+        f.write("S4\n");
+    }
+    with open(os.path.join(log_dir, "FATAL_REASON"), "w") as f {
+        f.write("no theme file for nightshift/2026-07-10/x\n");
+    }
+    cfg: dict = {"repo": {"fork": "me/jaseci"}, "budgets": {"wallclock_min": 480}};
+    s: dict = summarize(log_dir, drafts_dir, "2026-07-10", cfg);
+    assert s["error_stage"] == "S4";
+    assert s["fatal_reason"] == "no theme file for nightshift/2026-07-10/x";
+    assert "no theme file" in plain_body(s);
+    # a clean night carries neither
+    clean: str = tempfile.mkdtemp();
+    s2: dict = summarize(clean, drafts_dir, "2026-07-10", cfg);
+    assert s2["error_stage"] is None and s2["fatal_reason"] is None;
 }
 
 test "body inlines drafts and bug reports" {

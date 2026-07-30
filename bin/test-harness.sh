@@ -484,4 +484,24 @@ grep -q "2.0.0 OK q1 - gsmtp" "$E/SMTP_RECEIPT" \
 [ -f "$E/EMAIL_FAILED" ] && fail "email_main flagged a receipted send as failed"
 echo "transport guards behave: no receipt means not delivered"
 
+echo "== 20. same-night re-run must not report a STALE fatal stage =="
+# ERROR_STAGE was cleared nowhere while FATAL_REASON was cleared in ns_run, so a green re-run
+# after a red one mailed "ERROR S4" with no reason attached -- the digest's only outright lie.
+# Driven against the REAL statement, extracted from bin/nightshift.sh, so moving or narrowing it
+# fails here rather than passing a grep. `|| true` on the extraction because errexit+pipefail
+# would otherwise abort the harness before the case arm below could name what went wrong.
+clear_stmt="$(grep -E '^[[:space:]]*rm -f "\$LOG_DIR/FATAL_REASON"' bin/nightshift.sh | head -1 || true)"
+case "$clear_stmt" in
+    "") fail "bin/nightshift.sh no longer clears FATAL_REASON in ns_run -- section 20 would be vacuous" ;;
+esac
+S="$T/staleclear"; mkdir -p "$S"
+( LOG_DIR="$S"; touch "$S/FATAL_REASON" "$S/ERROR_STAGE"; eval "$clear_stmt" )
+[ -e "$S/FATAL_REASON" ] && fail "the extracted clear statement did not remove FATAL_REASON"
+[ -e "$S/ERROR_STAGE" ] && fail "a same-night re-run leaves a STALE ERROR_STAGE; the digest would report a green run as failed"
+# ...and the Plan 1 stopgap must be GONE, not kept alongside the first-class field: summarize()
+# now reads FATAL_REASON itself, so a surviving fold would print the same reason twice.
+grep -q 'FATAL (%s)' bin/nightshift.sh \
+    && fail "ns_on_exit still folds FATAL_REASON into warnings.txt; the digest would report it twice"
+echo "same-night re-run clears both fatal markers; the warnings.txt stopgap is gone"
+
 echo "ALL HARNESS TESTS PASSED"

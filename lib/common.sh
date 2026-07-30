@@ -38,13 +38,12 @@ ns_jac() {
 ns_log()  { printf '%s [%s] %s\n' "$(date '+%H:%M:%S')" "$1" "$2" | tee -a "$LOG_DIR/run.log" >&2; }
 ns_warn() { ns_log WARN "$1"; echo "$1" >> "$LOG_DIR/warnings.txt"; }
 ns_fail() { printf '%s\t%s\n' "$1" "$2" >> "$LOG_DIR/failed.tsv"; ns_log FAIL "$1: $2"; }
-# ns_die RECORDS WHY, not just that. bin/nightshift.sh's ns_on_exit copies only CURRENT_STAGE to
-# ERROR_STAGE, and the stage NAME is all the digest reports -- but this branch multiplied ns_die
-# call sites in the unattended path (13 in lib/verify.sh alone, every one of them EX_BUG=70), so
-# "the night died in S4" is now almost no information at all. The reason text is written here and
-# folded into the digest by ns_on_exit. Best-effort (`|| true`): $LOG_DIR may not exist yet on the
-# earliest failure paths, and losing the reason must never change the exit code the caller asked
-# for. Stopgap for the unattended channel; the real digest work is Plan 4.
+# ns_die RECORDS WHY, not just that. bin/nightshift.sh's ns_on_exit copies CURRENT_STAGE to
+# ERROR_STAGE (WHERE), and this writes the reason text (WHY). Both are read as first-class fields
+# by scripts/sendmail.jac's summarize() and appear in the subject line and the digest body --
+# without the reason, all 13 ns_die sites in lib/verify.sh alone read identically as "ERROR S4".
+# Best-effort (`|| true`): $LOG_DIR may not exist yet on the earliest failure paths, and losing
+# the reason must never change the exit code the caller asked for.
 ns_die()  {
     local code=$1; shift
     ns_log FATAL "$*"
