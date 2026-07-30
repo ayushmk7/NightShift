@@ -232,7 +232,13 @@ verify_main() {
     return 0
 }
 
-# Gate order: scope containment → jac check (changed files) → baseline-diff test gate → pre-commit.
+# Gate order: scope containment → jac check baseline-diff (changed files) → the FAST CI-mirror jobs
+# (fmt, check, jir) → baseline-diff test gate → pre-commit → the contribution CI-mirror job.
+#
+# The fast mirror jobs sit deliberately BEFORE the suites: they cost ~3s warm and are each fatal for
+# a fork PR, so a doomed branch dies in seconds instead of after ~40min of tests. bin/test-harness.sh
+# section 8 asserts that ordering, because getting it backwards is silently expensive rather than
+# visibly broken.
 verify_branch() {
     local branch=$1 theme=$2 t0 t1
     t0="$(date +%s)"
@@ -312,7 +318,55 @@ verify_branch() {
         fi
     fi
 
-    # 3. tests: baseline-diff gate. Run the mirrored CI suite for each gated SUITE the branch
+    # 3. FAST CI-mirror jobs, BEFORE the expensive suites. All three are ci.yml `jac-check` steps,
+    #    all three cost seconds, and all three are FATAL for a Nightshift PR:
+    #      fmt   — the check step itself carries `continue-on-error: true` (ci.yml:341), but the
+    #              autofix push that would rescue it is same-repo-only
+    #              (ci.yml:363-367, `head.repo.full_name == github.repository`) and Nightshift opens
+    #              FORK PRs, so the follow-up "Fail if formatting was not clean" step
+    #              (ci.yml:401-405) hard-fails the job anyway. A misformatted branch is dead on
+    #              arrival upstream.
+    #      jir   — ci.yml:407-409, no continue-on-error. A dead-code sweep that deletes a symbol can
+    #              invalidate the generated registry, i.e. CI reds on a file the agent never touched.
+    #      check — ci.yml:411-424, no continue-on-error.
+    #
+    #    `check` is in the fast set ON PURPOSE and is NOT a duplicate of step 2 above. Step 2 is a
+    #    BASELINE-DIFF check (new errors vs the same files' main content, no --ignore), deliberately
+    #    permissive so a branch is not punished for a file's pre-existing errors. [jobs.check] is
+    #    CI's literal `jac check $FILES --ignore $IGNORE_ARGS --nowarn`: a hard must-exit-0 gate
+    #    whose ~570-entry .jacignore list is precisely the set of files upstream has already excused.
+    #    A branch can pass step 2 and still be red in real CI (touching a non-ignored file that has
+    #    a pre-existing error), and this is the only stage that notices — while step 2 is the only
+    #    stage that notices a NEW error in a file .jacignore excuses. They cover different holes.
+    #    Measured on this host, warm mirror-home, one changed file: fmt 0s, check 2s, jir 1s.
+    #
+    #    rc=EX_MIRROR_READ (70) ABORTS THE NIGHT rather than reding the branch. Two distinct things
+    #    return 70 here and both are harness faults, not branch faults: cimirror_job's own
+    #    EX_MIRROR_READ (unreadable/renamed [jobs.*] in config/ci-mirror.toml) and
+    #    [jobs.fmt]/[jobs.check]'s own `exit 70` for an uncomputable merge-base (bad or unset
+    #    $NS_REPO_DEFAULT_BRANCH, detached HEAD, no shared history). The ambiguity does not matter
+    #    because the response is the same: both fail identically for EVERY queued branch, so reding
+    #    would burn every finding's attempt counter and auto-reject the whole ledger after two nights
+    #    over one config typo. Same judgement assert_suite_ran already applies to the test suites.
+    #    (fmt_autofix is NOT in this list and must never be: it is `jac fmt --lintfix` with no
+    #    --check, i.e. it MUTATES the branch. gate_job_names in scripts/cimirror.jac keeps it out of
+    #    the mirror's own iteration for the same reason.)
+    local mrr fastjob fast_rc
+    mrr="$LOG_DIR/mirror-fast-$(basename "$branch").txt"
+    : > "$mrr"
+    for fastjob in fmt check jir; do
+        fast_rc=0
+        cimirror_job "$fastjob" "$mrr" || fast_rc=$?
+        case "$fast_rc" in
+            0) : ;;
+            "$EX_MIRROR_READ")
+                ns_die "$EX_BUG" "CI mirror job '$fastjob' returned $EX_MIRROR_READ: either config/ci-mirror.toml could not be read, or the job could not compute a merge-base against '$NS_REPO_DEFAULT_BRANCH'. Both are harness faults that would fail identically for every queued branch, so $branch is not being blamed for it (see $(basename "$mrr"))." ;;
+            *)  verify_red "$branch" "CI mirror job '$fastjob' red (see $(basename "$mrr"))"
+                return 1 ;;
+        esac
+    done
+
+    # 4. tests: baseline-diff gate. Run the mirrored CI suite for each gated SUITE the branch
     #    touched, and fail only on NEW failures vs the recorded main baseline (testgate.jac).
     #    jac-mcp-only and fragment-only changes get no test gate — fmt/check/jir/contribution and
     #    pre-commit still gate them (see gated_suites_from_diff).
@@ -409,8 +463,19 @@ verify_branch() {
         gated="$gated $suite"
     done
 
-    # 4. pre-commit (standalone contributor tool from PATH, installed via pipx at M0 — NOT a git
+    # 5. pre-commit (standalone contributor tool from PATH, installed via pipx at M0 — NOT a git
     #    hook, so orchestrator commits stay unhooked). Hooks may self-mutate; fold in, demand clean.
+    #
+    #    KEPT, deliberately, even though this task replaced the rest of the hand-rolled gate with
+    #    mirrored ci.yml jobs. pre-commit is NOT part of [jobs.contribution] — Task 5 removed it
+    #    from there after reading work/repo/.pre-commit-config.yaml's own header ("Manifest for
+    #    pre-commit.ci only ... Contributors do not install pre-commit locally"). But pre-commit.ci
+    #    is a real third-party check that runs on the PR, fork or not, and its two hooks are
+    #    markdownlint-cli2 and a pygrep ban on em-dashes in markdown. Nightshift writes markdown
+    #    release-note fragments with an LLM, which is about the most reliable em-dash source there
+    #    is, so dropping this stage would trade a local seconds-long gate for a red check on an
+    #    upstream PR a human has to look at. It is not a ci.yml job, so it is not in the mirror; it
+    #    stays here as its own stage.
     if ! ns_precommit run --all-files; then
         git add -A
         git diff --cached --quiet || git commit -m "style: pre-commit autofix (nightshift)"
@@ -419,6 +484,37 @@ verify_branch() {
             return 1
         fi
     fi
+
+    # 6. contribution-checks (ci.yml:449-512), the LAST gate: AI co-author attribution, no new
+    #    Python files, bun/zig BUN_VERSION lockstep, docs-corpus validation, release-note fragment.
+    #    The first of those is the one most likely to bite this harness specifically — Nightshift IS
+    #    an AI agent producing commits.
+    #
+    #    Last on purpose. It is not a pre-filter for the suites (nothing downstream of it is
+    #    expensive), and two of its five commands read the branch's FINAL commit set — the
+    #    AI-co-author `git log $NS_REPO_DEFAULT_BRANCH..HEAD` range and the fragment check's
+    #    `git diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD"` — which the pre-commit autofix fold
+    #    directly above can still add a commit to. Running it earlier would judge a tree that is not
+    #    the one being shipped.
+    #
+    #    No self-mutation fold here (the brief's sketch had one, copied from the pre-commit block it
+    #    was replacing): none of [jobs.contribution]'s five commands writes to the tree, so a second
+    #    pass could only ever reproduce the first pass's verdict.
+    #
+    #    Unlike the fast three, rc=70 here is UNAMBIGUOUSLY a cimirror reader failure — no command in
+    #    [jobs.contribution] exits 70 of its own accord — but it gets the same treatment for the same
+    #    reason: a broken registry is night-wide and must not consume this branch's attempts.
+    local cj cj_rc=0
+    cj="$LOG_DIR/mirror-contribution-$(basename "$branch").txt"
+    : > "$cj"
+    cimirror_job contribution "$cj" || cj_rc=$?
+    case "$cj_rc" in
+        0) : ;;
+        "$EX_MIRROR_READ")
+            ns_die "$EX_BUG" "CI mirror job 'contribution' returned $EX_MIRROR_READ: cimirror could not read [jobs.contribution] from config/ci-mirror.toml. That is a harness fault, identical for every queued branch, so $branch is not being blamed for it (see $(basename "$cj"))." ;;
+        *)  verify_red "$branch" "CI mirror job 'contribution' red (see $(basename "$cj"))"
+            return 1 ;;
+    esac
 
     # record the tests line for the draft, and self-tune the verify estimate (TPRD S3-B step 5)
     t1="$(date +%s)"
@@ -432,6 +528,11 @@ verify_branch() {
     # with no baseline recorded, and — since state/test-baseline/ is currently empty — for every
     # branch until `nightshift.sh baseline` has run. Telling an upstream reviewer the tests passed
     # when nothing ran is the one failure in this file that escapes the repo.
+    #
+    # The `mirror fmt+check+jir ✓` and `contribution ✓` halves ARE flat literals, and that is honest:
+    # unlike the suites, those four jobs are unconditional and every one of them `return 1`s above on
+    # anything but rc=0, so reaching this line is proof all four ran green. If either stage ever
+    # gains a legitimate skip path, this line has to grow a case arm like the ones below.
     local check_line="jac check ✓" tests_line
     case "$changed_jac" in "") check_line="jac check (no .jac files changed)" ;; esac
     case "$suites" in
@@ -445,7 +546,7 @@ verify_branch() {
                     esac ;;
             esac ;;
     esac
-    echo "$check_line · $tests_line · pre-commit ✓ (${dur_min} min)" \
+    echo "mirror fmt+check+jir ✓ · $check_line · $tests_line · pre-commit ✓ · contribution ✓ (${dur_min} min)" \
         > "$LOG_DIR/tests-$(basename "$branch").txt"
     git checkout "$NS_REPO_DEFAULT_BRANCH"
     return 0

@@ -91,6 +91,7 @@ usage: nightshift.sh run                        # the nightly pipeline (launchd 
        nightshift.sh discard <branch> [reason]  # bury the branch; the finding never resurfaces
        nightshift.sh status                     # last run summary + ledger tallies
        nightshift.sh baseline                   # record the test baseline on main (slow; M0)
+       nightshift.sh mirror [branch]            # run the whole CI mirror against a branch (slow)
        nightshift.sh dataset-backfill           # rebuild dataset/*.jsonl from past real nights
 EOF
     exit 2
@@ -106,6 +107,41 @@ case "$cmd" in
     discard)    [ $# -ge 1 ] || usage; mkdir -p "$LOG_DIR"; discard_main "$@" ;;
     status)     status_main ;;
     baseline)   mkdir -p "$LOG_DIR" "$NS_ROOT/state"; ns_load_env; baseline_main ;;
+    # Hand-debugging a red branch. Runs EVERY gate job in config order (fmt, check, jir, byllm,
+    # compiler, runtime, contribution), stopping at the first failure -- so it is fast on a branch
+    # that is broken early and ~40min+ on one that is only broken late. That breadth is the point:
+    # S4 runs a deliberately narrowed subset (only the suites gated_suites_from_diff routes to), and
+    # this is the command for "CI is red and the gate was green, what did the gate not run?".
+    #
+    # Every line below is written the way it is because bin/nightshift.sh runs under `set -e`:
+    #   * `|| rc=$?`, not `cimirror_all ...; rc=$?` -- a nonzero from cimirror_all is the NORMAL way
+    #     a red job is reported, and as a bare simple command it would abort this script before
+    #     `rc=$?` ever ran, losing both the exit code and the tail below.
+    #   * `if`, not `[ -f ... ] && echo ...` -- on a GREEN run the file does not exist, the `&&` list
+    #     returns nonzero, and errexit would kill the script right before `exit "$rc"`, turning a
+    #     passing mirror into a nonzero exit.
+    # mirror-failed-job.txt is cleared first so a stale one from an earlier run in the same night
+    # cannot be reported against this one, and its two reader sentinels are handled by name
+    # (lib/cimirror.sh writes "(job-list-read-failure)" / "(empty-job-list)" there instead of a job).
+    mirror)     mkdir -p "$LOG_DIR"; ns_load_env
+                rm -f "$LOG_DIR/mirror-failed-job.txt"
+                if [ $# -ge 1 ]; then git -C "$REPO" checkout "$1"; fi
+                rc=0; cimirror_all "$LOG_DIR/mirror-manual.txt" || rc=$?
+                if [ -f "$LOG_DIR/mirror-failed-job.txt" ]; then
+                    failed_job="$(cat "$LOG_DIR/mirror-failed-job.txt")"
+                    case "$failed_job" in
+                        '(job-list-read-failure)')
+                            echo "mirror: could not read the job list from config/ci-mirror.toml — the harness is broken, not the branch" >&2 ;;
+                        '(empty-job-list)')
+                            echo "mirror: config/ci-mirror.toml yielded an EMPTY job list — the harness is broken, not the branch" >&2 ;;
+                        *)  echo "failed job: $failed_job" >&2 ;;
+                    esac
+                elif [ "$rc" -ne 0 ]; then
+                    # Should be unreachable: cimirror_all writes that file on every failure path.
+                    echo "mirror: rc=$rc but no failing job was recorded — see $LOG_DIR/mirror-manual.txt" >&2
+                fi
+                tail -40 "$LOG_DIR/mirror-manual.txt"
+                exit "$rc" ;;
     dataset-backfill) mkdir -p "$LOG_DIR"; dataset_backfill ;;
     *)          usage ;;
 esac

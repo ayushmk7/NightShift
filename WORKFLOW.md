@@ -79,19 +79,25 @@ flowchart TD
     subgraph S4["S4 · Verify gate · fail-closed · per queued branch"]
         direction TB
         SCOPE{"scope contained? · diff subset of theme files + fragment · no protected"}
-        CHK{"jac check ok?"}
-        TST{"jac test tests per pkg · one retry each"}
+        CHK{"jac check baseline-diff ok? · new errors vs main only"}
+        FAST{"CI mirror fast jobs ok? · fmt · check · jir · ~3s"}
+        TST{"mirrored CI suites per gated suite · baseline-diff · one retry each"}
         PC{"pre-commit ok? · fold self-mutation"}
+        CTRB{"CI mirror contribution ok? · AI co-author · no .py · bun lockstep · docs · fragment"}
         DISCARD["delete branch · ledger failed_verify++ · failed.tsv"]
         GREEN["green.tsv · record tests line · tune verify_estimate"]
         SCOPE -->|"no · possible injection"| DISCARD
         SCOPE -->|"yes"| CHK
         CHK -->|"no"| DISCARD
-        CHK -->|"yes"| TST
+        CHK -->|"yes"| FAST
+        FAST -->|"red · seconds, not 40min"| DISCARD
+        FAST -->|"green"| TST
         TST -->|"red x2"| DISCARD
         TST -->|"green"| PC
         PC -->|"red"| DISCARD
-        PC -->|"green"| GREEN
+        PC -->|"green"| CTRB
+        CTRB -->|"red"| DISCARD
+        CTRB -->|"green"| GREEN
     end
     GREEN --> S5
 
@@ -186,7 +192,7 @@ bash sequences processes; Jac owns every data and logic transformation. No Pytho
 ```mermaid
 flowchart LR
     subgraph ENTRY["bin"]
-        NS["nightshift.sh · run / dry-run / promote / discard / status"]
+        NS["nightshift.sh · run / dry-run / promote / discard / status / baseline / mirror"]
         TH["test-harness.sh"]
     end
     subgraph LIB["lib · bash stages"]
@@ -199,6 +205,7 @@ flowchart LR
         SH["ship.sh"]
         EM["email.sh"]
         PR2["promote.sh"]
+        CMR["cimirror.sh · runs config/ci-mirror.toml jobs"]
     end
     subgraph JAC["scripts · Jac helpers"]
         NL["nslib.jac · shared · fingerprint · globs · fragment map"]
@@ -217,12 +224,13 @@ flowchart LR
         SMTP["smtplib SSL"]
     end
 
-    NS --> CM & PF & SY & T1 & T2 & VF & SH & EM & PR2
+    NS --> CM & PF & SY & T1 & T2 & VF & SH & EM & PR2 & CMR
     PF --> CF & LG
     SY --> LG & GH
-    T1 --> JB & RD
+    T1 --> JB & RD & CMR
     T2 --> CC & PRz & SE & LG & RD
-    VF --> JB & CS & LG
+    VF --> JB & CS & LG & CMR
+    CMR --> JB
     SH --> RD & LG & GH
     EM --> SM & RD
     PR2 --> GH & LG & RD & CS & JB

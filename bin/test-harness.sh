@@ -166,4 +166,76 @@ case "$got" in
 esac
 echo "routing correct: byllm-only stays byllm, compiler tests reach compiler, mcp/fragments gate nothing"
 
+echo "== 8. S4 gate order: the cheap CI-mirror jobs must precede the expensive test suites =="
+# Ordering is a CORRECTNESS property here, not style. Get it backwards and every doomed branch pays
+# ~40min of test suites before a 0-second `jac fmt --check` rejects it -- silently expensive rather
+# than visibly broken, so nothing else in this file would ever notice.
+#
+# Anchored on the real CALL SITES, not on the "# 3." / "# 4." step comments and not on a marker
+# string planted for this test: a comment can be left behind when the code it labels moves, and a
+# planted marker can be moved without moving the code. `cimirror_job "$fastjob"`,
+# `for suite in $suites` and `cimirror_job contribution` ARE the stages, so they cannot drift from
+# what they assert about.
+#
+# gate_line demands EXACTLY ONE match. A pattern that finds nothing must FAIL, not return the empty
+# string -- otherwise a rename would leave this section comparing "" against "" and passing
+# vacuously. This plan has already shipped one regression test with exactly that bug (section 7's
+# route_probe, code review 2026-07-30), so gate_line's own failure mode is self-tested below before
+# any real assertion uses it.
+gate_line() {                 # gate_line <label> <ere> -> the single matching line number
+    local label=$1 pat=$2 hits n
+    hits="$(grep -nE -- "$pat" lib/verify.sh || true)"
+    case "$hits" in
+        "") fail "gate-order stage '$label' not found in lib/verify.sh (pattern: $pat) -- the ordering comparison would have been vacuous" ;;
+    esac
+    n="$(printf '%s\n' "$hits" | wc -l | tr -d ' ')"
+    case "$n" in
+        1) : ;;
+        *) fail "gate-order stage '$label' matched $n lines in lib/verify.sh; it must be unique or the ordering comparison is meaningless" ;;
+    esac
+    printf '%s\n' "$hits" | cut -d: -f1
+}
+# self-test: a stage that cannot exist must make gate_line exit nonzero, not print an empty string.
+if selftest="$(gate_line self-test 'ZZ_THIS_MARKER_MUST_NOT_EXIST_ZZ' 2>/dev/null)"; then
+    fail "gate_line succeeded for a stage that does not exist (printed '$selftest') -- section 8 cannot be trusted"
+fi
+
+fast_ln="$(gate_line "fast mirror jobs" 'cimirror_job "\$fastjob"')"
+suite_ln="$(gate_line "test suites" 'for suite in \$suites')"
+contrib_ln="$(gate_line "contribution job" 'cimirror_job contribution')"
+for n in "$fast_ln" "$suite_ln" "$contrib_ln"; do
+    case "$n" in
+        ''|*[!0-9]*) fail "gate_line produced a non-numeric line number ('$n') -- refusing to compare it" ;;
+    esac
+done
+[ "$fast_ln" -lt "$suite_ln" ] \
+    || fail "the fast CI-mirror jobs (line $fast_ln) must run BEFORE the test suites (line $suite_ln)"
+[ "$suite_ln" -lt "$contrib_ln" ] \
+    || fail "the contribution job (line $contrib_ln) must run AFTER the test suites (line $suite_ln)"
+
+# Ordering alone is not enough: emptying the fast job list would leave every assertion above green
+# while removing the whole point of the stage. Pin its membership, and pin that no ~40min suite has
+# been smuggled into the "fast" loop.
+fast_list="$(grep -E '^[[:space:]]*for fastjob in ' lib/verify.sh || true)"
+case "$fast_list" in
+    "") fail "could not find the fast-job loop header in lib/verify.sh" ;;
+esac
+for j in fmt check jir; do
+    case "$fast_list" in
+        *" $j"*) : ;;
+        *) fail "fast CI-mirror job '$j' is no longer in the pre-suite loop: $fast_list" ;;
+    esac
+done
+for j in byllm compiler runtime; do
+    case "$fast_list" in
+        *" $j"*) fail "suite job '$j' was added to the 'fast' pre-suite loop; it takes tens of minutes: $fast_list" ;;
+    esac
+done
+# fmt_autofix APPLIES formatting (`jac fmt --lintfix`, no --check). Running it inside a read-only
+# gate would silently rewrite the candidate branch while deciding whether to ship it.
+case "$fast_list" in
+    *fmt_autofix*) fail "fmt_autofix is a MUTATING apply step and must never run inside the S4 gate" ;;
+esac
+echo "gate order correct (fast mirror jobs $fast_ln < suites $suite_ln < contribution $contrib_ln)"
+
 echo "ALL HARNESS TESTS PASSED"
