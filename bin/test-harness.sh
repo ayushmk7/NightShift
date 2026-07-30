@@ -42,4 +42,22 @@ if printf 'M\tpkg/tests/fixtures/weird.jac\n' \
     fail "scope gate let a protected path through"
 fi
 
+echo "== 5. ci.yml drift tripwire =="
+CI_YML="$NS_ROOT/work/repo/.github/workflows/ci.yml"
+if [ -f "$CI_YML" ]; then
+    want="$(sed -n 's/^sha256 *= *"\(.*\)"/\1/p' config/ci-mirror.toml | head -1)"
+    have="$(shasum -a 256 "$CI_YML" | awk '{print $1}')"
+    if [ "$want" != "$have" ]; then
+        echo "FAIL: ci.yml changed upstream." >&2
+        echo "  recorded: $want" >&2
+        echo "  actual:   $have" >&2
+        echo "  Re-read the ci.yml diff, re-sync config/ci-mirror.toml commands, then update" >&2
+        echo "  the sha256. Do NOT just bump the hash." >&2
+        exit 1
+    fi
+    echo "ci.yml matches the recorded hash"
+else
+    echo "SKIP: no work/repo clone present"
+fi
+
 echo "ALL HARNESS TESTS PASSED"

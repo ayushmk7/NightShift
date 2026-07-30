@@ -1,0 +1,84 @@
+# config/ci-mirror.toml — local replica of the CI jobs a FORK PR cannot reach.
+#
+# Why this file exists: 13 of ~16 ci.yml jobs are `runs-on: blacksmith-4vcpu-ubuntu-2404`,
+# third-party runners attached to the upstream org. Confirmed empirically on 2026-07-30 against
+# ayushmk7/jaseci: ubuntu-latest/macos-latest jobs complete, every Blacksmith job sits `queued`
+# indefinitely (one observed stuck 2h). The Blacksmith subset is exactly what matters for
+# janitorial diffs, so fork CI is not a usable pre-PR gate and this replica is.
+#
+# ponytail: a hash tripwire, NOT a yaml interpreter. Parsing ci.yml at runtime to derive these
+#           commands would be a parser to maintain forever; a hash mismatch that forces a human
+#           to re-read the diff is three lines and cannot silently be wrong.
+
+[source]
+workflow = ".github/workflows/ci.yml"
+sha256   = "3f282983240facf169e109c0eea9cab4fe971515d84d9980c2c3373224497fda"
+
+[jobs.fmt]
+ci_job = "jac-check"
+# CI's EXACT invocation. Not `jac format .`, not `jac lint --fix`. The exclusion regex is copied
+# verbatim from ci.yml. A fork PR gets no autofix (the bot at ci.yml:303 is gated on same-repo
+# PRs), so it hits the hard failure at ci.yml:342 instead -- formatting must be right locally.
+commands = [
+  "git ls-files -z '*.jac' | grep -zv -E '(/fixtures/|^scripts/|/passes/native/llvm/|_err\\.jac$|_syntax_err\\.jac$)' | xargs -0 jac fmt --check --lintfix",
+]
+
+[jobs.jir]
+ci_job = "jac-check"
+# ci.yml:408-410. Deleting a symbol during a dead-code sweep can invalidate the generated
+# registry, which CI verifies. Without this, dead-code PRs fail CI on a file the agent
+# never touched.
+commands = ["jac gen-jir-registry --verify"]
+
+[jobs.byllm]
+ci_job = "test-packages-and-docs"
+# ci.yml:608, run from the repo root. Note ci.yml:946 runs the SAME tests serially
+# (JAC_TEST_JOBS=0) in test-pypi-build because "byllm tests share a SQLite mock-LLM cache".
+# We mirror the PR-path job (608) for fidelity; the flake that serialization exists to avoid is
+# absorbed by the union-of-two-runs baseline instead (see scripts/testgate.jac record-union).
+commands = ["jac test jac/jaclang/byllm/tests"]
+
+[jobs.compiler]
+ci_job = "test-compiler"
+# The second command is the cross-backend equivalence suite. The harness has NEVER gated it:
+# lib/verify.sh's pkg_test_raw ran only tests/ and tests/compiler.
+commands = [
+  "JAC_TEST_JOBS=auto jac test tests/compiler",
+  "JAC_TEST_JOBS=auto jac test jaclang/compiler/tests",
+]
+
+[jobs.runtime]
+ci_job = "test-runtime"
+commands = ["JAC_TEST_JOBS=auto jac test tests/ --ignore tests/compiler"]
+
+[jobs.contribution]
+ci_job = "contribution-checks"
+commands = ["scripts/check-release-notes.sh", "pre-commit run --all-files"]
+
+# Step 2b decision (whole-repo `jac check . --ignore ... --nowarn`, ci.yml:412-424):
+# NOT added as [jobs.check]. Ran CI's exact full-repo invocation against a clean `main` checkout
+# under work/repo/jac/zig-out/bin/jac on 2026-07-30:
+#
+#   IGNORE_ARGS="tests checker_*.jac *_err.jac $(grep -v '^#' .jacignore | grep -v '^[[:space:]]*$' | tr '\n' ' ')"
+#   jac check . --ignore $IGNORE_ARGS --nowarn
+#
+# Result: RED. 182 files already reported FAILED within the first ~12% of the traversal
+# (e.g. jac/jaclang/byllm/{cli,llm,mcp,mtir,parallel,schema,telemetry,tool_protocol,types,
+# visit_routing}.jac, jac/jaclang/cli/{ai_agent,banners,cli,console,help,registry}.jac,
+# jac/jaclang/compiler/passes/main/{type_checker_pass,mtir_gen_pass,pyast_load_pass}.impl.jac,
+# and more). The run was killed after this point rather than run to a natural exit: at the
+# observed rate a full traversal of the ~3000+ file corpus would take well over an hour, and it
+# cannot change the verdict -- `jac check`'s aggregate exit is nonzero the moment any file fails,
+# so the recorded exit code here is empirically certain to be nonzero even though the process
+# itself was terminated (SIGTERM) rather than left to report its own code.
+# lib/verify.sh's existing comment ("would trip the repo's broken test fixtures") no longer
+# describes the exact mechanism -- .jacignore already covers the old fixture problem -- but the
+# whole-repo check is independently red on main for a different, currently-unbaselined set of
+# files. Note also: several FAILED files above (e.g. jac/jaclang/byllm/cli.jac) are listed
+# verbatim in .jacignore yet still failed, meaning --ignore is not fully suppressing them the way
+# ci.yml's comment implies -- worth a closer look in a future task, but out of scope here since
+# it does not change the RED verdict. main's own CI run on this job is therefore not green
+# either, so per the brief's decision procedure this stays OUT of the mirror; Plan 3's CI
+# baseline-diff (checkgate.jac) remains the correct (cheaper, already-diff-aware) filter for this
+# job instead of a hard gate that would reject every branch on pre-existing breakage it never
+# touched.
