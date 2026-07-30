@@ -40,20 +40,25 @@
 
 ---
 
-### Task 1: Correct the stale repo facts
+### Task 1: Correct the stale repo facts and remove the package concept
 
-The target repo restructured. `jac-byllm` and `jac-scale` are gone as packages, upstream renamed, and the release-note path moved. Everything downstream reads these, so they go first.
+The target repo restructured. `jac-byllm` and `jac-scale` are gone as packages, upstream renamed, and the release-note path moved. Everything downstream reads these, so they go first. Package rotation dies in the same task rather than a later one, because deleting the `[rotation]` config table without deleting `selector.jac`'s `rotate` would leave the harness red — and the plan's Global Constraints forbid committing that.
 
 **Files:**
 - Modify: `scripts/nslib.jac:177-187` (replace `fragment_dir` + `release_fragment`)
 - Modify: `scripts/nslib.jac:195-201` (the negation-glob test, whose fixture path no longer exists)
-- Modify: `scripts/check_scope.jac:16` (import), `scripts/check_scope.jac:21` (call site)
-- Modify: `config/nightshift.toml` (`[repo].upstream`, `[protect].globs`)
+- Modify: `scripts/check_scope.jac:16` (import), `scripts/check_scope.jac:21` (call site), `:81-92` (test fixture)
+- Modify: `scripts/selector.jac` (lines 4, 8, 152, 203, 233, 253, 258-268, 273-276, 297-300)
+- Modify: `config/nightshift.toml` (`[repo].upstream`, delete `[rotation]`, `[protect].globs`)
+- Modify: `lib/common.sh:129-136` (delete `ns_audit_scope`), `lib/tier2.sh:37` (its one call site)
+- Modify: `bin/test-harness.sh:26-29` (golden replay drops the package argument)
+- Edit (untracked, gitignored): `state/state.json` (drop `next_package`)
 
 **Interfaces:**
 - Produces: `fragment_path(paths: list[str], kind: str) -> str` in `nslib.jac` — returns the fragment path for a change touching `jac/jaclang/**`, or `""` when no fragment is required. Replaces `release_fragment(pkg)` and `fragment_dir(pkg)`, both deleted.
 - Produces: `VALID_FRAGMENT_KINDS: list[str]` in `nslib.jac`.
-- Consumed by: `check_scope.jac` (Task 1), `lib/tier2.sh` fragment writing (Plan 2), `render_draft.jac` (Plan 3).
+- Produces: `selector.jac select` taking **7** argv (`select <config.toml> <ledger.jsonl> <state.json> <remaining_min> <repo_dir>`), and themes that no longer carry a `package` key. `selector.jac rotate` no longer exists.
+- Consumed by: `check_scope.jac` (this task), `lib/tier2.sh` (Task 3), `render_draft.jac` (Task 3).
 
 - [ ] **Step 1: Write the failing tests in `scripts/nslib.jac`**
 
@@ -199,30 +204,86 @@ globs = [
 ]
 ```
 
-- [ ] **Step 9: Delete `ns_audit_scope` from `lib/common.sh`**
+- [ ] **Step 9: Remove the package concept from `scripts/selector.jac`**
 
-Remove lines 129-136 entirely. It hardcodes the pre-restructure package geography and Task 2 replaces it with the shard registry. Nothing else may call it after this step; verify:
+Package rotation is gone with the `[rotation]` table, so `rotate` would now crash, and `theme["package"]` no longer has a meaning (a theme can span shards after Task 3). Four concrete edits:
+
+1. **`def select` (line 233):** delete the `package: str` parameter. Update the docstring at line 4 to `select <config.toml> <ledger.jsonl> <state.json> <remaining_min> <repo_dir>`.
+2. **`def pack_themes` (line 152):** delete the `package: str` parameter, and at line 203 delete the `"package": package,` entry from the theme dict. Update the call site at line 253 to drop the argument.
+3. **`def rotate` (lines 258-268), its dispatch (lines 297-298), and its usage line (line 8):** delete all three outright.
+4. **Dispatch for `select` (lines 273-276):** now 7 argv, not 8. Reindex:
+
+```jac
+    if len(args) == 7 and args[1] == "select" {
+        findings: list[dict] = parse_list(read_stdin());
+        print(json.dumps(select(findings, args[2], args[3], args[4], int(args[5]), args[6])));
+```
+
+Read lines 270-280 before editing to match the existing body's variable names and helper calls, and update the usage string at line 300. Fix any in-file test that passes a package positionally.
+
+```bash
+cd /Volumes/ExtremePro/JaseciLabs/NightShift && rm -rf .jac && jac test scripts/selector.jac
+```
+
+Expected: PASS.
+
+- [ ] **Step 10: Drop `next_package` from the runtime state**
+
+`state/` is gitignored and untracked, so this is a plain file edit with nothing to commit:
+
+```bash
+cd /Volumes/ExtremePro/JaseciLabs/NightShift
+printf '{\n  "last_jac_version": "0.16.1",\n  "verify_estimate_min": 1\n}\n' > state/state.json
+cat state/state.json
+```
+
+Expected: no `next_package` key.
+
+- [ ] **Step 11: Repair the golden replay in `bin/test-harness.sh`**
+
+`selector.jac select` no longer takes a package. Update both invocations (lines 26-29) by removing the `jac` argument:
+
+```bash
+jac run scripts/selector.jac select config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
+    < "$T/f.json" > "$T/s1.json"
+jac run scripts/selector.jac select config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
+    < "$T/f.json" > "$T/s2.json"
+cmp -s "$T/s1.json" "$T/s2.json" || fail "selector output not deterministic"
+```
+
+- [ ] **Step 12: Delete `ns_audit_scope` from `lib/common.sh`**
+
+Remove lines 129-136 entirely. It hardcodes the pre-restructure package geography and Task 2 replaces it with the shard registry.
+
+`lib/tier2.sh:37` still calls it, and `tier2.sh` is not rewritten until Task 3 — so to keep this commit green, also replace that one call site now with a literal whole-repo scope, which Task 3 then swaps for the per-shard scope:
+
+```bash
+        "pkg=$pkg" "scope=jac/jaclang/ and jac-mcp/" \
+```
+
+Then confirm no caller remains:
 
 ```bash
 cd /Volumes/ExtremePro/JaseciLabs/NightShift && grep -rn "ns_audit_scope" bin lib scripts prompts || echo "no callers remain"
 ```
 
-Expected: one hit in `lib/tier2.sh:37` (fixed in Task 3). Note it and continue.
+Expected: `no callers remain`.
 
-- [ ] **Step 10: Run the harness tests**
+- [ ] **Step 13: Run the harness tests — they must be fully green**
 
 ```bash
 cd /Volumes/ExtremePro/JaseciLabs/NightShift && bin/test-harness.sh
 ```
 
-Expected: section 3's golden replay may now fail, because `selector.jac select` is still called with a package argument. If it fails on anything other than the golden replay, stop and fix. The golden replay is repaired in Task 3.
+Expected: `ALL HARNESS TESTS PASSED`. This task must not leave the harness red; if section 3 still fails, the selector reindex in Step 9 is wrong.
 
-- [ ] **Step 11: Commit**
+- [ ] **Step 14: Commit**
 
 ```bash
 cd /Volumes/ExtremePro/JaseciLabs/NightShift
-git add scripts/nslib.jac scripts/check_scope.jac config/nightshift.toml lib/common.sh
-git commit -m "Correct stale target-repo facts after the upstream restructure
+git add scripts/nslib.jac scripts/check_scope.jac scripts/selector.jac \
+        config/nightshift.toml lib/common.sh lib/tier2.sh bin/test-harness.sh
+git commit -m "Correct stale target-repo facts and remove the package concept
 
 Upstream renamed to jaseci-labs/jac. jac-byllm and jac-scale no longer exist
 as packages; they are jac/jaclang/byllm and jac/jaclang/scale. Release-note
@@ -232,7 +293,12 @@ docs/** negation glob dead.
 Replaces release_fragment(pkg) and fragment_dir(pkg) with
 fragment_path(paths, kind), which returns \"\" when a change needs no fragment
 and clamps an invalid kind to refactor so a tampered theme cannot smuggle a
-filename past the regex CI enforces."
+filename past the regex CI enforces.
+
+Package rotation goes in the same commit rather than a later one: deleting the
+[rotation] table while selector.jac still read it would leave the harness red,
+and a theme can span shards once the audit is sharded, so theme[\"package\"] has
+no meaning either. selector.jac select now takes 7 argv and rotate is gone."
 ```
 
 ---
@@ -653,39 +719,9 @@ tier2_main() {
 }
 ```
 
-- [ ] **Step 8a: Remove the package concept from `scripts/selector.jac`**
+- [ ] **Step 8: Drop the package argument from `tier2_select` and `tier2_apply`**
 
-Package rotation is gone, so `rotate` would crash on the deleted `[rotation]` table and `theme["package"]` no longer has a meaning (a theme can now span shards). Four concrete edits:
-
-1. **`def select` (line 233):** delete the `package: str` parameter. Update the docstring at line 4 to `select <config.toml> <ledger.jsonl> <state.json> <remaining_min> <repo_dir>`.
-2. **`def pack_themes` (line 152):** delete the `package: str` parameter, and at line 203 delete the `"package": package,` entry from the theme dict. Update the call at line 253 to drop the argument.
-3. **`def rotate` (lines 258-268) and its dispatch (lines 297-298):** delete both outright. Also delete the usage line for `rotate` at line 8.
-4. **Dispatch for `select` (lines 273-276):** now takes 7 argv, not 8. Reindex:
-
-```jac
-    if len(args) == 7 and args[1] == "select" {
-        findings: list[dict] = parse_list(read_stdin());
-        print(json.dumps(select(findings, args[2], args[3], args[4], int(args[5]), args[6])));
-```
-
-Match the existing body's variable names and helper calls; read lines 270-280 before editing. Update the usage string at line 300 to match. Then remove `next_package` from `state/state.json`:
-
-```bash
-cd /Volumes/ExtremePro/JaseciLabs/NightShift
-jac run scripts/ledger.jac state-set next_package '' state/state.json 2>/dev/null \
-  || printf '{\n  "last_jac_version": "0.16.1",\n  "verify_estimate_min": 1\n}\n' > state/state.json
-cat state/state.json
-```
-
-Expected: no `next_package` key. Then run selector's own tests, fixing any that pass a package positionally:
-
-```bash
-rm -rf .jac && jac test scripts/selector.jac
-```
-
-Expected: PASS.
-
-- [ ] **Step 8b: Drop the package argument from `tier2_select` and `tier2_apply`**
+Task 1 already removed `package` from `selector.jac` itself (`select` now takes 7 argv, `rotate` is gone, themes carry no `package` key). This step updates the two bash callers.
 
 `tier2_select()`: delete `local pkg=$1` and remove `"$pkg"` from the `ns_jac selector select` call. `tier2_apply()`: delete `local pkg=$1`; the fragment and commit message need a package name, which no longer exists at theme level. Until Plan 2 introduces per-task fragment kinds, derive it from the theme's own files:
 
@@ -734,17 +770,11 @@ cd /Volumes/ExtremePro/JaseciLabs/NightShift && grep -o '{[a-z_]*}' prompts/audi
 
 Expected exactly: `{ponytail_mode}`, `{protect_globs}`, `{scope}`, `{shard}`.
 
-- [ ] **Step 10: Repair the golden replay in `bin/test-harness.sh`**
+- [ ] **Step 10: Add a merge determinism check to `bin/test-harness.sh`**
 
-`selector.jac select` no longer takes a package. Update both invocations (lines 26-29) by removing the `jac` argument, and add a merge determinism check:
+Task 1 already fixed the golden replay's `select` invocations. Append this new section after section 3:
 
 ```bash
-jac run scripts/selector.jac select config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
-    < "$T/f.json" > "$T/s1.json"
-jac run scripts/selector.jac select config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
-    < "$T/f.json" > "$T/s2.json"
-cmp -s "$T/s1.json" "$T/s2.json" || fail "selector output not deterministic"
-
 echo "== 3b. findings merge: dedupe on (file, rule), stable order =="
 cp "$T/f.json" "$T/f2.json"
 jac run scripts/parse_result.jac merge "$T/f.json" "$T/f2.json" > "$T/m.json"
@@ -752,7 +782,7 @@ jac run scripts/parse_result.jac merge "$T/f.json" "$T/f2.json" > "$T/m.json"
     || fail "merge failed to dedupe an identical findings array"
 ```
 
-If `selector.jac`'s `select` verb still requires the package positionally, change its signature there too and update its own in-file tests. Read `scripts/selector.jac` before editing; it is 427 lines and the package name may also feed theme construction.
+`selector.jac` needs no further change here — Task 1 already dropped its `package` parameter.
 
 - [ ] **Step 11: Run the full harness test suite**
 
@@ -1005,13 +1035,17 @@ cimirror_fmt_cmd() {
 }
 
 # Run one mirrored job. Repo dev binary first on PATH so `jac` means the target repo's jac.
+# Clean HOME per job: the bundled test runner's conftest import fails against a populated HOME.
+# It lives HERE, not in the caller, so `nightshift.sh mirror` gets it too -- a caller-side HOME
+# would silently omit it from the one path a human uses to debug a red branch.
 cimirror_job() {
-    local job=$1 out=$2 cmd rc=0 first_rc=0
+    local job=$1 out=$2 cmd rc=0 first_rc=0 H
+    H="$(mktemp -d)"
     ns_log MIRROR "job $job"
     while IFS= read -r cmd; do
         [ -n "$cmd" ] || continue
         printf '\n$ %s\n' "$cmd" >> "$out"
-        ( cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
+        ( cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" HOME="$H" \
             && eval "$cmd" ) >> "$out" 2>&1 || rc=$?
         if [ "$rc" -ne 0 ] && [ "$first_rc" -eq 0 ]; then
             first_rc=$rc
@@ -1266,10 +1300,10 @@ Replace `lib/verify.sh:13-25`:
 # Run one mirrored TEST suite's commands, combined output to <out>. The runner's own exit code
 # is ignored on purpose -- baseline failures are expected, and testgate.jac decides pass/fail on
 # NEW failures only. Suite names are mirror job names from config/ci-mirror.toml.
-# The bundled test runner needs a clean HOME or its conftest import fails.
+# cimirror_job supplies the clean HOME the bundled runner's conftest import needs.
 suite_test_raw() {
-    local suite=$1 out=$2 H; H="$(mktemp -d)"; : > "$out"
-    HOME="$H" cimirror_job "$suite" "$out" || true
+    local suite=$1 out=$2; : > "$out"
+    cimirror_job "$suite" "$out" || true
 }
 ```
 
@@ -1327,10 +1361,12 @@ baseline_main() {
 
 - [ ] **Step 8: Delete the stale baselines**
 
-They predate the restructure and name packages that no longer exist:
+They predate the restructure and name packages that no longer exist. `state/` is gitignored and nothing under it is tracked (`git ls-files state/` is empty), so this is a plain `rm` — `git rm` would fail:
 
 ```bash
-cd /Volumes/ExtremePro/JaseciLabs/NightShift && git rm state/test-baseline/jac.json state/test-baseline/jac-byllm.json
+cd /Volumes/ExtremePro/JaseciLabs/NightShift
+rm -f state/test-baseline/jac.json state/test-baseline/jac-byllm.json
+ls state/test-baseline/ 2>/dev/null || echo "(empty)"
 ```
 
 - [ ] **Step 9: Verify the routing logic without running the suites**
@@ -1385,7 +1421,7 @@ A large `flaky` count is the quantified version of the 07-21/07-23 failure mode 
 
 ```bash
 cd /Volumes/ExtremePro/JaseciLabs/NightShift
-git add lib/verify.sh scripts/testgate.jac state/test-baseline config/ci-mirror.toml
+git add lib/verify.sh scripts/testgate.jac config/ci-mirror.toml   # state/ is gitignored
 git commit -m "Drive the test gate from the CI mirror; baseline the union of two runs
 
 pkg_test_raw named packages that no longer exist and omitted the cross-backend
