@@ -20,7 +20,7 @@ ci_job = "jac-check"
 # verbatim from ci.yml. A fork PR gets no autofix (the bot at ci.yml:303 is gated on same-repo
 # PRs), so it hits the hard failure at ci.yml:342 instead -- formatting must be right locally.
 commands = [
-  "git ls-files -z '*.jac' | grep -zv -E '(/fixtures/|^scripts/|/passes/native/llvm/|_err\\.jac$|_syntax_err\\.jac$)' | xargs -0 jac fmt --check --lintfix",
+  "git ls-files -z '*.jac' | grep -zv -E '(/fixtures/|^scripts/|/passes/native/llvm/|_err\\.jac$|_syntax_err\\.jac$)' | xargs -0 --no-run-if-empty jac fmt --check --lintfix",
 ]
 
 [jobs.jir]
@@ -53,7 +53,68 @@ commands = ["JAC_TEST_JOBS=auto jac test tests/ --ignore tests/compiler"]
 
 [jobs.contribution]
 ci_job = "contribution-checks"
-commands = ["scripts/check-release-notes.sh", "pre-commit run --all-files"]
+# ci.yml:449-512, five real gates (checkout + "Set up jac" are infra, not gates):
+#   461-468 Block AI co-author attribution   470-479 Block Python files
+#   482-497 Check bun version lockstep       499-500 Validate Jac code blocks in docs corpus
+#   502-512 Check Release Notes Updated
+#
+# CORRECTED after code review 2026-07-30: the original commands list here
+# ("scripts/check-release-notes.sh", "pre-commit run --all-files") was wrong on two counts.
+# (1) `pre-commit run --all-files` is NOT part of this job at all -- pre-commit is run by the
+#     separate third-party pre-commit.ci service. work/repo/.pre-commit-config.yaml's own header:
+#     "Manifest for pre-commit.ci only ... Contributors do not install pre-commit locally ...
+#     jac formatting in CI is enforced by the Contribution Checks workflow's `jac fmt --check`
+#     gate." Its hooks are markdownlint-cli2 + an em-dash ban, nothing this job gates on. Removed.
+# (2) The other three real gates in this job (AI co-author, no-Python-files, bun/zig lockstep,
+#     docs-corpus validation) were simply missing. Added below, transcribed from ci.yml's actual
+#     step bodies rather than re-guessed.
+#
+# AI co-author check: CI's exact command is
+#   git log origin/${{ github.base_ref }}..HEAD --format='%b' | grep -iP '...'
+# `github.base_ref` only exists for a real PR event. Locally there is no PR object, so this
+# mirrors it as `git log main..HEAD` -- the commits unique to the current branch vs `main`,
+# which is exactly what CI's `origin/base..HEAD` log range means for a PR opened against main.
+# Nightshift IS an AI agent producing commits, so this is precisely the check most likely to
+# bite one of its own PRs -- it stays a hard gate, not a nice-to-have.
+#
+# Block Python files: CI diffs `origin/${{ github.base_ref }}...HEAD` (triple-dot, i.e. relative
+# to the merge-base). Mirrored the same way lib/verify.sh already diffs
+# ("$NS_REPO_DEFAULT_BRANCH...HEAD") for consistency: `main...HEAD`.
+#
+# `-P` -> `-E`: CI's runners are Linux/GNU grep, where `-P` (PCRE) works. This dev host's real
+# /usr/bin/grep is BSD grep with NO PCRE support at all -- `grep -P` hard-errors
+# ("invalid option -- P") the moment either command actually executes as a subprocess (verified:
+# the interactive tool shell here has a `grep` shell FUNCTION shimming in a bundled PCRE-capable
+# `ugrep`, but that function is not exported, so any `bash -c` child process -- which is how
+# Task 5/6 will actually invoke these command strings -- falls through to the real BSD binary).
+# `\b` word-boundaries are NOT a PCRE-only feature -- BSD grep supports them fine under `-E`, and
+# GNU grep treats `\b` as a GNU extension valid under `-E` too, not exclusively `-P`. So `-E`
+# reproduces CI's exact match semantics on Linux (verified: no lookaheads/backrefs in either
+# pattern, nothing `-E` can't express) while also being what actually runs on this host. Verified
+# directly (env -i PATH=/usr/bin:/bin, i.e. no shell shim): both patterns behave identically
+# under `-iE`/`-E` here to their documented `-iP`/`-P` CI behavior.
+#
+# Check Release Notes Updated: CI runs this with `env: CI: "true"` (ci.yml:507). Without CI=true,
+# scripts/check-release-notes.sh (line 16) takes its "local mode" branch and reads
+# `git diff --cached` -- against a committed tree (no staged files) that is always empty, so the
+# script hits its `[ -z "$CHANGED_FILES" ] && exit 0` early-out and silently passes regardless of
+# whether a fragment is actually missing. `CI=true` is required for this gate to gate anything.
+# KNOWN LIMITATION, measured 2026-07-30: even with CI=true, `bash scripts/check-release-notes.sh`
+# currently fails immediately on this dev host with "line 12: jac: unbound variable" -- the
+# script's `declare -A FOLDER_TO_FRAGMENTS=(...)` needs bash 4+ associative arrays, and this
+# host's only bash (both /bin/bash and `env bash`) is 3.2.57. This is a pre-existing defect in
+# the TARGET repo's own script (it assumes a bash newer than what CI's ubuntu runners are not the
+# only place this can run), not something introduced by this fix, and out of scope to patch here
+# (work/repo is upstream-tracked, not ours to edit). Whoever wires this command up (Task 5/6)
+# needs a bash >= 4 on PATH for this one command specifically, or the gate will hard-error before
+# it can ever pass or fail meaningfully.
+commands = [
+  "if git log main..HEAD --format='%b' | grep -iE 'co-authored-by:.*\\b(claude|anthropic|openai|copilot|composer|cursor|gpt|gemini|ai|bot)\\b'; then echo \"AI co-author attribution found in commit messages. Remove Co-Authored-By lines referencing AI tools.\"; exit 1; fi",
+  "if git diff --name-only --diff-filter=A main...HEAD | grep -E '\\.py$'; then echo \"New Python (.py) files detected in this PR. This codebase does not allow adding Python files.\"; exit 1; fi",
+  '''jac_ver=$(grep -oE 'glob BUN_VERSION = "[^"]+"' jac/jaclang/runtimelib/client/bun_installer.jac | grep -oE '"[^"]+"' | tr -d '"'); zig_ver=$(grep -oE 'const BUN_VERSION = "[^"]+"' jac/launcher/payload.zig | grep -oE '"[^"]+"' | tr -d '"'); if [ -z "$jac_ver" ] || [ -z "$zig_ver" ]; then echo "Could not read BUN_VERSION from both bun_installer.jac and payload.zig"; exit 1; fi; if [ "$jac_ver" != "$zig_ver" ]; then echo "BUN_VERSION mismatch: bun_installer.jac=$jac_ver vs payload.zig=$zig_ver"; exit 1; fi''',
+  "jac run scripts/validate_docs_code.jac",
+  "CI=true bash scripts/check-release-notes.sh",
+]
 
 # Step 2b decision (whole-repo `jac check . --ignore ... --nowarn`, ci.yml:412-424):
 # NOT added as [jobs.check]. Ran CI's exact full-repo invocation against a clean `main` checkout
