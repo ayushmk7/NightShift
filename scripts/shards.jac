@@ -5,7 +5,6 @@ LOC-balanced shards that are audited concurrently and merged into one selection.
 
 argv:
   list  <config.toml>          print one shard name per line, in config order
-  count <config.toml>          print the number of shards
   scope <name> <config.toml>   print the prompt-ready scope string for one shard
 """
 import sys;
@@ -36,12 +35,10 @@ with entry {
         for n in shard_names(load_config_toml(args[2])) {
             print(n);
         }
-    } elif cmd == "count" and len(args) == 3 {
-        print(len(shard_names(load_config_toml(args[2]))));
     } elif cmd == "scope" and len(args) == 4 {
         print(shard_scope(load_config_toml(args[3]), args[2]));
     } elif cmd != "" and cmd != "test" {
-        eprint("usage: jac run shards.jac list|count <config.toml>");
+        eprint("usage: jac run shards.jac list <config.toml>");
         eprint("       jac run shards.jac scope <name> <config.toml>");
     }
 }

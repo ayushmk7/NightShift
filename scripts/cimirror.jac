@@ -3,7 +3,6 @@
 argv:
   jobs <ci-mirror.toml>          print each GATE job name (mirrors a real ci.yml job), file order
   cmds <job> <ci-mirror.toml>    print that job's commands, one per line
-  hash <ci-mirror.toml>          print the recorded ci.yml sha256
 """
 import sys;
 import from nslib { eprint, load_config_toml, as_dict, as_list }
@@ -61,10 +60,8 @@ with entry {
         for c in job_cmds(load_config_toml(args[3]), args[2]) {
             print(c);
         }
-    } elif cmd == "hash" and len(args) == 3 {
-        print(str(load_config_toml(args[2])["source"]["sha256"]));
     } elif cmd != "" and cmd != "test" {
-        eprint("usage: jac run cimirror.jac jobs|hash <ci-mirror.toml>");
+        eprint("usage: jac run cimirror.jac jobs <ci-mirror.toml>");
         eprint("       jac run cimirror.jac cmds|testcmds <job> <ci-mirror.toml>");
     }
 }

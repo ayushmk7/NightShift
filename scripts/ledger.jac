@@ -204,7 +204,7 @@ test "state roundtrip" {
     }
     os.remove(path);
     state: dict = state_read(path);
-    state["next_package"] = "jac-byllm";
+    state["verify_estimate_min"] = 7;
     state_write(path, state);
-    assert state_read(path)["next_package"] == "jac-byllm";
+    assert state_read(path)["verify_estimate_min"] == 7;
 }

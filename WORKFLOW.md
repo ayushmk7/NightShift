@@ -1,8 +1,11 @@
 # Nightshift — Workflow
 
-End-to-end map of the harness. Reflects the corrected single-binary `jac test` model
-(docs v0.5). Stages `S0–S6` run nightly and unattended; `S7` is the human morning loop.
-See `docs/PRD.md`, `docs/TechnicalPRD.md`, and `docs/steps/` for detail.
+End-to-end map of the harness, current as of the v2 foundations work (2026-07-30): whole-repo
+sharded audit, and an S4 gate that runs a local replica of the CI jobs a fork PR cannot reach.
+Stages `S0–S6` run nightly and unattended; `S7` is the human morning loop.
+Current design: `docs/superpowers/specs/2026-07-30-nightshift-4task-design.md`; open items:
+`docs/superpowers/specs/2026-07-30-nightshift-followups.md`. `docs/PRD.md` and `docs/TechnicalPRD.md`
+are pre-restructure and superseded for S3 onward (they carry banners saying so).
 
 ## 1. Nightly pipeline (S0 → S6)
 
@@ -130,10 +133,9 @@ flowchart TD
 
     %% data stores
     LEDGER[("ledger.jsonl · fingerprint to status")]
-    STATE[("state.json · next_package · verify_estimate")]
+    STATE[("state.json · verify_estimate · last_jac_version")]
     DRAFTSB[("nightshift/drafts orphan branch · drafts/*.md")]
     PULL -.->|read| LEDGER
-    ROT -.->|advance| STATE
     SEL -.->|read| LEDGER
     FRAG -.->|write| LEDGER
     DISCARD -.->|write| LEDGER
@@ -174,7 +176,7 @@ stateDiagram-v2
     [*] --> new: audit surfaces it
     new --> in_theme: selected + applied
     new --> deferred: did not fit budget/clock
-    deferred --> in_theme: eligible next rotation
+    deferred --> in_theme: eligible on a later night
     in_theme --> drafted: S4 green then S5
     in_theme --> failed_verify: S4 red
     failed_verify --> in_theme: first failure · retry later
