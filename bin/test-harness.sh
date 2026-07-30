@@ -1179,11 +1179,217 @@ esac
 rm -rf .jac
 echo "ship path: an empty/garbled/failed gh result never becomes a shipped PR; the rename is kind-agnostic"
 
-# Sections 17-18 are RESERVED for Plan 3's remaining tasks (S1.6 inventory).
-# docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2 (task registry) and 15-18 to
-# Plan 3 (ship path); all four v2 plans independently claimed "section 11". Plan 4 owns 19-23. The
-# gap is deliberate — renumbering later would silently reorder the other two plans' tripwires into
-# someone else's range.
+echo "== 17. S1.6 inventory: an empty answer is not a failed query, and the re-gate never demotes =="
+# THE assertion this section exists for: `gh pr list` failing prints NOTHING, and "no open PRs" is a
+# perfectly normal answer -- so an unchecked reader failure reports a converged, empty inventory on
+# the night the token expires. That is the shape of six of the seven false greens this codebase has
+# already shipped, and today there are genuinely zero open PRs, so the empty path is the one that
+# actually runs every night. Driven with a fake gh; nothing here touches GitHub or work/repo.
+rm -rf .jac
+INV="$T/inv"; mkdir -p "$INV"
+cat > "$INV/fake-gh" <<EOF
+#!/bin/sh
+echo "GH \$*" >> "$INV/gh-calls.txt"
+case "\$1 \$2" in
+    "pr list") cat "$INV/pr-list.out"; exit "\$(cat "$INV/pr-list.rc")" ;;
+    "pr view") echo "{\"headRefOid\": \"\$(cat "$INV/sha-\$3")\"}" ;;
+    "api "*)   case "\$2" in
+                   *"/commits/main/"*) cat "$INV/checks-main.json" ;;
+                   *"/commits/aaa111/"*) cat "$INV/checks-green.json" ;;
+                   *) cat "$INV/checks-red.json" ;;
+               esac ;;
+esac
+exit 0
+EOF
+chmod +x "$INV/fake-gh"
+echo aaa111 > "$INV/sha-7301"; echo bbb222 > "$INV/sha-7302"
+inv_checks() {             # inv_checks <file> <name:status:conclusion> ...
+    local out=$1 first=1 spec; shift
+    printf '{"total_count": %d, "check_runs": [' "$#" > "$out"
+    for spec in "$@"; do
+        case "$first" in 0) printf ', ' >> "$out" ;; esac
+        first=0
+        printf '{"name": "%s", "status": "%s", "conclusion": "%s"}' \
+            "${spec%%:*}" "$(echo "$spec" | cut -d: -f2)" "${spec##*:}" >> "$out"
+    done
+    printf ']}\n' >> "$out"
+}
+inv_checks "$INV/checks-main.json"  build-jac:completed:success jac-check:completed:failure
+inv_checks "$INV/checks-green.json" build-jac:completed:success jac-check:completed:failure
+inv_checks "$INV/checks-red.json"   build-jac:completed:failure jac-check:completed:failure
+# THE point of the baseline diff, driven end to end: jac-check is red on the branch AND red on main,
+# so it must NOT red the PR; build-jac is red on the branch and green on main, so it must.
+
+inv_run() {                # inv_run  -> rc in $inv_rc; fresh $INV/log each time
+    rm -rf "$INV/log"; mkdir -p "$INV/log"; rm -f "$INV/gh-calls.txt" "$INV/ci-baseline.json"
+    inv_rc=0
+    (
+        . "$NS_ROOT/lib/common.sh"; ns_load_config
+        . "$NS_ROOT/lib/inventory.sh"
+        LOG_DIR="$INV/log"; CI_BASELINE="$INV/ci-baseline.json"
+        NS_PATHS_GH="$INV/fake-gh"; NS_REPO_UPSTREAM=o/r; NS_REPO_DEFAULT_BRANCH=main
+        # inventory_refresh is stubbed: it fetches/rebases/force-pushes a real branch, and section
+        # 17's subject is the LISTING and the VERDICT. Its own guards are driven further down.
+        inventory_refresh() { echo "REFRESH $*" >> "$INV/log/refresh.txt"; }
+        inventory_main
+    ) >/dev/null 2>&1 || inv_rc=$?
+}
+inv_saw() { grep -q "$1" "$INV/log/$2" 2>/dev/null; }
+
+# --- A. the query ran and there is genuinely nothing to do -----------------------------------
+echo '[]' > "$INV/pr-list.out"; echo 0 > "$INV/pr-list.rc"
+inv_run
+[ "$inv_rc" = 0 ] || fail "S1.6 exited $inv_rc on an empty PR list; an empty inventory is the normal state and must not end the night"
+inv_saw "the inventory ran and is empty" run.log \
+    || fail "S1.6 did not positively record that it QUERIED and got zero PRs: $(cat "$INV/log/run.log" 2>/dev/null)"
+inv_saw "did NOT run" warnings.txt \
+    && fail "S1.6 warned that the inventory did not run when the query succeeded and simply returned nothing"
+grep -q '^GH pr list' "$INV/gh-calls.txt" \
+    || fail "S1.6 reported an empty inventory without ever calling 'gh pr list' -- 'nothing to maintain' with no query behind it"
+[ -f "$INV/log/pr-inventory.jsonl" ] \
+    || fail "S1.6 did not create pr-inventory.jsonl; Plan 4's digest reader returns [] for a missing file, so the section would render empty forever with no error"
+
+# --- B. ...and a FAILED query must not look like A ---------------------------------------------
+: > "$INV/pr-list.out"; echo 4 > "$INV/pr-list.rc"
+inv_run
+[ "$inv_rc" = 0 ] || fail "S1.6 exited $inv_rc when gh failed; a night must survive an unreachable API"
+inv_saw "the inventory did NOT run tonight" warnings.txt \
+    || fail "a failed 'gh pr list' produced no warning; the digest would show a converged inventory on the night the token expired: $(cat "$INV/log/warnings.txt" 2>/dev/null)"
+inv_saw "This is not the same as having none" warnings.txt \
+    || fail "the failed-query warning does not say that it differs from having no PRs -- the distinction IS the assertion"
+# ...and it must be the READER's own rc that was noticed, named, in this warning. Mutation found
+# this the hard way: deleting inventory_main's `gh pr list` rc check entirely left the harness GREEN,
+# because the empty $raw then fails the cigate PROJECTION and that guard raises the same sentence.
+# Safe only by accident -- the day `cigate prs` tolerates empty input (returning []), an expired
+# token renders as a converged inventory with no warning at all. Pinning gh's own exit code is what
+# makes the first guard non-decorative.
+inv_saw "could not list open PRs (gh rc=4)" warnings.txt \
+    || fail "the failed query was not caught at the READER: nothing names gh's own rc=4, so the failure is being noticed downstream (by the projection) rather than where it happened: $(cat "$INV/log/warnings.txt" 2>/dev/null)"
+inv_saw "the inventory ran and is empty" run.log \
+    && fail "a failed 'gh pr list' was reported as an inventory that ran and found nothing -- the exact false green this section exists for"
+case "$(wc -l < "$INV/log/pr-inventory.jsonl" | tr -d ' ')" in
+    0) : ;;
+    *) fail "a failed query invented $(wc -l < "$INV/log/pr-inventory.jsonl") inventory row(s)" ;;
+esac
+
+# --- C. a real list: the nightshift/ prefix filter, and the baseline diff in both directions ---
+cat > "$INV/pr-list.out" <<'EOF'
+[{"number": 7301, "headRefName": "nightshift/2026-07-29/dead-code-pipe",
+  "url": "https://github.com/o/r/pull/7301", "title": "refactor: drop dead pipe"},
+ {"number": 7302, "headRefName": "nightshift/2026-07-28/coverage-cli",
+  "url": "https://github.com/o/r/pull/7302", "title": "test: cover the cli"},
+ {"number": 9999, "headRefName": "my-own-hand-written-branch",
+  "url": "https://github.com/o/r/pull/9999", "title": "a human's PR"}]
+EOF
+echo 0 > "$INV/pr-list.rc"
+inv_run
+[ "$inv_rc" = 0 ] || fail "S1.6 exited $inv_rc on a normal three-PR list"
+inv_saw "1 checks currently passing on main" run.log \
+    || fail "S1.6 recorded no CI baseline from a readable capture: $(cat "$INV/log/run.log")"
+# the prefix filter is a SAFETY invariant: everything downstream fetches, rebases and force-pushes
+# what this projection hands it, so a human's PR reaching the loop is a force-push of their branch.
+grep -q 'my-own-hand-written-branch' "$INV/log/refresh.txt" \
+    && fail "S1.6 handed a NON-nightshift branch to the refresh path; it would rebase and force-push a human's branch"
+grep -q '9999' "$INV/log/pr-inventory.jsonl" \
+    && fail "S1.6 recorded a verdict for a PR whose head is not under nightshift/"
+case "$(wc -l < "$INV/log/refresh.txt" | tr -d ' ')" in
+    2) : ;;
+    *) fail "S1.6 refreshed $(wc -l < "$INV/log/refresh.txt") branch(es); the two nightshift PRs and only those must be processed" ;;
+esac
+# #7301: build-jac green on the branch, jac-check red on BOTH -> green. This is the whole reason
+# cigate exists (upstream main is red on jac-check right now); a plain all-green gate would red it.
+grep -q '"number": 7301.*"action": "ci-green"' "$INV/log/pr-inventory.jsonl" \
+    || fail "PR #7301 was not scored ci-green: a check that is red on main too must not red the PR. Got: $(cat "$INV/log/pr-inventory.jsonl")"
+inv_saw 'CI RED' warnings.txt || fail "PR #7302 broke build-jac, which is green on main, and no CI-red warning was raised"
+grep -q '"number": 7302.*"action": "ci-red"' "$INV/log/pr-inventory.jsonl" \
+    || fail "PR #7302 was not scored ci-red: $(cat "$INV/log/pr-inventory.jsonl")"
+grep -q '"number": 7302.*build-jac' "$INV/log/pr-inventory.jsonl" \
+    || fail "the ci-red row does not name the failing check, so the digest tells the operator nothing actionable: $(cat "$INV/log/pr-inventory.jsonl")"
+grep -q '"number": 7302.*jac-check' "$INV/log/pr-inventory.jsonl" \
+    && fail "the ci-red row blames jac-check, which fails on main too -- the baseline diff is not being applied"
+
+# --- D. no usable baseline is "cannot gate", never "green" and never fatal ---------------------
+printf '{"total_count": 30, "check_runs": []}\n' > "$INV/checks-main.json"
+inv_run
+[ "$inv_rc" = 0 ] || fail "S1.6 exited $inv_rc when main's capture was unreadable; a baseline failure must never end the night"
+inv_saw "no PR will be CI-gated tonight" warnings.txt \
+    || fail "a truncated main capture produced no warning: $(cat "$INV/log/warnings.txt" 2>/dev/null)"
+grep -q '"action": "ci-nobaseline"' "$INV/log/pr-inventory.jsonl" \
+    || fail "with no baseline the PRs were not recorded as ungated; 'cannot gate' must never render as green: $(cat "$INV/log/pr-inventory.jsonl")"
+grep -q '"action": "ci-green"' "$INV/log/pr-inventory.jsonl" \
+    && fail "a PR was scored ci-green against a baseline that could not be recorded"
+inv_checks "$INV/checks-main.json" build-jac:completed:success jac-check:completed:failure
+
+# --- the re-gate must not burn attempt counters or delete an open PR's branch -----------------
+# [jobs.contribution] validates WHOLE-REPO state (validate_docs_code.jac's 852 blocks, the bun/zig
+# lockstep), so an upstream-introduced breakage reds every open PR identically. With the default
+# demote mode that bumps every finding's attempts and auto-rejects the whole ledger after two
+# nights, over something no branch caused. The inventory therefore re-gates in report mode.
+grep -qE 'verify_branch "\$branch" "\$theme" report' lib/inventory.sh \
+    || fail "lib/inventory.sh does not re-gate in report mode; an upstream breakage would auto-reject the entire ledger in two nights"
+# every verify_red call INSIDE verify_branch must forward the mode, or the mode is decorative
+vr_total="$(grep -c 'verify_red "\$branch"' lib/verify.sh || true)"
+vr_moded="$(grep -c 'verify_red "\$branch" .* "\$on_red"' lib/verify.sh || true)"
+case "$vr_total" in
+    0) fail "no verify_red call sites found in lib/verify.sh -- this assertion would be vacuous" ;;
+esac
+[ "$vr_total" = "$vr_moded" ] \
+    || fail "$((vr_total - vr_moded)) of $vr_total verify_red calls do not forward \$on_red; those paths still demote during an S1.6 re-gate"
+VR="$T/vr"; mkdir -p "$VR"
+vr_probe() {               # vr_probe <mode-args...>
+    rm -f "$VR/calls.txt"
+    vr_rc=0
+    ( . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/verify.sh"
+      LOG_DIR="$VR"; LEDGER="$VR/ledger.jsonl"; REPO="$VR/norepo"; NS_REPO_DEFAULT_BRANCH=main
+      ns_jac() { echo "LEDGER-WRITE $*" >> "$VR/calls.txt"; }
+      git() { echo "GIT $*" >> "$VR/calls.txt"; }
+      verify_red somebranch "a reason" "$@" ) >/dev/null 2>&1 || vr_rc=$?
+}
+vr_probe report
+[ "$vr_rc" = 0 ] || fail "verify_red in report mode returned $vr_rc; verify_branch's own 'return 1' is what marks the branch red"
+case "$(cat "$VR/calls.txt" 2>/dev/null || true)" in
+    *LEDGER-WRITE*) fail "verify_red in report mode still wrote to the ledger -- attempts would be burned by every S1.6 re-gate" ;;
+esac
+case "$(cat "$VR/calls.txt" 2>/dev/null || true)" in
+    *"branch -D"*) fail "verify_red in report mode still deleted the branch -- an open PR's head would vanish" ;;
+esac
+grep -q 'somebranch' "$VR/failed.tsv" \
+    || fail "verify_red in report mode recorded nothing in failed.tsv; a silent red is worse than a demoting one"
+# ...and demote mode must still do both, or the guard has simply disabled the S4 gate
+vr_probe
+case "$(cat "$VR/calls.txt" 2>/dev/null || true)" in
+    *LEDGER-WRITE*) : ;;
+    *) fail "verify_red in the DEFAULT mode no longer demotes -- the S4 gate has been silently disabled" ;;
+esac
+case "$(cat "$VR/calls.txt" 2>/dev/null || true)" in
+    *"branch -D"*) : ;;
+    *) fail "verify_red in the DEFAULT mode no longer deletes the red branch" ;;
+esac
+
+# The inventory never force-pushes bare. COMMENTS STRIPPED FIRST, and the bare form asserted absent
+# as well as the leased form present: mutation found that the plain `grep -q force-with-lease` stayed
+# green after the actual push was changed to `--force`, because this file's header explains in prose
+# why the push is leased. `--force-with-lease` cannot match `--force([^-]|$)`, so the two checks do
+# not cancel. (ns_git_push refuses a bare --force at runtime, but that refusal is an ns_die: S1.6
+# runs before all new work, so it would end the night rather than skip a push.)
+inv_code="$(grep -vE '^[[:space:]]*#' lib/inventory.sh)"
+printf '%s\n' "$inv_code" | grep -q -- '--force-with-lease' \
+    || fail "lib/inventory.sh does not push a rebased branch with --force-with-lease (checked against the CODE, not the comments)"
+printf '%s\n' "$inv_code" | grep -qE -- '--force([^-]|$)' \
+    && fail "lib/inventory.sh pushes with a BARE --force; ns_git_push ns_dies on it, so every night would end at S1.6 before any new work"
+grep -q 'cigate prs "nightshift/"' lib/inventory.sh \
+    || fail "lib/inventory.sh no longer filters PR heads to nightshift/ -- it would rebase and force-push a human's branch"
+# a rebase conflict is REPORTED, never resolved and never forced
+grep -q 'git rebase --abort' lib/inventory.sh \
+    || fail "lib/inventory.sh does not abort a conflicting rebase; work/repo would be left mid-rebase for every later stage"
+case "$(grep -vE '^[[:space:]]*#' lib/inventory.sh | grep -cE 'rebase.*(--continue|-Xours|-Xtheirs|--strategy)' || true)" in
+    0) : ;;
+    *) fail "lib/inventory.sh tries to RESOLVE a rebase conflict; a conflict is reported and left for a human, never merged by the harness" ;;
+esac
+rm -rf .jac
+echo "S1.6: an empty answer is distinguishable from a failed query; heads filtered; re-gate report-only; lease-only force"
+
+# Section 18 lands with Task 8 (wiring S1.6 into the night).
 
 echo "== 19. the digest's transport guards: receipt required, credentials scrubbed =="
 # scripts/sendmail.jac's own tests cover the two pure functions (section 1 runs them). What is NOT

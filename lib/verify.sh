@@ -270,7 +270,15 @@ verify_main() {
 # section 8 asserts that ordering, because getting it backwards is silently expensive rather than
 # visibly broken.
 verify_branch() {
-    local branch=$1 theme=$2 t0 t1
+    # on_red: `demote` (default) is the S4 behavior -- a red branch is failed_verify'd (attempts++,
+    # auto-rejected at 2) and deleted. `report` is for S1.6's re-gate of an ALREADY-OPEN PR, where
+    # the branch is upstream and the red may not be its fault at all: [jobs.contribution] validates
+    # whole-repo state (validate_docs_code.jac's 852 blocks, the bun/zig BUN_VERSION lockstep), so
+    # an upstream-introduced breakage reds every open PR identically and would auto-reject the
+    # entire ledger in two nights over something no branch caused. Passed EXPLICITLY to every
+    # verify_red below rather than read out of dynamic scope, because bash's dynamic scoping would
+    # make this work by accident and then break silently the day a call site moves.
+    local branch=$1 theme=$2 on_red="${3:-demote}" t0 t1
     t0="$(date +%s)"
     cd "$REPO"
     # `|| ns_die`, NOT bare. verify_branch is only ever invoked as an `if` CONDITION
@@ -294,7 +302,7 @@ verify_branch() {
         btask="$(ns_task_of_branch "$branch")" || ns_die "$EX_BUG" "cannot derive a task from branch '$branch': its slug matches no name in [tasks.*]. Refusing to gate it -- with no task there is no permission set to apply, and defaulting to one would either reject every coverage branch or hand every branch the coverage exemption."
         if ! git diff --name-status "$NS_REPO_DEFAULT_BRANCH...HEAD" \
                 | ns_jac check_scope check "$theme" "$CONFIG" "$btask" > "$LOG_DIR/scope-violations.txt"; then
-            verify_red "$branch" "scope violation (possible prompt injection): $(head -3 "$LOG_DIR/scope-violations.txt" | tr '\n' ' ')"
+            verify_red "$branch" "scope violation (possible prompt injection): $(head -3 "$LOG_DIR/scope-violations.txt" | tr '\n' ' ')" "$on_red"
             return 1
         fi
 
@@ -317,7 +325,7 @@ verify_branch() {
             git -C "$REPO" show "$NS_REPO_DEFAULT_BRANCH:$tw_f" > "$tw_old" \
                 || ns_die "$EX_BUG" "git show $NS_REPO_DEFAULT_BRANCH:$tw_f failed; the test-weakening guard cannot compare what it cannot read, and skipping it silently is how a weakened test ships."
             if ! ns_jac check_scope weakened "$tw_f" "$tw_old" "$REPO/$tw_f" >> "$LOG_DIR/test-weakening.txt"; then
-                verify_red "$branch" "test weakened: $(grep VIOLATION "$LOG_DIR/test-weakening.txt" | head -2 | tr '\n' ' ')"
+                verify_red "$branch" "test weakened: $(grep VIOLATION "$LOG_DIR/test-weakening.txt" | head -2 | tr '\n' ' ')" "$on_red"
                 return 1
             fi
             tw_checked=$((tw_checked + 1))
@@ -391,7 +399,7 @@ verify_branch() {
         assert_check_ran "$branch" "$br" "branch"
         case "$main_jac" in "") : ;; *) assert_check_ran "$branch" "$mr" "main" ;; esac
         if ! ns_jac checkgate gate "$mr" "$br"; then
-            verify_red "$branch" "jac check: new type errors vs main (see $(basename "$br"))"
+            verify_red "$branch" "jac check: new type errors vs main (see $(basename "$br"))" "$on_red"
             return 1
         fi
     fi
@@ -439,7 +447,7 @@ verify_branch() {
             0) : ;;
             "$EX_MIRROR_READ")
                 ns_die "$EX_BUG" "CI mirror job '$fastjob' returned $EX_MIRROR_READ: either config/ci-mirror.toml could not be read, or the job could not compute a merge-base against '$NS_REPO_DEFAULT_BRANCH'. Both are harness faults that would fail identically for every queued branch, so $branch is not being blamed for it (see $(basename "$mrr"))." ;;
-            *)  verify_red "$branch" "CI mirror job '$fastjob' red (see $(basename "$mrr"))"
+            *)  verify_red "$branch" "CI mirror job '$fastjob' red (see $(basename "$mrr"))" "$on_red"
                 return 1 ;;
         esac
     done
@@ -506,7 +514,7 @@ verify_branch() {
                 continue
             fi
             if [ "$rc" -ne 0 ]; then
-                verify_red "$branch" "$suite: new test failures vs baseline (2 runs; see $(basename "$raw"))"
+                verify_red "$branch" "$suite: new test failures vs baseline (2 runs; see $(basename "$raw"))" "$on_red"
                 return 1
             fi
         fi
@@ -534,7 +542,7 @@ verify_branch() {
             assert_suite_ran "$suite" "$raw" "$srr" "collection retry"
             ns_jac testgate collection-check "$suite" "$raw" "$BASELINE_DIR"; rc=$?
             if [ "$rc" -eq 1 ]; then
-                verify_red "$branch" "$suite: collected far fewer tests than the baseline on 2 runs — the suite did not run to completion, so its unreached tests cannot be read as passing (check the branch for an import error, or the environment for missing suite dependencies; see $(basename "$raw"))"
+                verify_red "$branch" "$suite: collected far fewer tests than the baseline on 2 runs — the suite did not run to completion, so its unreached tests cannot be read as passing (check the branch for an import error, or the environment for missing suite dependencies; see $(basename "$raw"))" "$on_red"
                 return 1
             fi
         fi
@@ -558,7 +566,7 @@ verify_branch() {
         git add -A
         git diff --cached --quiet || git commit -m "style: pre-commit autofix (nightshift)"
         if ! ns_precommit run --all-files; then
-            verify_red "$branch" "pre-commit red"
+            verify_red "$branch" "pre-commit red" "$on_red"
             return 1
         fi
     fi
@@ -620,7 +628,7 @@ verify_branch() {
                 *validate_docs_code*|*BUN_VERSION*)
                     ns_warn "$(basename "$branch"): the contribution job failed on a WHOLE-REPO check, not a branch-scoped one ($CIMIRROR_FAILED_CMD). If every branch reds here tonight the cause is upstream, not the branches — verify it against main before letting a second night auto-reject their findings." ;;
             esac
-            verify_red "$branch" "CI mirror job 'contribution' red (see $(basename "$cj"))"
+            verify_red "$branch" "CI mirror job 'contribution' red (see $(basename "$cj"))" "$on_red"
             return 1 ;;
     esac
 
@@ -689,8 +697,17 @@ verify_branch() {
 }
 
 verify_red() {
-    local branch=$1 why=$2 fp why_sane
+    local branch=$1 why=$2 on_red="${3:-demote}" fp why_sane
     ns_fail "$branch" "$why"
+    case "$on_red" in
+        report)
+            # S1.6's re-gate of an already-open PR. No ledger write (attempts must not move -- an
+            # upstream-introduced red would otherwise auto-reject every finding in the ledger after
+            # two nights) and no branch delete (the branch is an open PR's head upstream; deleting
+            # it locally is pointless and deleting it at all would orphan the PR).
+            ns_log S1.6 "$branch: gate red, reported only — no attempt counter moved, branch kept"
+            return 0 ;;
+    esac
     # reason goes into a JSON literal: strip the two characters that could break it
     why_sane="$(printf '%s' "$why" | tr -d '"\\')"
     # findings on this branch become failed_verify (attempts++; auto-rejected after 2, TPRD S3-B)
