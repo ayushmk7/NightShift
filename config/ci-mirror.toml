@@ -12,12 +12,28 @@
 
 [source]
 workflow = ".github/workflows/ci.yml"
-sha256   = "3f282983240facf169e109c0eea9cab4fe971515d84d9980c2c3373224497fda"
+sha256   = "8b8d9efcfbb1f298c5e32b4518a434f0dfc5bb370c2fdff17d43ca8a39f4f4e8"
+# RE-SYNCED 2026-07-30 after the post-reset upstream pull moved work/repo from bf505dc09 to
+# e61124559. Two commits touched ci.yml: 203d9162d ("ci: reuse the build-jac artifact instead of
+# rebuilding per job", #7796) and e61124559 ("test(scale): testing-trophy migration", #7628). The
+# whole diff was re-read line by line; NO mirrored command string changed, so `commands` below are
+# untouched. What did change, and why none of it moves this mirror:
+#   - Most Linux jobs now `download-artifact` the jac binary instead of running ./.github/actions/
+#     setup-jac. Pure infra: the binary the job then runs is the same one, and locally the mirror
+#     already uses $NS_PATHS_JAC_REPO. jac-check and contribution-checks -- the two jobs three of
+#     the six entries below transcribe -- still run setup-jac, unchanged.
+#   - test-scale-k8s collapsed its two-leg matrix into one job. Not mirrored (no [jobs.scale]).
+#   - test-scale gained a root-level scale-test step (ci.yml:856-865). Also not mirrored -- see the
+#     scale gap noted at the bottom of this file.
+#   - test-pypi-build DELETED its byllm re-run and the byllm dep install that fed it. That made a
+#     claim in [jobs.byllm]'s note below factually false; it is corrected there rather than left to
+#     mislead the next reader.
+# Every `ci.yml:NNN` citation in this file was re-anchored to e61124559 in the same pass.
 
 [jobs.fmt]
 ci_job = "jac-check"
-# CI's EXACT invocation for a PULL REQUEST event (ci.yml:279-295, :326-345) -- NOT the `else`
-# whole-repo sweep at ci.yml:350. Nightshift only ever opens PRs (never pushes to the default
+# CI's EXACT invocation for a PULL REQUEST event (ci.yml:286-305, :336-352) -- NOT the `else`
+# whole-repo sweep at ci.yml:358. Nightshift only ever opens PRs (never pushes to the default
 # branch upstream), so `github.event_name == 'pull_request'` is always true for it, and ci.yml's
 # own "Determine changed .jac files" step always takes the `mode=scoped` branch for it. The
 # scoped step's `origin/${{ github.base_ref }}` merge-base is mirrored locally as
@@ -29,10 +45,10 @@ ci_job = "jac-check"
 # upstream CI logs (a cross-repo PR's `jac-check` job log literally prints `mode=scoped` and then
 # diffs only the PR's own changed .jac files). `jac format .` / `jac lint --fix` are NOT this
 # tool: they were removed by CLI cleanup #7255. The exclusion regex is copied verbatim from the
-# scoped branch (ci.yml:339); this branch does NOT have the whole-repo branch's extra
+# scoped branch (ci.yml:346); this branch does NOT have the whole-repo branch's extra
 # `_syntax_err\.jac$` alternative, but that alternative was already redundant there -- every
 # `_syntax_err.jac` filename also ends in `_err.jac`, so `_err\.jac$` alone matches it too. Preserves
-# CI's exact "no formattable files changed -> skip cleanly, exit 0" behavior (ci.yml:333-343),
+# CI's exact "no formattable files changed -> skip cleanly, exit 0" behavior (ci.yml:341-350),
 # collapsed into one check since an empty diff and an all-excluded diff both reduce to the same
 # empty $FILES here. This is now the ONLY fmt entry: tier-1's apply counterpart was retired with the
 # stage, so nothing here can rewrite the branch it is judging (pinned by test-harness.sh section 6).
@@ -44,7 +60,7 @@ ci_job = "jac-check"
 # changed" skip. Reproduced: `NS_REPO_DEFAULT_BRANCH=nosuchbranch` or an unset
 # `NS_REPO_DEFAULT_BRANCH` both printed "No formattable .jac files changed; skipping format
 # check." and returned rc=0 -- a hard-broken gate reporting green. ci.yml itself cannot do this:
-# its own `BASE="$(git merge-base ...)"` (ci.yml:289) runs unguarded under `set -euo pipefail`, so
+# its own `BASE="$(git merge-base ...)"` (ci.yml:296) runs unguarded under `set -euo pipefail`, so
 # a real CI job just fails outright. Fixed by computing BASE as its own statement with an explicit
 # `|| { ...; exit 70; }` failure path -- `70` matches lib/common.sh's EX_BUG convention for "the
 # harness itself is broken", not "the branch under test is unformatted" -- and scoping `|| true`
@@ -55,16 +71,16 @@ commands = [
 
 [jobs.check]
 ci_job = "jac-check"
-# ci.yml:412-424, "Run jac check (using .jacignore)" -- has NO `continue-on-error`, unlike the fmt
-# step above (:71 `continue-on-error: true`), so a real CI run fails the job immediately on a
+# ci.yml:419-432, "Run jac check (using .jacignore)" -- has NO `continue-on-error`, unlike the fmt
+# step above (:338 `continue-on-error: true`), so a real CI run fails the job immediately on a
 # nonzero exit here; there is no separate "was it clean" gate to defer to. Task 4 originally
-# measured only the `else` whole-repo branch (ci.yml:423, `jac check . --ignore ... --nowarn`) and
+# measured only the `else` whole-repo branch (ci.yml:430, `jac check . --ignore ... --nowarn`) and
 # recorded it RED and >1hr (see the now-superseded decision note that followed this file, deleted
 # below) -- but that is the PUSH-event branch, and Nightshift only ever opens PRs, so the branch
-# that actually gates it is the scoped one at ci.yml:421:
+# that actually gates it is the scoped one at ci.yml:428:
 # `jac check $(cat changed-jac.txt) --ignore $IGNORE_ARGS --nowarn`.
 #
-# This IS a literal transcription of ci.yml:421 (IGNORE_ARGS built exactly as ci.yml:415, passed
+# This IS a literal transcription of ci.yml:428 (IGNORE_ARGS built exactly as ci.yml:422, passed
 # unquoted to `--ignore` exactly as CI does). A code-review round on 2026-07-30 briefly replaced
 # this with a Jac-side pre-filter (scripts/cimirror.jac's since-deleted filter_survivors),
 # diagnosing `jac check --ignore`'s ~570-value .jacignore list as silently broken past ~100-150
@@ -99,23 +115,27 @@ commands = [
 
 [jobs.jir]
 ci_job = "jac-check"
-# ci.yml:408-410. Deleting a symbol during a dead-code sweep can invalidate the generated
+# ci.yml:415-417. Deleting a symbol during a dead-code sweep can invalidate the generated
 # registry, which CI verifies. Without this, dead-code PRs fail CI on a file the agent
 # never touched.
 commands = ["jac gen-jir-registry --verify"]
 
 [jobs.byllm]
 ci_job = "test-packages-and-docs"
-# ci.yml:608, run from the repo root. Note ci.yml:946 runs the SAME tests serially
-# (JAC_TEST_JOBS=0) in test-pypi-build because "byllm tests share a SQLite mock-LLM cache".
-# We mirror the PR-path job (608) for fidelity; the flake that serialization exists to avoid is
-# absorbed by the union-of-two-runs baseline instead (see scripts/testgate.jac record-union).
+# ci.yml:645, run from the repo root. This is now the ONLY place upstream runs the byllm suite.
+# CORRECTED 2026-07-30 (ci.yml re-sync at e61124559): the note here used to say test-pypi-build
+# also ran the SAME tests serially (JAC_TEST_JOBS=0) "because byllm tests share a SQLite mock-LLM
+# cache", and offered that second run as part of why the flake is tolerable. #7628 DELETED that
+# step and its dep install ("test_byllm.jac is deliberately NOT re-run here"), so the second run no
+# longer exists and citing it would overstate upstream's coverage. The flake that serialization
+# guarded against is absorbed by the union-of-two-runs baseline instead (scripts/testgate.jac
+# record-union), which never depended on the pypi job.
 #
 # No `cd` prefix here, unlike [jobs.compiler]/[jobs.runtime]: test-packages-and-docs declares no
 # `working-directory`, so ci.yml runs this from the repo ROOT, which is where cimirror_job already
 # runs it. Verified 2026-07-30: 219 items collected from the root.
 #
-# The FIRST command is ci.yml:598-603's dependency install, and it is not optional here. Those four
+# The FIRST command is ci.yml:634-640's dependency install, and it is not optional here. Those four
 # packages live in the jac GLOBAL env at
 # $HOME/.cache/jac/rt/<hash>/python/lib/python3.14/site-packages, which is HOME-derived -- so
 # cimirror_job's clean $LOG_DIR/mirror-home strips them. Measured 2026-07-30, same command, same
@@ -137,9 +157,9 @@ ci_job = "test-packages-and-docs"
 #
 # Two things from the same ci.yml job are deliberately NOT transcribed, both checked rather than
 # assumed:
-#   ci.yml:605 `TEST_ENV=true` is VESTIGIAL -- `grep -rn TEST_ENV` across the whole checkout hits
-#     only ci.yml:563 and :605. Nothing reads it. Adding it would be cargo cult.
-#   ci.yml:610-611's docs-corpus step (jac/tests/cli/test_docs_content.jac, test_guide_docs.jac) is
+#   ci.yml:642 `TEST_ENV=true` is VESTIGIAL -- `grep -rn TEST_ENV` across the whole checkout hits
+#     only ci.yml:590 and :642. Nothing reads it. Adding it would be cargo cult.
+#   ci.yml:647-648's docs-corpus step (jac/tests/cli/test_docs_content.jac, test_guide_docs.jac) is
 #     ALREADY COVERED: both files live under jac/tests/, which [jobs.runtime] collects wholesale.
 #     Duplicating them here would just run them twice.
 commands = [
@@ -153,7 +173,7 @@ ci_job = "test-compiler"
 # Task 6: lib/verify.sh's since-replaced pkg_test_raw ran only tests/ and tests/compiler.
 #
 # `cd jac && ` IS REQUIRED AND LOAD-BEARING -- do not "simplify" it away. Both ci.yml steps that
-# these mirror (:181-193, :195-214) declare `working-directory: jac` (:182, :196), so their paths are relative
+# these mirror (:188-201, :202-224) declare `working-directory: jac` (:189, :203), so their paths are relative
 # to $REPO/jac, NOT to the repo root. lib/cimirror.sh's cimirror_job evals every command from
 # `cd "$REPO"` (the root), which is correct for every OTHER job here (jac-check, contribution-checks
 # and test-packages-and-docs all run at the root in ci.yml) but wrong for these two and for
@@ -176,8 +196,8 @@ ci_job = "test-compiler"
 # lib/verify.sh's assert_suite_ran is the belt to this braces, on BOTH the baseline and the branch
 # path: it refuses to let a capture with the wrong number of runner sessions be scored at all, so a
 # regression here fails loudly instead of silently passing every branch.
-# `JAC_NO_DEV_SOURCE=""` on the SECOND command only, mirroring ci.yml:202-203's step-level `env:`.
-# ci.yml:196-201 explains why: the equivalence suite's cross-module tests build fixture paths under
+# `JAC_NO_DEV_SOURCE=""` on the SECOND command only, mirroring ci.yml:209-210's step-level `env:`.
+# ci.yml:204-208 explains why: the equivalence suite's cross-module tests build fixture paths under
 # jac/tests/ from jaclang.__file__, which only resolve in the CHECKOUT, not in the binary's bundled
 # site copy -- so that one step is deliberately forced back through the checkout's
 # `[dev] jaclang_source` loop. Harmless on this host today (the repo binary already reports
@@ -186,8 +206,8 @@ ci_job = "test-compiler"
 # fail on unresolvable fixtures. Explicit beats inherited.
 #
 # NOT transcribed from these two ci.yml jobs, recorded so nobody has to rediscover it: the
-# `zig build -Dno-ninja vendor-musl` step (ci.yml:174-179, :242-247) and test-runtime's Node/Bun
-# setup (:236-241). Whatever those enable is simply absent locally, so any test depending on them
+# `zig build -Dno-ninja vendor-musl` step (ci.yml:182-187, :251-256) and test-runtime's Node/Bun
+# setup (:240-245). Whatever those enable is simply absent locally, so any test depending on them
 # fails identically on main and on the branch -- it lands in the baseline and is subtracted out.
 # That makes the local gate PERMISSIVE on those tests, never falsely red; real CI remains the
 # authority. Worth revisiting only if the baseline turns out to be dominated by them.
@@ -198,17 +218,17 @@ commands = [
 
 [jobs.runtime]
 ci_job = "test-runtime"
-# `cd jac && ` for the same reason as [jobs.compiler] above: ci.yml:250-263 declares
-# `working-directory: jac` (:251). From the repo root this command collected zero tests and reported
+# `cd jac && ` for the same reason as [jobs.compiler] above: ci.yml:257-273 declares
+# `working-directory: jac` (:258). From the repo root this command collected zero tests and reported
 # "File not found: 'tests/'"; from jac/ it collects 1852.
 commands = ["cd jac && JAC_TEST_JOBS=auto jac test tests/ --ignore tests/compiler"]
 
 [jobs.contribution]
 ci_job = "contribution-checks"
-# ci.yml:449-512, five real gates (checkout + "Set up jac" are infra, not gates):
-#   461-468 Block AI co-author attribution   470-479 Block Python files
-#   482-497 Check bun version lockstep       499-500 Validate Jac code blocks in docs corpus
-#   502-512 Check Release Notes Updated
+# ci.yml:456-519, five real gates (checkout + "Set up jac" are infra, not gates):
+#   468-476 Block AI co-author attribution   477-488 Block Python files
+#   489-502 Check bun version lockstep       506-507 Validate Jac code blocks in docs corpus
+#   509-519 Check Release Notes Updated
 #
 # CORRECTED after code review 2026-07-30: the original commands list here
 # ("scripts/check-release-notes.sh", "pre-commit run --all-files") was wrong on two counts.
@@ -254,7 +274,7 @@ ci_job = "contribution-checks"
 # under `-iE`/`-E` here to their documented `-iP`/`-P` CI behavior.
 #
 # Check Release Notes Updated: CI's ACTUAL command is `bash scripts/check-release-notes.sh` with
-# `env: CI: "true"` (ci.yml:502-512). That command CANNOT run on this host: the script's line
+# `env: CI: "true"` (ci.yml:509-519). That command CANNOT run on this host: the script's line
 # 12 `declare -A FOLDER_TO_FRAGMENTS=(...)` needs bash 4+ associative arrays, and this harness's
 # only available bash (both /bin/bash and whatever `env bash` resolves to) is 3.2.57. Under 3.2,
 # `declare -A` is silently rejected and bash then mis-parses the parenthesized initializer as an
@@ -292,7 +312,7 @@ commands = [
 ]
 
 # build-jac decision, recorded 2026-07-30 (code review): NOT mirrored, deliberately, even though
-# the design spec's mirror table (spec section 7) names it. ci.yml:61-143 is a Zig BUILD job -- zig
+# the design spec's mirror table (spec section 7) names it. ci.yml:68-149 is a Zig BUILD job -- zig
 # build + fetch-typeshed, an `ldd`/`env -i` hermeticity smoke, two end-to-end `jac run` programs and
 # a three-test `jac test` smoke file -- all of which exercise the COMPILED BINARY, not the tree a
 # Nightshift diff touches. Measured against this checkout: `git ls-files '*.zig'` returns ELEVEN
@@ -306,12 +326,12 @@ commands = [
 # tool that can edit them. Today neither is true.
 #
 # Step 2b decision, CORRECTED 2026-07-30 (code review): the note that used to live here concluded
-# "NOT added as [jobs.check]" after measuring ONLY the whole-repo `else` branch of ci.yml:412-424
-# (`jac check . --ignore $IGNORE_ARGS --nowarn`, ci.yml:423) -- RED, 182 files failed within the
+# "NOT added as [jobs.check]" after measuring ONLY the whole-repo `else` branch of ci.yml:419-432
+# (`jac check . --ignore $IGNORE_ARGS --nowarn`, ci.yml:430) -- RED, 182 files failed within the
 # first ~12% of a traversal killed after taking well over an hour's projected runtime. That
 # measurement was real, but it measured the wrong branch: exactly like [jobs.fmt] above, this step
 # ALSO branches on `steps.changes.outputs.mode`, and Nightshift's PRs always take the scoped
-# branch (ci.yml:421: `jac check $(cat changed-jac.txt) --ignore $IGNORE_ARGS --nowarn`), never
+# branch (ci.yml:428: `jac check $(cat changed-jac.txt) --ignore $IGNORE_ARGS --nowarn`), never
 # the whole-repo one. The scoped branch is fast (~0.45s for one file, measured) and is what a real
 # PR is actually gated on -- so [jobs.check] above IS now part of the mirror. The whole-repo
 # variant's RED verdict is real but no longer relevant to this decision: it was never the thing
@@ -320,3 +340,15 @@ commands = [
 # .jacignore yet still failed under `jac check .`, meaning whole-repo `--ignore` does not fully
 # suppress them the way ci.yml's comment implies -- worth a closer look some day, but irrelevant
 # to [jobs.check]'s scoped invocation, which does not exercise that path.)
+
+# test-scale / test-scale-k8s gap, recorded 2026-07-30 during the e61124559 re-sync: NOT mirrored,
+# and this is a real (pre-existing, not new) hole rather than a considered exclusion like build-jac
+# above. `scale` IS an audit shard ([shards.paths].scale = jac/jaclang/scale), so a night can and
+# does produce diffs there -- but lib/verify.sh's gated_suites_from_diff routes anything under
+# jac/* that is not byllm/compiler to `runtime`, and [jobs.runtime] runs `jac test tests/ --ignore
+# tests/compiler` from jac/, which does NOT collect jac/jaclang/scale/tests. So a scale-only branch
+# is gated by zero scale tests locally. Upstream is where it would be caught (test-scale, ci.yml:790,
+# a 3-group matrix + a MicroK8s job), which needs a cluster and firebase/gcloud deps this host does
+# not have. #7628 widened that job further (a new root-level step at ci.yml:856-865). Recorded, not
+# fixed: closing it means either a [jobs.scale] entry with the deps installed, or teaching
+# gated_suites_from_diff a scale arm. Either is its own task with its own baseline.
