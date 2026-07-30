@@ -26,6 +26,7 @@ argv:
   prs    <prefix>                       stdin: gh pr list --json number,headRefName,url,title
                                         stdout: number<TAB>branch<TAB>url<TAB>title per matching PR
   row    k=v ...                        stdout: ONE prs.jsonl line (see PR_ROW_KEYS)
+  inv    k=v ...                        stdout: ONE pr-inventory.jsonl line (see INV_ROW_KEYS)
 """
 import sys;
 import json;
@@ -168,37 +169,62 @@ a PR that had nothing to say."""
 glob PR_ROW_KEYS: list[str] = ["number", "title", "task", "url", "mirror", "ci", "attempts"];
 glob PR_ROW_INT_KEYS: list[str] = ["number", "attempts"];
 
-"""Project `k=v` argv into one prs.jsonl line. bash never composes JSON (global constraint).
+"""The exact schema of one $LOG_DIR/pr-inventory.jsonl line -- S1.6's event log, one row per thing
+that happened to an already-open PR tonight.
 
-`number` and `attempts` are parsed with int(), which RAISES on anything non-numeric rather than
+SEPARATE FILE from prs.jsonl on purpose, and not a matter of taste: Plan 4's digest reads the two
+independently (`prs` is "PRs this night opened", `inventory` is "PRs this night maintained") and
+renders them as different sections. Folding S1.6's rows into prs.jsonl would make every maintained
+PR appear in tonight's "opened" table.
+
+`branch` is the one key Plan 4's renderer does not print today. It is here anyway because this file
+is also the on-disk record of which branches an unattended night force-pushed, and a bare PR number
+does not say that. Plan 4's readers are `.get()`-based, so the extra key costs it nothing."""
+glob INV_ROW_KEYS: list[str] = ["number", "branch", "action", "note"];
+glob INV_ROW_INT_KEYS: list[str] = ["number"];
+
+"""Project `k=v` argv into ONE JSONL line against a FIXED schema. bash never composes JSON (global
+constraint), and every key is REQUIRED with no unknown key tolerated -- bash composing this by hand
+is exactly how a key gets dropped or misspelled, and the digest cannot tell a missing key from a PR
+that had nothing to say.
+
+The declared int keys are parsed with int(), which RAISES on anything non-numeric rather than
 defaulting to 0: a silent 0 would render in the digest as a real PR #0 with zero attempts."""
-def pr_json(kvs: list[str]) -> str {
+def kv_row(verb: str, kvs: list[str], keys: list[str], int_keys: list[str]) -> str {
     row: dict = {};
     for kv in kvs {
         if "=" not in kv {
-            raise ValueError("cigate row: '" + kv + "' is not key=value");
+            raise ValueError("cigate " + verb + ": '" + kv + "' is not key=value");
         }
         parts: list[str] = kv.split("=", 1);
         row[parts[0]] = parts[1];
     }
-    missing: list[str] = [k for k in PR_ROW_KEYS if k not in row];
+    missing: list[str] = [k for k in keys if k not in row];
     if missing {
-        raise ValueError("cigate row: missing required key(s): " + ",".join(missing)
-                         + ". The digest reads all of " + ",".join(PR_ROW_KEYS)
+        raise ValueError("cigate " + verb + ": missing required key(s): " + ",".join(missing)
+                         + ". The digest reads all of " + ",".join(keys)
                          + " and renders nothing for a row it cannot read.");
     }
     # str(k), not k: `row` is dict[any] here (it came from argv), so the comprehension is
     # list[<any>] and `extra: list[str] = ...` fails jac check with E1001.
-    extra: list[str] = [str(k) for k in row.keys() if str(k) not in PR_ROW_KEYS];
+    extra: list[str] = [str(k) for k in row.keys() if str(k) not in keys];
     if extra {
-        raise ValueError("cigate row: unknown key(s): " + ",".join(sorted(extra))
-                         + ". Add it to PR_ROW_KEYS and to Plan 4's digest together, or the value"
+        raise ValueError("cigate " + verb + ": unknown key(s): " + ",".join(sorted(extra))
+                         + ". Add it to the schema and to Plan 4's digest together, or the value"
                          + " is written every night and read by nothing.");
     }
-    for k in PR_ROW_INT_KEYS {
+    for k in int_keys {
         row[k] = int(str(row[k]));
     }
     return json.dumps(row);
+}
+
+def pr_json(kvs: list[str]) -> str {
+    return kv_row("row", kvs, PR_ROW_KEYS, PR_ROW_INT_KEYS);
+}
+
+def inv_json(kvs: list[str]) -> str {
+    return kv_row("inv", kvs, INV_ROW_KEYS, INV_ROW_INT_KEYS);
 }
 
 with entry:__main__ {
@@ -227,12 +253,15 @@ with entry:__main__ {
         }
     } elif cmd == "row" and len(args) > 2 {
         print(pr_json(args[2:]));
+    } elif cmd == "inv" and len(args) > 2 {
+        print(inv_json(args[2:]));
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run cigate.jac parse|ran <checks.json>");
         eprint("       jac run cigate.jac record <checks.json> <baseline.json>");
         eprint("       jac run cigate.jac gate   <checks.json> <baseline.json>");
         eprint("       jac run cigate.jac prs <branch-prefix>   (gh pr list --json ... on stdin)");
         eprint("       jac run cigate.jac row number=.. title=.. task=.. url=.. mirror=.. ci=.. attempts=..");
+        eprint("       jac run cigate.jac inv number=.. branch=.. action=.. note=..");
         sys.exit(2);
     }
 }
@@ -418,6 +447,52 @@ test "a prs.jsonl row is one typed JSON line, and every schema slip raises" {
     try {
         pr_json(["number=-", "title=t", "task=t", "url=u", "mirror=green", "ci=pending",
                  "attempts=0"]);
+    } except ValueError {
+        nonnum = True;
+    }
+    assert nonnum;
+}
+
+test "a pr-inventory row is one typed JSON line carrying exactly what the digest reads" {
+    line: str = inv_json(["number=7288", "branch=nightshift/2026-07-29/dead-code-x",
+                          "action=rebased", "note=gate green"]);
+    assert "\n" not in line;
+    got: dict = parse_obj(line);
+    assert got["number"] == 7288;                     # INT, not the string bash handed over
+    assert got["action"] == "rebased" and got["note"] == "gate green";
+    # every key Plan 4's html_body/plain_body reads must be present
+    for k in ["number", "action", "note"] {
+        assert k in got;
+    }
+    # a note carrying a tab or a newline must not break the line discipline
+    multi: str = inv_json(["number=1", "branch=b", "action=conflicted", "note=a\tb\nc"]);
+    assert "\n" not in multi;
+    assert parse_obj(multi)["note"] == "a\tb\nc";
+    # an EMPTY note is legitimate (nothing to say) and must NOT read as a missing key
+    assert parse_obj(inv_json(["number=1", "branch=b", "action=current", "note="]))["note"] == "";
+    # a missing key raises rather than rendering a partial row
+    missing: bool = False;
+    try {
+        inv_json(["number=1", "branch=b", "action=rebased"]);
+    } except ValueError as e {
+        missing = True;
+        assert "note" in str(e);
+    }
+    assert missing;
+    # an unknown key raises: prs.jsonl's schema is NOT this schema, and mixing them silently
+    # would put S1.6 rows in the digest's "opened tonight" table
+    unknown: bool = False;
+    try {
+        inv_json(["number=1", "branch=b", "action=rebased", "note=", "title=t"]);
+    } except ValueError as e2 {
+        unknown = True;
+        assert "title" in str(e2);
+    }
+    assert unknown;
+    # a non-numeric PR number raises rather than rendering as PR #0
+    nonnum: bool = False;
+    try {
+        inv_json(["number=-", "branch=b", "action=rebased", "note="]);
     } except ValueError {
         nonnum = True;
     }

@@ -95,6 +95,15 @@ loc_per_theme      = 600                     # was 300 -- was silently dropping 
                                               # real 492-line dead file never even got considered:
                                               # 0 + 492 > 300 killed it before packing tried).
 wallclock_min      = 180                     # hard ceiling for the whole night
+inventory_min      = 120                     # ceiling for S1.6. Re-gating one open PR costs what S4
+                                              # costs (~40min worst case), so N open PRs can eat the
+                                              # whole night and ship nothing new. When this is spent
+                                              # the remaining PRs are left for the next night -- the
+                                              # inventory converges over nights, not within one.
+                                              # Raise it once the steady state is known. NOTE it is
+                                              # deliberately NOT clamped to wallclock_min: the
+                                              # watchdog in bin/nightshift.sh is the hard stop, and
+                                              # two ceilings that can disagree is a drift bug.
 audit_timeout_min  = 20                      # 15 was too tight for the jac core package: 07-18 hit the wall twice, 0-byte envelope both times
 apply_timeout_min  = 25                      # per theme session
 audit_max_turns    = 45                      # audit is read-only investigation (grep/read heavy,
