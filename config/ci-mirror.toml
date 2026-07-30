@@ -16,11 +16,47 @@ sha256   = "3f282983240facf169e109c0eea9cab4fe971515d84d9980c2c3373224497fda"
 
 [jobs.fmt]
 ci_job = "jac-check"
-# CI's EXACT invocation. Not `jac format .`, not `jac lint --fix`. The exclusion regex is copied
-# verbatim from ci.yml. A fork PR gets no autofix (the bot at ci.yml:303 is gated on same-repo
-# PRs), so it hits the hard failure at ci.yml:342 instead -- formatting must be right locally.
+# CI's EXACT invocation for a PULL REQUEST event (ci.yml:279-295, :326-345) -- NOT the `else`
+# whole-repo sweep at ci.yml:350. Nightshift only ever opens PRs (never pushes to the default
+# branch upstream), so `github.event_name == 'pull_request'` is always true for it, and ci.yml's
+# own "Determine changed .jac files" step always takes the `mode=scoped` branch for it. The
+# scoped step's `origin/${{ github.base_ref }}` merge-base is mirrored locally as
+# `git merge-base "$NS_REPO_DEFAULT_BRANCH" HEAD` -- the local analogue of "the commit this PR
+# would be based on". CORRECTED 2026-07-30 after a dry run against a clean `main` checkout showed
+# rc=1 with 259 files flagged: that was this entry mistakenly registered as the whole-repo
+# (`git ls-files`) variant, which is real CI's PUSH-event behavior only and would reject every
+# candidate branch on repo-wide pre-existing drift it never touched -- confirmed against real
+# upstream CI logs (a cross-repo PR's `jac-check` job log literally prints `mode=scoped` and then
+# diffs only the PR's own changed .jac files). `jac format .` / `jac lint --fix` are NOT this
+# tool: they were removed by CLI cleanup #7255. The exclusion regex is copied verbatim from the
+# scoped branch (ci.yml:340); this branch does NOT have the whole-repo branch's extra
+# `_syntax_err\.jac$` alternative, but that alternative was already redundant there -- every
+# `_syntax_err.jac` filename also ends in `_err.jac`, so `_err\.jac$` alone matches it too. Preserves
+# CI's exact "no formattable files changed -> skip cleanly, exit 0" behavior (ci.yml:333-343),
+# collapsed into one check since an empty diff and an all-excluded diff both reduce to the same
+# empty $FILES here. See [jobs.fmt_autofix] just below: SAME tool/flags/exclusion-regex, only the
+# path SELECTION differs (diff-scoped here vs. tier-1's own jac/jaclang/byllm scope there) --
+# bin/test-harness.sh's drift guard asserts the two regexes stay byte-identical.
 commands = [
-  "git ls-files -z '*.jac' | grep -zv -E '(/fixtures/|^scripts/|/passes/native/llvm/|_err\\.jac$|_syntax_err\\.jac$)' | xargs -0 --no-run-if-empty jac fmt --check --lintfix",
+  '''FILES="$(git diff --name-only --diff-filter=ACMR "$(git merge-base "$NS_REPO_DEFAULT_BRANCH" HEAD)" HEAD -- '*.jac' | grep -vE '(/fixtures/|^scripts/|/passes/native/llvm/|_err\.jac$)' || true)"; if [ -z "$FILES" ]; then echo "No formattable .jac files changed; skipping format check."; else printf '%s\n' "$FILES" | tr '\n' '\0' | xargs -0 --no-run-if-empty jac fmt --check --lintfix; fi''',
+]
+
+[jobs.fmt_autofix]
+# NOT a ci.yml job -- there is no upstream CI step this mirrors. This is tier-1's OWN apply step
+# (lib/tier1.sh S2): the nightly "clean up drift, near-zero risk" autofix, deliberately scoped to
+# jac/jaclang/byllm rather than the whole repo (repo-wide `--lintfix` would touch ~260 files
+# nightly, drag the ~95min "jac" core test suite into every autofix night via
+# gated_pkgs_from_diff, and rewrite files with known pre-existing .jacignore type-check gaps --
+# see lib/tier1.sh's own comment). [jobs.fmt] and this entry MUST use the identical tool, flags
+# (minus --check -- tier-1 APPLIES the fix, [jobs.fmt] only VERIFIES it), and exclusion regex;
+# only the path SELECTION (git-ls-files pathspec here vs. git-diff-scoped there) differs. Kept as
+# its own registry entry, not derived from [jobs.fmt] by string surgery: once [jobs.fmt] became
+# diff-scoped it no longer contains a `git ls-files '*.jac'` pathspec to substitute, so a `sed`
+# derivation has nothing to anchor on. bin/test-harness.sh's drift guard is the no-drift
+# replacement for that substitution.
+ci_job = "none -- tier-1's own apply step, not a ci.yml job"
+commands = [
+  "git ls-files -z 'jac/jaclang/byllm/*.jac' | grep -zv -E '(/fixtures/|^scripts/|/passes/native/llvm/|_err\\.jac$)' | xargs -0 --no-run-if-empty jac fmt --lintfix",
 ]
 
 [jobs.jir]

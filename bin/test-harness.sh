@@ -60,4 +60,28 @@ else
     echo "SKIP: no work/repo clone present"
 fi
 
+echo "== 6. fmt/fmt_autofix drift guard: check and apply must share one exclusion regex =="
+rm -rf .jac
+fmt_cmd="$(jac run scripts/cimirror.jac cmds fmt config/ci-mirror.toml | head -1)"
+autofix_cmd="$(jac run scripts/cimirror.jac cmds fmt_autofix config/ci-mirror.toml | head -1)"
+rm -rf .jac
+# `|| true`: a genuinely absent regex must reach the empty-string check below as a clean FAIL,
+# not silently kill this script via set -e + pipefail (grep's rc=1-on-no-match is the rightmost
+# nonzero in the pipeline, which pipefail would otherwise propagate to the assignment itself).
+fmt_regex="$(printf '%s' "$fmt_cmd" | grep -oE -- '\(/fixtures/[^)]*\)' | head -1 || true)"
+autofix_regex="$(printf '%s' "$autofix_cmd" | grep -oE -- '\(/fixtures/[^)]*\)' | head -1 || true)"
+case "$fmt_regex" in "") fail "could not extract an exclusion regex from [jobs.fmt]" ;; esac
+case "$autofix_regex" in "") fail "could not extract an exclusion regex from [jobs.fmt_autofix]" ;; esac
+case "$autofix_regex" in
+    "$fmt_regex") : ;;
+    *) fail "fmt and fmt_autofix exclusion regexes have drifted apart: '$fmt_regex' vs '$autofix_regex'" ;;
+esac
+case "$fmt_cmd$autofix_cmd" in
+    *'jac format'*) fail "fmt/fmt_autofix regressed to 'jac format' (removed by CLI cleanup #7255)" ;;
+esac
+case "$fmt_cmd$autofix_cmd" in
+    *'jac lint --fix'*) fail "fmt/fmt_autofix regressed to 'jac lint --fix' (removed by CLI cleanup #7255)" ;;
+esac
+echo "fmt and fmt_autofix share one exclusion regex ($fmt_regex), no jac format / jac lint --fix"
+
 echo "ALL HARNESS TESTS PASSED"

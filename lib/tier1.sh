@@ -8,26 +8,19 @@ tier1_main() {
 
     rm -rf "$REPO/.jac"                                # `jac clean --cache` prompts [y/N] non-interactively -> aborts
 
-    # CI's EXACT tool/flags/exclusion-regex (config/ci-mirror.toml [jobs.fmt]), with `--check`
-    # stripped (tier-1 APPLIES the fix; the mirror VERIFIES it) and the `git ls-files` PATHSPEC
-    # narrowed from the whole repo to jac/jaclang/byllm. `jac format .` / `jac lint --fix` are
-    # NOT the same tool invocation, and a fork PR gets no autofix rescue (ci.yml:303 is
-    # same-repo only), so anything left unformatted in scope becomes a hard CI failure at
-    # ci.yml:342 -- hence deriving from CI's exact command instead of a hand-rolled one.
-    #
-    # NOT the unscoped cimirror_fmt_cmd, though: CI's own fmt CHECK, when it actually runs on a
-    # PR, is scoped by DIFF (changed-jac.txt), not by directory -- ci.yml has no "byllm" scope to
-    # copy. `[jobs.fmt]`'s registered command is CI's PUSH-event branch (whole-repo git ls-files),
-    # which is what the *mirror* should verify against (stricter than a real PR check is a safe
-    # direction to err in). Running that same whole-repo command as tier-1's AUTOFIX would
-    # `--lintfix` all ~260 currently-unformatted files repo-wide every night -- exactly the
-    # "genuinely risky" repo-wide autofix this stage was scoped away from originally: it drags
-    # the ~95min "jac" core test suite into every autofix night via gated_pkgs_from_diff, and
-    # rewrites files with known pre-existing .jacignore type-check gaps. So only the PATHSPEC is
-    # substituted here (byllm/*.jac for *.jac); the tool, flags, and exclusion regex still come
-    # from the one canonical string, so they cannot drift from what the mirror verifies.
+    # config/ci-mirror.toml [jobs.fmt_autofix]: tier-1's OWN apply step, not a ci.yml job (there
+    # is no diff yet when tier-1 runs -- it's the first stage -- so it can't reuse [jobs.fmt]'s
+    # diff-scoped CHECK command; there's nothing to diff against yet). Same tool, flags (minus
+    # --check), and exclusion regex as [jobs.fmt] -- kept byte-identical by
+    # bin/test-harness.sh's drift guard -- scoped to jac/jaclang/byllm rather than the whole repo:
+    # a repo-wide `--lintfix` would touch ~260 files nightly, drag the ~95min "jac" core test
+    # suite into every autofix night via gated_pkgs_from_diff, and rewrite files with known
+    # pre-existing .jacignore type-check gaps -- exactly what this scope restriction avoids.
+    # `jac format .` / `jac lint --fix` are NOT this tool: removed by CLI cleanup #7255. A fork PR
+    # gets no autofix rescue from CI itself (ci.yml:303 is same-repo only), so anything left
+    # unformatted in scope becomes a hard CI failure at ci.yml:342.
     ( cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
-        && eval "$(cimirror_fmt_cmd | sed "s/ --check//; s#'\\*\\.jac'#'jac/jaclang/byllm/*.jac'#")" ) || true
+        && eval "$(cimirror_fmt_autofix_cmd)" ) || true
 
     # Backstop even though the formatter is scoped now: protected paths must never ship edited (PRD 9).
     local protected
