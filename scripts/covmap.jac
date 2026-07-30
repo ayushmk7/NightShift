@@ -17,8 +17,9 @@ here. Upgrade path: the same subtraction over `jac code symbol` output per file.
 Phase B -- real line coverage as a compiler pass -- is explicitly NOT this and has its own spec.
 
 argv:
-  rank <repo_dir> <jac_repo_bin>                    print the ranked untested-symbol JSON array
-  top  <covmap.json> <shard> <config.toml> <limit>  markdown evidence lines for one shard
+  rank  <repo_dir> <jac_repo_bin>                    print the ranked untested-symbol JSON array
+  top   <covmap.json> <shard> <config.toml> <limit>  markdown evidence lines for one shard
+  paths <covmap.json> <paths.txt> <limit>            same, filtered by an explicit path list
 """
 import sys;
 import os;
@@ -122,15 +123,29 @@ def top_lines(entries: list[dict], paths: list[str], limit: int) -> list[str] {
     return out;
 }
 
+def load_entries(path: str) -> list[dict] {
+    with open(path, "r") as f {
+        return [as_dict(e) for e in json.loads(f.read())];
+    }
+}
+
+"""One path per line, blanks dropped. lib/reactive.sh's $LOG_DIR/reactive-files.txt is exactly this
+shape, which is what lets the reactive coverage lens get REAL evidence rather than the literal
+`{coverage_evidence}` placeholder or an empty block -- and an empty evidence block reads to the
+model exactly like "everything here is tested"."""
+def read_path_list(path: str) -> list[str] {
+    with open(path, "r") as f {
+        return [str(l).strip() for l in f.read().splitlines() if str(l).strip()];
+    }
+}
+
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "rank" and len(args) == 4 {
         print(json.dumps(rank(args[2], args[3])));
     } elif cmd == "top" and len(args) == 6 {
-        with open(args[2], "r") as f {
-            entries: list[dict] = [as_dict(e) for e in json.loads(f.read())];
-        }
+        entries: list[dict] = load_entries(args[2]);
         paths: list[str] = shard_paths(load_config_toml(args[4]), args[3]);
         lines: list[str] = top_lines(entries, paths, int(args[5]));
         if not lines {
@@ -139,9 +154,20 @@ with entry {
         for line in lines {
             print(line);
         }
+    } elif cmd == "paths" and len(args) == 5 {
+        # The reactive pass audits a merged-FILE set, not a shard, so its evidence filter is that
+        # same file list. top_lines matches on startswith, so exact paths select exact files.
+        lines2: list[str] = top_lines(load_entries(args[2]), read_path_list(args[3]), int(args[4]));
+        if not lines2 {
+            print("(no untested public archetypes among the files that merged tonight)");
+        }
+        for line in lines2 {
+            print(line);
+        }
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run covmap.jac rank <repo_dir> <jac_repo_bin>");
         eprint("       jac run covmap.jac top <covmap.json> <shard> <config.toml> <limit>");
+        eprint("       jac run covmap.jac paths <covmap.json> <paths.txt> <limit>");
         # NONZERO for the same reason check_scope.jac's usage arm is: lib/tier2.sh decides whether
         # tonight's coverage audit runs at all from this command's exit status, and an exit 0 with
         # no output would be recorded as "evidence gathered, nothing untested".
@@ -177,6 +203,27 @@ test "top_lines filters to the shard's paths and honours the limit" {
     assert "`A`" in lines[0] and "jac/jaclang/cli/a.jac:3" in lines[0];
     assert len(top_lines(entries, ["jac/jaclang/cli"], 1)) == 1;
     assert top_lines(entries, ["jac/jaclang/byllm"], 5) == [];
+}
+
+test "read_path_list feeds top_lines an exact-file filter for the reactive pass" {
+    # The reactive coverage lens has no shard to look up, so its {coverage_evidence} comes from the
+    # merged-file list instead. A read that quietly returned [] would hand the lens an empty
+    # evidence block, which reads to the model as "everything that merged tonight is tested".
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    p: str = d + "/files.txt";
+    with open(p, "w") as f {
+        f.write("jac/jaclang/cli/a.jac\n\n  jac/jaclang/scale/b.jac  \n");
+    }
+    assert read_path_list(p) == ["jac/jaclang/cli/a.jac", "jac/jaclang/scale/b.jac"];
+    entries: list[dict] = [
+        {"symbol": "A", "kind": "obj", "file": "jac/jaclang/cli/a.jac", "line": 3, "weight": 9},
+        {"symbol": "B", "kind": "walker", "file": "jac/jaclang/scale/b.jac", "line": 5, "weight": 8},
+        {"symbol": "C", "kind": "obj", "file": "jac/jaclang/cli/untouched.jac", "line": 7, "weight": 7},
+    ];
+    lines: list[str] = top_lines(entries, read_path_list(p), 10);
+    assert len(lines) == 2;
+    assert "`C`" not in " ".join(lines);
 }
 
 test "ability_name strips the signature, and a fieldless archetype weighs 0" {

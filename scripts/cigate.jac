@@ -27,6 +27,7 @@ argv:
                                         stdout: number<TAB>branch<TAB>url<TAB>title per matching PR
   row    k=v ...                        stdout: ONE prs.jsonl line (see PR_ROW_KEYS)
   inv    k=v ...                        stdout: ONE pr-inventory.jsonl line (see INV_ROW_KEYS)
+  deferred k=v ...                      stdout: ONE deferred.jsonl line (see DEFERRED_ROW_KEYS)
 """
 import sys;
 import json;
@@ -183,6 +184,17 @@ does not say that. Plan 4's readers are `.get()`-based, so the extra key costs i
 glob INV_ROW_KEYS: list[str] = ["number", "branch", "action", "note"];
 glob INV_ROW_INT_KEYS: list[str] = ["number"];
 
+"""The exact schema of one $LOG_DIR/deferred.jsonl line -- a finding the selector shed for budget or
+clock reasons, in either phase.
+
+The ledger already records these as `deferred`, so this file is not the system of record; it exists
+because the digest must be able to say what was left undone WITHOUT re-scanning a ledger that
+accumulates every finding the harness has ever seen. `phase` is the whole reason it is a separate
+key rather than a prefix on the file: RECONCILIATION B6 forbids distinguishing phases by filename,
+so they are distinguished by a field inside the file, which is exactly this one."""
+glob DEFERRED_ROW_KEYS: list[str] = ["fingerprint", "file", "reason", "phase"];
+glob DEFERRED_ROW_INT_KEYS: list[str] = [];
+
 """Project `k=v` argv into ONE JSONL line against a FIXED schema. bash never composes JSON (global
 constraint), and every key is REQUIRED with no unknown key tolerated -- bash composing this by hand
 is exactly how a key gets dropped or misspelled, and the digest cannot tell a missing key from a PR
@@ -227,6 +239,10 @@ def inv_json(kvs: list[str]) -> str {
     return kv_row("inv", kvs, INV_ROW_KEYS, INV_ROW_INT_KEYS);
 }
 
+def deferred_json(kvs: list[str]) -> str {
+    return kv_row("deferred", kvs, DEFERRED_ROW_KEYS, DEFERRED_ROW_INT_KEYS);
+}
+
 with entry:__main__ {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
@@ -255,6 +271,8 @@ with entry:__main__ {
         print(pr_json(args[2:]));
     } elif cmd == "inv" and len(args) > 2 {
         print(inv_json(args[2:]));
+    } elif cmd == "deferred" and len(args) > 2 {
+        print(deferred_json(args[2:]));
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run cigate.jac parse|ran <checks.json>");
         eprint("       jac run cigate.jac record <checks.json> <baseline.json>");
@@ -262,6 +280,7 @@ with entry:__main__ {
         eprint("       jac run cigate.jac prs <branch-prefix>   (gh pr list --json ... on stdin)");
         eprint("       jac run cigate.jac row number=.. title=.. task=.. url=.. mirror=.. ci=.. attempts=..");
         eprint("       jac run cigate.jac inv number=.. branch=.. action=.. note=..");
+        eprint("       jac run cigate.jac deferred fingerprint=.. file=.. reason=.. phase=..");
         sys.exit(2);
     }
 }
@@ -512,4 +531,31 @@ test "prs keeps only nightshift heads and survives a tab in a title" {
     assert rows[1].startswith("3\t");
     # an empty PR list is a legitimate answer and must not raise
     assert pr_rows("[]", "nightshift/") == [];
+}
+
+test "a deferred row carries the PHASE inside the file, never in its name" {
+    # RECONCILIATION B6: findings.json / selection.json keep their names, so "which phase deferred
+    # this" has to live in a field. A row that lost `phase` would make the digest's deferred list
+    # unattributable, and a row that gained a stray key would be written every night and read by
+    # nothing -- both raise here rather than being silently accepted.
+    row: dict = parse_obj(deferred_json(["fingerprint=ab12", "file=jac/jaclang/cli/x.jac",
+                                         "reason=over-night-budget", "phase=reactive"]));
+    assert str(row["phase"]) == "reactive";
+    assert str(row["fingerprint"]) == "ab12";
+    assert str(row["reason"]) == "over-night-budget";
+    assert sorted([str(k) for k in row.keys()]) == ["file", "fingerprint", "phase", "reason"];
+    missing: bool = False;
+    try {
+        deferred_json(["fingerprint=ab12", "file=x", "reason=r"]);
+    } except ValueError {
+        missing = True;
+    }
+    assert missing;
+    unknown: bool = False;
+    try {
+        deferred_json(["fingerprint=a", "file=x", "reason=r", "phase=cycle", "extra=1"]);
+    } except ValueError {
+        unknown = True;
+    }
+    assert unknown;
 }

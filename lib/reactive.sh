@@ -89,3 +89,127 @@ reactive_stage() {
     reactive_poll || true
     return 0
 }
+
+# S3a — all four task lenses over the files that merged upstream today (design spec section 10).
+# Runs BEFORE the cycle task so fresh merges are cleaned the same night. Priority order for a
+# night is: PR inventory (S1.6) > this > carry-over > tonight's cycle task.
+#
+# COST, stated plainly because four LLM sessions a night is the most expensive thing Plan 4 adds:
+# the justification is that the scope is a handful of files, not an 87k-LOC shard. The moment that
+# stops being true the justification is gone, so both ends are guarded -- zero merged files costs
+# zero sessions, and a huge merge day is truncated rather than pursued.
+#
+# Returns 0 ALWAYS. A failed lens costs its own findings, never the night: this runs inside
+# tier2_main, which ns_stage invokes with errexit live.
+reactive_main() {
+    local scope n_files conc task task_list rc=0
+
+    # A poll that never answered is NOT a quiet day, and the two must not read the same. S1.5
+    # already wrote the failure row; this only has to avoid claiming the pass was skipped for lack
+    # of work.
+    if [ ! -f "$LOG_DIR/reactive-files.txt" ]; then
+        ns_log S3a "no merge-poll result on disk — the S1.5 poll did not answer, so there is no reactive scope tonight (see failed.tsv)"
+        return 0
+    fi
+    # A quiet day must cost NOTHING: no session, no audit-*.json, no ns_fail row, one log line.
+    # `-s`, not `-f`: reactive_poll writes an EMPTY file for a real merge day that touched nothing
+    # any lens audits, and that is a genuine quiet day rather than a failure.
+    if [ ! -s "$LOG_DIR/reactive-files.txt" ]; then
+        ns_log S3a "no upstream merges to clean tonight — reactive pass skipped (0 sessions)"
+        return 0
+    fi
+    n_files="$(wc -l < "$LOG_DIR/reactive-files.txt" | tr -d ' ')"
+
+    # ponytail: CEILING. An audit session cannot usefully read an unbounded file list, and a
+    #           200-file merge day is a release, not a janitorial opportunity. Above the cap the
+    #           pass audits the first files_per_theme*4 paths and SAYS SO in the digest, rather
+    #           than silently truncating or silently spending four max-turn sessions on a list it
+    #           cannot hold. The list is CHURN-RANKED by merges.jac, so "the first N" really is the
+    #           largest-signal subset and is reproducible from merges.json.
+    #           Upgrade path: shard the merged file set the way the repo is sharded, reusing
+    #           tier2_audit_all's fan-out with per-chunk scopes. Measured 2026-07-30, one real day
+    #           was 376 auditable files, so this ceiling fires on a busy day rather than never.
+    local cap=$(( NS_BUDGETS_FILES_PER_THEME * 4 ))
+    if [ "$n_files" -gt "$cap" ]; then
+        ns_warn "reactive pass: $n_files merged file(s) exceeds the $cap-file ceiling — auditing the $cap most-churned"
+        scope="$(head -"$cap" "$LOG_DIR/reactive-files.txt" | tr '\n' ' ')"
+    else
+        scope="$(tr '\n' ' ' < "$LOG_DIR/reactive-files.txt")"
+    fi
+
+    # Same materialize-and-check discipline as tier2_audit_all: `for x in $(reader)` does not fire
+    # set -e, so a broken reader would run ZERO lenses and look exactly like a quiet day -- which
+    # is the one thing this whole task is built to distinguish.
+    task_list="$(ns_jac tasks list "$CONFIG")" || rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$task_list" ]; then
+        ns_fail "S3a reactive" "could not read the task list from $CONFIG (rc=$rc) — reactive pass skipped"
+        return 0
+    fi
+
+    # The coverage lens needs covmap evidence or it skips, and tier2_main only builds covmap.json on
+    # a COVERAGE night -- so three nights in four the reactive coverage lens would report a failure
+    # for want of a file nobody asked for. `covmap rank` is a deterministic `jac code map` pass with
+    # no LLM in it, so build it here when it is missing rather than shipping a lens that is dead 75%
+    # of the time. Written through a temp file: covmap.jac refuses to emit `[]` on failure, and a
+    # truncated covmap.json reads to the audit as "everything is tested".
+    if [ ! -s "$LOG_DIR/covmap.json" ]; then
+        if ns_jac covmap rank "$REPO" "$NS_PATHS_JAC_REPO" > "$LOG_DIR/covmap.json.tmp" 2>> "$LOG_DIR/covmap-err.txt"; then
+            mv "$LOG_DIR/covmap.json.tmp" "$LOG_DIR/covmap.json"
+        else
+            rm -f "$LOG_DIR/covmap.json.tmp"
+            ns_warn "reactive pass: covmap produced no evidence — the coverage lens is skipped tonight, not failed"
+        fi
+    fi
+
+    conc="${NS_SHARDS_CONCURRENCY:-2}"
+    ns_log S3a "reactive pass over $n_files merged file(s), $(printf '%s' "$task_list" | wc -w | tr -d ' ') lenses"
+    for task in $task_list; do
+        if [ "$(ns_remaining_min)" -lt $(( NS_BUDGETS_AUDIT_TIMEOUT_MIN + NS_BUDGETS_APPLY_TIMEOUT_MIN )) ]; then
+            ns_warn "clock too short to schedule more reactive lenses — stopping at $task"
+            break
+        fi
+        ns_jobs_wait "$conc"
+        # `reactive-<task>` is the AUDIT ARTIFACT name, not a branch name -- tier2_apply builds the
+        # branch slug as <task>-reactive-<hint> so lib/common.sh's prefix-based task resolver still
+        # works (RECONCILIATION B2). tier2_audit_shard keys its coverage-evidence filter on this
+        # prefix.
+        tier2_audit_shard "reactive-$task" "$scope" "$task" &
+    done
+    wait
+
+    # Collect. Space-joined string, not a bash array: under set -u bash 3.2 aborts on ${#arr[@]}
+    # and "${arr[@]}" when the array is EMPTY, and "every lens failed" is exactly the case this
+    # has to survive.
+    local found="" n_found=0
+    : > "$LOG_DIR/reactive-summary.tsv"
+    for task in $task_list; do
+        if [ -s "$LOG_DIR/findings-reactive-$task.json" ]; then
+            found="$found $LOG_DIR/findings-reactive-$task.json"
+            n_found=$(( n_found + 1 ))
+            printf '%s\t%s\n' "$task" \
+                "$(ns_jac parse_result len < "$LOG_DIR/findings-reactive-$task.json" || echo 0)" \
+                >> "$LOG_DIR/reactive-summary.tsv"
+        elif [ "$task" = coverage ] && [ ! -s "$LOG_DIR/covmap.json" ]; then
+            # "did not run" and "ran and found nothing" are the two things this plan refuses to
+            # conflate; so are "did not run" and "FAILED". A lens with no evidence never started.
+            printf '%s\tskipped (no coverage evidence)\n' "$task" >> "$LOG_DIR/reactive-summary.tsv"
+        else
+            printf '%s\tFAILED\n' "$task" >> "$LOG_DIR/reactive-summary.tsv"
+        fi
+    done
+    if [ "$n_found" -eq 0 ]; then
+        ns_fail "S3a reactive" "every lens failed or produced nothing over $n_files merged files"
+        return 0
+    fi
+
+    # shellcheck disable=SC2086  # deliberate word-split into one arg per lens findings file
+    if ! ns_jac parse_result merge $found > "$LOG_DIR/findings-reactive.json"; then
+        ns_fail "S3a reactive" "merge of $n_found lens findings failed — reactive pass contributes nothing"
+        rm -f "$LOG_DIR/findings-reactive.json"
+        return 0
+    fi
+    ns_log S3a "merged $n_found lens result(s) into $(ns_jac parse_result len < "$LOG_DIR/findings-reactive.json" || echo 0) findings"
+    tier2_select reactive
+    tier2_apply reactive
+    return 0
+}

@@ -81,38 +81,72 @@ tier2_main() {
         fi
     fi
 
+    # S3a BEFORE S3b: fresh upstream merges are cleaned the same night they land (design spec
+    # section 10), and the clock is what gives them priority -- they simply spend it first. A quiet
+    # day returns immediately having spent nothing. Placed after tier2_resolve_task so a night that
+    # dies inside the reactive pass still advanced the cycle, and after the covmap block so a
+    # coverage night does not build the same evidence twice.
+    reactive_main
+
     # tier2_audit_all's failure no longer returns: with carry-over, a night with zero fresh
     # findings still has yesterday's deferred themes to apply.
     tier2_audit_all || ns_log S3 "no fresh findings tonight — carry-over only"
-    tier2_select
-    tier2_apply
+    tier2_select cycle
+    tier2_apply cycle
     dataset_record_night               # after select+apply: selection.json + every meta-*.json exist
 }
 
 # Phase A — audit, physically read-only (dontAsk + no Edit/Write in the allow-list).
-# ONE SHARD per session: 365k LOC cannot be audited in one context (design spec 5).
-# Writes $LOG_DIR/findings-<shard>.json on success. Never returns nonzero for a single
-# shard failure -- a dead shard must not kill the tier, the way a dead package used to.
-tier2_audit_shard() {
-    local shard=$1 prompt attempt scope evidence=""
+#
+# ONE SCOPE per session. Called two ways, deliberately by the SAME function:
+#   * the shard fan-out passes a shard name and `shards scope` output (365k LOC, design spec 5)
+#   * the reactive pass passes "reactive-<task>" and the merged-file list (design spec 10)
+# Scope arrives as an ARGUMENT rather than being looked up here, because that plus the task are the
+# only things that differ between the callers, and a second copy of the retry / session-limit /
+# corrective-re-prompt logic is the last thing this file needs.
+#
+# Writes $LOG_DIR/findings-<name>.json on success. Never returns nonzero for a single
+# failure -- a dead scope must not kill the tier, the way a dead package used to.
+tier2_audit_shard() {   # tier2_audit_shard <name> <scope> <task>
+    local name=$1 scope=$2 task=$3 prompt attempt evidence="" task_env rc=0
+
+    # The TASK's own knobs, resolved here rather than read from the ambient NS_TASK_* that
+    # tier2_resolve_task left behind: the shard fan-out runs tonight's one task, but the reactive
+    # pass runs all four in parallel, and a shared NS_TASK_PONYTAIL would render three of the four
+    # prompts at the wrong mode. The eval is BARE (no export, no `set -a`) for the same reason
+    # tier2_resolve_task's is -- these stay orchestrator-local and never reach a claude session --
+    # and it is safe in this shell because both callers invoke this function with `&`.
+    task_env="$(ns_jac tasks env "$task" "$CONFIG")" || rc=$?
+    case "$rc$task_env" in
+        0?*) : ;;
+        *)  ns_fail "audit[$name]" "[tasks.$task] did not yield a usable NS_TASK_* env (rc=$rc)"
+            return 1 ;;
+    esac
+    eval "$task_env"
 
     # A coverage audit with no evidence is a coverage audit that guesses, and `{coverage_evidence}`
     # rendered empty reads to the model as "nothing here is untested". tier2_main removes the file
     # when covmap fails, so absence here is unambiguous.
-    if [ "$NS_TASK_NAME" = coverage ] && [ ! -s "$LOG_DIR/covmap.json" ]; then
-        ns_log S3 "audit[$shard] skipped: coverage task with no covmap evidence"
+    if [ "$task" = coverage ] && [ ! -s "$LOG_DIR/covmap.json" ]; then
+        ns_log S3 "audit[$name] skipped: coverage lens with no covmap evidence"
         return 1
     fi
 
-    scope="$(ns_jac shards scope "$shard" "$CONFIG")"
-    if [ "$NS_TASK_NAME" = coverage ]; then
-        evidence="$(ns_jac covmap top "$LOG_DIR/covmap.json" "$shard" "$CONFIG" 40)"
+    # The evidence filter follows the SCOPE, not the task: a shard filters by its declared paths, a
+    # reactive lens by the exact files that merged. Keyed on the name because that is the one thing
+    # the two callers already differ in by construction (the reactive lenses are named
+    # reactive-<task>), which keeps the argv at three.
+    if [ "$task" = coverage ]; then
+        case "$name" in
+            reactive-*) evidence="$(ns_jac covmap paths "$LOG_DIR/covmap.json" "$LOG_DIR/reactive-files.txt" 40)" ;;
+            *)          evidence="$(ns_jac covmap top "$LOG_DIR/covmap.json" "$name" "$CONFIG" 40)" ;;
+        esac
     fi
     # {coverage_evidence} only appears in prompts/audit-coverage.md, and only the coverage task
     # fills it. For the other three it substitutes to the empty string, which is correct: their
     # prompts do not carry the placeholder at all (bin/test-harness.sh section 11 pins that).
-    prompt="$(render_prompt "$NS_ROOT/prompts/audit-$NS_TASK_NAME.md" \
-        "shard=$shard" "scope=$scope" "coverage_evidence=$evidence" \
+    prompt="$(render_prompt "$NS_ROOT/prompts/audit-$task.md" \
+        "shard=$name" "scope=$scope" "coverage_evidence=$evidence" \
         "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_TASK_PONYTAIL")"
 
     # The audit is ALWAYS the expensive model: it is judgement work, and a bad finding costs a
@@ -121,9 +155,9 @@ tier2_audit_shard() {
     local audit_model="$NS_AGENT_MODEL"
 
     # Up to 2 attempts: a transient API error (e.g. "Connection closed mid-response") shouldn't
-    # burn this shard. Each attempt is time-boxed; the parse decides success.
+    # burn this scope. Each attempt is time-boxed; the parse decides success.
     # </dev/null on every claude call is load-bearing: the driver loop feeds stdin, and without
-    # it one session EATS the remaining shard list (the same bug that cost 5 of 6 themes in
+    # it one session EATS the remaining scope list (the same bug that cost 5 of 6 themes in
     # tier2_apply — see the comment there).
     for attempt in 1 2; do
         # dev jac first on PATH so the agent's Bash(jac *) and the jac MCP server hit the repo binary.
@@ -133,47 +167,47 @@ tier2_audit_shard() {
             --permission-mode dontAsk \
             --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
             --max-turns "$NS_BUDGETS_AUDIT_MAX_TURNS" --output-format json) \
-            > "$LOG_DIR/audit-$shard.json" < /dev/null || true
+            > "$LOG_DIR/audit-$name.json" < /dev/null || true
 
         # 0-byte envelope = the timebox killed the session before it printed anything; a longer
         # audit_timeout_min (not a re-prompt) is the lever for that failure mode.
-        if [ ! -s "$LOG_DIR/audit-$shard.json" ]; then
-            ns_log S3 "audit[$shard] attempt $attempt produced no output (killed at ${NS_BUDGETS_AUDIT_TIMEOUT_MIN}m?)"
+        if [ ! -s "$LOG_DIR/audit-$name.json" ]; then
+            ns_log S3 "audit[$name] attempt $attempt produced no output (killed at ${NS_BUDGETS_AUDIT_TIMEOUT_MIN}m?)"
             continue
         fi
 
-        ns_jac parse_result meta < "$LOG_DIR/audit-$shard.json" > "$LOG_DIR/meta-audit-$shard.json" || true
+        ns_jac parse_result meta < "$LOG_DIR/audit-$name.json" > "$LOG_DIR/meta-audit-$name.json" || true
 
-        if ns_jac parse_result findings "$NS_TASK_NAME" "$NS_TASK_SCORING" < "$LOG_DIR/audit-$shard.json" \
-                > "$LOG_DIR/findings-$shard.json" 2> "$LOG_DIR/parse-err-audit-$shard.txt"; then
-            ns_log S3 "audit[$shard]: $(ns_jac parse_result len < "$LOG_DIR/findings-$shard.json" || echo 0) findings"
+        if ns_jac parse_result findings "$task" "$NS_TASK_SCORING" < "$LOG_DIR/audit-$name.json" \
+                > "$LOG_DIR/findings-$name.json" 2> "$LOG_DIR/parse-err-audit-$name.txt"; then
+            ns_log S3 "audit[$name]: $(ns_jac parse_result len < "$LOG_DIR/findings-$name.json" || echo 0) findings"
             return 0
         fi
 
         # Hard account limit: leave a marker so the DRIVER can drop to serial / stop scheduling.
-        if grep -q "hit your session limit" "$LOG_DIR/audit-$shard.json"; then
+        if grep -q "hit your session limit" "$LOG_DIR/audit-$name.json"; then
             touch "$LOG_DIR/.session-limit"
-            ns_fail "audit[$shard]" "Claude session limit hit"
-            rm -f "$LOG_DIR/findings-$shard.json"
+            ns_fail "audit[$name]" "Claude session limit hit"
+            rm -f "$LOG_DIR/findings-$name.json"
             return 1
         fi
 
         # Live envelope, bad JSON: one cheap single-turn corrective re-prompt before burning
         # the attempt — two whole nights died to malformed audit output with no salvage.
-        ns_timebox 3 "$NS_PATHS_CLAUDE" -p "Your audit output failed validation: $(cat "$LOG_DIR/parse-err-audit-$shard.txt")
+        ns_timebox 3 "$NS_PATHS_CLAUDE" -p "Your audit output failed validation: $(cat "$LOG_DIR/parse-err-audit-$name.txt")
 Previous output:
-$(ns_jac parse_result field result < "$LOG_DIR/audit-$shard.json")
+$(ns_jac parse_result field result < "$LOG_DIR/audit-$name.json")
 Re-emit ONLY the corrected \`\`\`json fenced findings array — same schema, no prose." \
             --model "$audit_model" --max-turns 1 --output-format json \
-            > "$LOG_DIR/audit-repair-$shard.json" < /dev/null || true
-        if ns_jac parse_result findings "$NS_TASK_NAME" "$NS_TASK_SCORING" < "$LOG_DIR/audit-repair-$shard.json" > "$LOG_DIR/findings-$shard.json"; then
-            ns_log S3 "audit[$shard] salvaged via corrective re-prompt — $(ns_jac parse_result len < "$LOG_DIR/findings-$shard.json" || echo 0) findings"
+            > "$LOG_DIR/audit-repair-$name.json" < /dev/null || true
+        if ns_jac parse_result findings "$task" "$NS_TASK_SCORING" < "$LOG_DIR/audit-repair-$name.json" > "$LOG_DIR/findings-$name.json"; then
+            ns_log S3 "audit[$name] salvaged via corrective re-prompt — $(ns_jac parse_result len < "$LOG_DIR/findings-$name.json" || echo 0) findings"
             return 0
         fi
-        ns_log S3 "audit[$shard] attempt $attempt failed to parse even after corrective re-prompt"
+        ns_log S3 "audit[$name] attempt $attempt failed to parse even after corrective re-prompt"
     done
-    ns_fail "audit[$shard]" "malformed/failed audit after retry — this shard contributes nothing"
-    rm -f "$LOG_DIR/findings-$shard.json"
+    ns_fail "audit[$name]" "malformed/failed audit after retry — this scope contributes nothing"
+    rm -f "$LOG_DIR/findings-$name.json"
     return 1
 }
 
@@ -230,7 +264,10 @@ tier2_audit_all() {
             break
         fi
         ns_jobs_wait "$conc"
-        tier2_audit_shard "$shard" &
+        # Scope and task are passed EXPLICITLY: the same function drives the reactive pass with a
+        # merged-file list and one of the other three tasks, and nothing may be inferred from
+        # ambient NS_TASK_* state that only one of the two callers sets up.
+        tier2_audit_shard "$shard" "$(ns_jac shards scope "$shard" "$CONFIG")" "$NS_TASK_NAME" &
     done
     wait
 
@@ -266,14 +303,41 @@ tier2_audit_all() {
 }
 
 # Phase B — select (pure function in selector.jac; deterministic, unit-tested)
+#
+# `phase` is `cycle` or `reactive`. It is a FILENAME INFIX and nothing else, and it is empty for
+# the cycle phase on purpose:
+#
+#   RECONCILIATION B6 -- findings.json and selection.json must keep those exact names. lib/dataset.sh
+#   line 18 and scripts/dataset.jac lines 70/88 hardcode them, so a `-cycle` suffix would make
+#   dataset_record_night return 0 having recorded nothing. This repo already fixed that exact bug
+#   once, in ffdf856/e0db4a3. The reactive artifacts are NEW files (findings-reactive.json,
+#   selection-reactive.json) and collide with nothing.
+ns_phase_suffix() {   # ns_phase_suffix <phase>  -- "" for cycle, "-<phase>" otherwise
+    case "$1" in
+        cycle) printf '%s' "" ;;
+        *)     printf -- '-%s' "$1" ;;
+    esac
+}
+
 tier2_select() {
-    local carry="$NS_ROOT/state/carryover.json" input="$LOG_DIR/findings.json"
+    local phase=$1 sfx carry="$NS_ROOT/state/carryover.json" input
+    sfx="$(ns_phase_suffix "$phase")"
+    input="$LOG_DIR/findings$sfx.json"
 
     # Carried themes are packed FIRST the next night (selector.jac sorts on the carry flag), and
     # merging them AHEAD of tonight's findings also makes the carried copy win the (file, rule)
     # dedupe in parse_result merge -- so a re-discovered finding keeps its carry flag.
-    if [ -s "$carry" ]; then
-        if ns_jac parse_result merge "$carry" "$LOG_DIR/findings.json" > "$LOG_DIR/findings-all.json"; then
+    #
+    # RECONCILIATION B7 -- carry-over belongs to the CYCLE phase ONLY. The reactive pass runs first;
+    # if it also consumed the carry-over it would pack yesterday's deferrals into the reactive
+    # phase (spec section 4 says reactive OUTRANKS carry-over, not that it absorbs it) and then
+    # overwrite carryover.json with its own deferrals -- spending yesterday's carry-over twice in
+    # one night and losing it.
+    if [ "$phase" = cycle ] && [ -s "$carry" ]; then
+        # "$input", not a second hardcoded findings.json: the two are the same file in the cycle
+        # phase, and writing the name twice means a phase guard that is deleted looks harmless
+        # (the merge would just fail on a missing file) instead of doing the damage B7 describes.
+        if ns_jac parse_result merge "$carry" "$input" > "$LOG_DIR/findings-all.json"; then
             input="$LOG_DIR/findings-all.json"
             ns_log S3 "carry-over: $(ns_jac parse_result len < "$carry" || echo 0) deferred finding(s) packed ahead of tonight's task"
         else
@@ -283,27 +347,43 @@ tier2_select() {
     # An absent/empty input is the normal shape of a night whose audit produced nothing AND which
     # has no carry-over. `return 0`, not a die: S4/S5 still have work if an earlier stage queued a
     # branch, and dataset_record_night is what reports the empty night.
-    [ -s "$input" ] || { ns_log S3 "nothing to select"; return 0; }
+    [ -s "$input" ] || { ns_log S3 "nothing to select for the $phase phase"; return 0; }
 
     ns_jac selector select "$CONFIG" "$LEDGER" "$STATE" "$(ns_remaining_min)" "$REPO" \
-        < "$input" > "$LOG_DIR/selection.json"
+        < "$input" > "$LOG_DIR/selection$sfx.json"
 
     # Tonight's own deferrals become tomorrow's carry-over. Written to a temp file and moved, so a
     # failure here leaves YESTERDAY's carry-over intact rather than truncating it to nothing --
     # the redirect would otherwise have emptied the file before the reader could fail.
-    if ns_jac parse_result field carryover < "$LOG_DIR/selection.json" > "$carry.tmp"; then
-        mv "$carry.tmp" "$carry"
-        ns_log S3 "carry-over for the next night: $(ns_jac parse_result len < "$carry" || echo 0) finding(s)"
-    else
-        rm -f "$carry.tmp"
-        ns_fail "carry-over" "could not extract tonight's carryover set — yesterday's file left untouched"
+    #
+    # Cycle phase only, per B7 above. A reactive deferral is still remembered -- the `dropped` loop
+    # below upserts it into the ledger as `deferred`, and the next audit that re-finds it keeps its
+    # fingerprint -- it simply does not get to displace the cycle phase's carry-over file, which is
+    # the one thing tomorrow night reads first.
+    if [ "$phase" = cycle ]; then
+        if ns_jac parse_result field carryover < "$LOG_DIR/selection.json" > "$carry.tmp"; then
+            mv "$carry.tmp" "$carry"
+            ns_log S3 "carry-over for the next night: $(ns_jac parse_result len < "$carry" || echo 0) finding(s)"
+        else
+            rm -f "$carry.tmp"
+            ns_fail "carry-over" "could not extract tonight's carryover set — yesterday's file left untouched"
+        fi
     fi
 
-    # findings the selector shed for budget/clock reasons are remembered as deferred (TPRD 9)
-    local fp file reason
-    ns_jac selector dropped "$LOG_DIR/selection.json" | while IFS=$'\t' read -r fp file reason; do
+    # findings the selector shed for budget/clock reasons are remembered as deferred (TPRD 9), and
+    # teed to $LOG_DIR/deferred.jsonl so the digest can list them without re-scanning the ledger.
+    local fp file reason drow
+    ns_jac selector dropped "$LOG_DIR/selection$sfx.json" | while IFS=$'\t' read -r fp file reason; do
         case "$reason" in
             over-theme-budget|over-night-budget|no-clock-left)
+                # Projected by Jac, never composed here (same rule ship_pr_row and inventory_row
+                # follow), and never fatal: losing a digest row must not also lose the ledger row
+                # that is the actual system of record for a deferral.
+                if drow="$(ns_jac cigate deferred "fingerprint=$fp" "file=$file" "reason=$reason" "phase=$phase" 2>&1)"; then
+                    printf '%s\n' "$drow" >> "$LOG_DIR/deferred.jsonl"
+                else
+                    ns_warn "could not project a deferred.jsonl row for $file ($reason): $drow — the digest will not list it"
+                fi
                 printf '{"fingerprint":"%s","file":"%s","rule":"unknown","summary":"deferred by selector","status":"deferred"}\n' "$fp" "$file" \
                     | ns_jac ledger upsert "$LEDGER" >/dev/null ;;
         esac
@@ -312,11 +392,11 @@ tier2_select() {
 
 # Phase C — apply: fresh branch + fresh headless session per theme
 tier2_apply() {
-    local slug branch theme_file prompt remaining attempt got_report limit_hit
+    local phase=$1 sfx slug bslug branch theme_file prompt remaining attempt got_report limit_hit
     local theme_task theme_cx attempt_model
-    ns_jac selector split "$LOG_DIR/selection.json" "$LOG_DIR" | while IFS= read -r slug; do
+    sfx="$(ns_phase_suffix "$phase")"
+    ns_jac selector split "$LOG_DIR/selection$sfx.json" "$LOG_DIR" | while IFS= read -r slug; do
         theme_file="$LOG_DIR/theme-$slug.json"
-        branch="nightshift/$NS_DATE/$slug"
 
         remaining="$(ns_remaining_min)"
         if [ "$remaining" -lt $(( NS_BUDGETS_APPLY_TIMEOUT_MIN + 20 )) ]; then
@@ -335,6 +415,28 @@ tier2_apply() {
         esac
         [ -f "$NS_ROOT/prompts/apply-rules-$theme_task.md" ] \
             || ns_die "$EX_BUG" "no prompts/apply-rules-$theme_task.md for theme $slug"
+
+        # THE BRANCH SLUG. selector.jac builds `<task>-<theme-hint>`; a reactive theme becomes
+        # `<task>-reactive-<theme-hint>`, so the two phases cannot collide on a branch name even
+        # when they land on the same file with the same hint.
+        #
+        # RECONCILIATION B2 -- the marker goes AFTER the task, never in front of it. lib/common.sh's
+        # ns_task_of_branch resolves the task from the slug BY PREFIX, and that resolution is the
+        # sole input to check_scope's protect_unless. A `reactive-` prefix would make every reactive
+        # branch fail S4 unresolved, and `reactive-coverage-*` would never receive the `tests/**`
+        # write exemption that is the only reason a coverage branch can write anything at all.
+        #
+        # The theme file is MOVED to match, because $LOG_DIR/theme-<branch-basename>.json is where
+        # ns_theme_for_branch looks and where lib/ship.sh copies from -- a branch whose theme file
+        # is named after the pre-rename slug re-gates with no theme, which ns_theme_for_branch
+        # (correctly) treats as fatal rather than as "skip scope containment".
+        case "$phase" in
+            cycle) bslug="$slug" ;;
+            *)     bslug="$theme_task-$phase-${slug#"$theme_task"-}"
+                   mv "$theme_file" "$LOG_DIR/theme-$bslug.json"
+                   theme_file="$LOG_DIR/theme-$bslug.json" ;;
+        esac
+        branch="nightshift/$NS_DATE/$bslug"
         # ...and that task's OWN knobs, re-evaluated per theme. A carried theme belongs to an
         # earlier night's task and keeps its own ponytail mode: rendering it at TONIGHT's
         # NS_TASK_PONYTAIL is how a carried coverage theme would silently be told to YAGNI away the
@@ -355,7 +457,7 @@ tier2_apply() {
         limit_hit=0
         for attempt in 1 2; do
             attempt_model="$(ns_attempt_model "$attempt" "$theme_cx")"
-            ns_log S3 "apply $slug attempt $attempt on $attempt_model (task=$theme_task, complexity=$theme_cx)"
+            ns_log S3 "apply $bslug attempt $attempt on $attempt_model (task=$theme_task, complexity=$theme_cx)"
             cd "$REPO"
             git checkout -f "$NS_REPO_DEFAULT_BRANCH" 2>/dev/null || true
             git branch -D "$branch" 2>/dev/null || true
@@ -370,27 +472,27 @@ tier2_apply() {
                 --permission-mode acceptEdits \
                 --allowedTools "Read,Edit,Grep,Glob,Bash(jac fmt *),Bash(jac check *),Bash(jac code *),Bash(jac test *),Bash(git diff *),Bash(git status *),Bash(git log *),Bash(git add *),Bash(git rm *),Bash(git commit *),mcp__jac__*" \
                 --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \
-                --output-format json) > "$LOG_DIR/apply-$slug.json" < /dev/null || true
+                --output-format json) > "$LOG_DIR/apply-$bslug.json" < /dev/null || true
 
-            ns_jac parse_result meta < "$LOG_DIR/apply-$slug.json" > "$LOG_DIR/meta-apply-$slug.json" || true
+            ns_jac parse_result meta < "$LOG_DIR/apply-$bslug.json" > "$LOG_DIR/meta-apply-$bslug.json" || true
 
-            if ns_jac parse_result report < "$LOG_DIR/apply-$slug.json" > "$LOG_DIR/report-$slug.json"; then
+            if ns_jac parse_result report < "$LOG_DIR/apply-$bslug.json" > "$LOG_DIR/report-$bslug.json"; then
                 got_report=1
                 break
             fi
             # A hard account limit fails every retry and every later theme until it resets —
             # observed: "You've hit your session limit · resets 7am". Stop burning the night.
-            if grep -q "hit your session limit" "$LOG_DIR/apply-$slug.json"; then
+            if grep -q "hit your session limit" "$LOG_DIR/apply-$bslug.json"; then
                 limit_hit=1
                 ns_log S3 "Claude session limit hit — retrying is pointless until it resets"
                 break
             fi
-            ns_log S3 "apply $slug attempt $attempt failed to parse (transient API error?) — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"
+            ns_log S3 "apply $bslug attempt $attempt failed to parse (transient API error?) — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"
         done
 
         if [ "$got_report" -ne 1 ]; then
-            ns_fail "theme $slug" "apply session died or returned malformed report after retry — branch discarded"
-            rm -f "$LOG_DIR/report-$slug.json"    # empty/invalid leftover from the failed redirect — sendmail's digest globs report-*.json
+            ns_fail "theme $bslug" "apply session died or returned malformed report after retry — branch discarded"
+            rm -f "$LOG_DIR/report-$bslug.json"    # empty/invalid leftover from the failed redirect — sendmail's digest globs report-*.json
             git checkout -f "$NS_REPO_DEFAULT_BRANCH"; git branch -D "$branch" || true
             if [ "$limit_hit" = 1 ]; then
                 ns_fail "agentic tier" "session limit — remaining themes deferred to a future night"
@@ -400,7 +502,7 @@ tier2_apply() {
         fi
 
         if git diff --quiet "$NS_REPO_DEFAULT_BRANCH...HEAD" 2>/dev/null; then
-            ns_fail "theme $slug" "agent made no committed changes — branch discarded"
+            ns_fail "theme $bslug" "agent made no committed changes — branch discarded"
             git checkout -f "$NS_REPO_DEFAULT_BRANCH"; git branch -D "$branch" || true
             continue
         fi
@@ -415,22 +517,22 @@ tier2_apply() {
         # hardcoded `refactor` while the S4 gate already honoured the theme's kind.
         local frag_kind fragment
         frag_kind="$(ns_jac parse_result field fragment_kind < "$theme_file")"
-        fragment="$(ns_jac render_draft frag "$LOG_DIR/report-$slug.json" "$frag_kind")"
+        fragment="$(ns_jac render_draft frag "$LOG_DIR/report-$bslug.json" "$frag_kind")"
         if [ -n "$fragment" ]; then
             mkdir -p "$(dirname "$REPO/$fragment")"
             # `fragment`, not `field`: normalizes into bullet form (nslib.normalize_fragment_body)
             # so an agent's plain-English release_note_md can't reach a commit unbulleted and
             # fail CI's content-format check (ci.yml contribution-checks, check-release-notes.sh
             # ~line 176) while the local gate (fragcheck.jac) would have passed it.
-            ns_jac parse_result fragment release_note_md < "$LOG_DIR/report-$slug.json" > "$REPO/$fragment"
+            ns_jac parse_result fragment release_note_md < "$LOG_DIR/report-$bslug.json" > "$REPO/$fragment"
             git add "$fragment"
             git commit -m "docs: release note fragment (nightshift)"
         else
-            ns_log S3 "theme $slug touches no jac/jaclang/ path — no fragment required"
+            ns_log S3 "theme $bslug touches no jac/jaclang/ path — no fragment required"
         fi
 
         ns_jac ledger upsert-theme "$theme_file" "$branch" "$LEDGER" >/dev/null
-        ns_queue_branch "$branch" "$theme_file" "$LOG_DIR/report-$slug.json"
+        ns_queue_branch "$branch" "$theme_file" "$LOG_DIR/report-$bslug.json"
         git checkout -f "$NS_REPO_DEFAULT_BRANCH"
     done
 }

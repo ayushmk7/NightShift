@@ -1625,4 +1625,143 @@ printf '#!/usr/bin/env bash\nexit 4\n' > "$P/gh"; chmod +x "$P/gh"; echo '{}' > 
 ) >/dev/null 2>&1 || fail "reactive_stage propagated a failed poll; under ns_stage's errexit that ends the night at S1.5"
 echo "merge poll distinguishes quiet, empty, malformed and real; a failed poll cannot end the night"
 
+echo "== 22. reactive pass: a quiet day spends nothing, and never looks like a failure =="
+# Four LLM sessions a night is the most expensive thing in Plan 4, justified ONLY by the scope
+# being a handful of merged files. The guard that keeps a quiet day free is one `-s` test, and
+# losing it would be invisible except on the bill. Driven with a claude stub that records any
+# invocation; nothing here can reach a real session even if the guard is broken.
+rm -rf .jac
+Q="$T/quiet"; mkdir -p "$Q"
+printf '#!/usr/bin/env bash\ntouch "%s/CLAUDE_WAS_CALLED"\n' "$Q" > "$Q/claude"; chmod +x "$Q/claude"
+: > "$Q/reactive-files.txt"
+(
+    . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"; . "$NS_ROOT/lib/reactive.sh"
+    LOG_DIR="$Q"; NS_PATHS_CLAUDE="$Q/claude"; date +%s > "$Q/start_epoch"; reactive_main
+) > "$Q/out.txt" 2>&1 || fail "reactive_main returned nonzero on a quiet day -- it must never fail the night"
+[ -e "$Q/CLAUDE_WAS_CALLED" ] && fail "a quiet day started an audit session; the reactive pass is not free"
+[ -e "$Q/failed.tsv" ] && fail "a quiet day wrote a failure row; 'nothing merged' is not a failure"
+[ -e "$Q/covmap.json" ] && fail "a quiet day built covmap evidence; the guard must return before any work at all"
+case "$(ls "$Q" | grep -c '^findings-\|^audit-' || true)" in
+    0) : ;;
+    *) fail "a quiet day left audit artifacts behind: $(ls "$Q" | grep '^findings-\|^audit-' | tr '\n' ' ')" ;;
+esac
+# ...and it must still SAY something, or a skipped pass is indistinguishable from a missing one
+grep -q 'S3a' "$Q/out.txt" || fail "a quiet day logged nothing at all; a skipped pass must be visible"
+case "$(grep -c 'S3a' "$Q/out.txt")" in
+    1) : ;;
+    *) fail "a quiet day logged $(grep -c 'S3a' "$Q/out.txt") S3a lines; the guard promises exactly one" ;;
+esac
+# THE DISTINCTION THIS WHOLE PLAN EXISTS FOR: a poll that never answered leaves NO scope file, and
+# must not be reported with the same words as a poll that answered "nothing".
+N="$T/noask"; mkdir -p "$N"
+cp "$Q/claude" "$N/claude"
+(
+    . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"; . "$NS_ROOT/lib/reactive.sh"
+    LOG_DIR="$N"; NS_PATHS_CLAUDE="$N/claude"; date +%s > "$N/start_epoch"; reactive_main
+) > "$N/out.txt" 2>&1 || fail "reactive_main returned nonzero when the poll had not answered"
+[ -e "$N/CLAUDE_WAS_CALLED" ] && fail "a missing merge poll still started audit sessions"
+grep -q 'did not answer' "$N/out.txt" \
+    || fail "a poll that never ran was reported as a quiet day: $(cat "$N/out.txt") -- 'did not ask' is being scored as 'nothing merged'"
+grep -q 'no upstream merges' "$N/out.txt" \
+    && fail "a poll that never ran was reported with the quiet-day wording"
+
+# The CEILING: a merge day too large to read is truncated with a warning, not pursued. Driven, with
+# a claude stub that records the prompt it was handed so the scope can be counted.
+C="$T/ceiling"; mkdir -p "$C"
+cat > "$C/claude" <<'STUB'
+#!/usr/bin/env bash
+while [ $# -gt 0 ]; do
+    case "$1" in -p) printf '%s' "$2" >> "$CEILING_PROMPTS" ;; esac
+    shift
+done
+printf '{"result":"```json\\n[]\\n```"}\n'
+STUB
+chmod +x "$C/claude"
+: > "$C/prompts.txt"
+echo '[]' > "$C/covmap.json"          # pre-seeded so no `jac code map` runs inside the harness
+awk 'BEGIN{for(i=1;i<=45;i++) printf "jac/jaclang/cli/f%02d.jac\n", i}' > "$C/reactive-files.txt"
+(
+    . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"; . "$NS_ROOT/lib/reactive.sh"
+    LOG_DIR="$C"; NS_PATHS_CLAUDE="$C/claude"; CEILING_PROMPTS="$C/prompts.txt"; export CEILING_PROMPTS
+    date +%s > "$C/start_epoch"; reactive_main
+) > "$C/out.txt" 2>&1 || fail "reactive_main failed on an over-ceiling merge day"
+grep -q 'exceeds the 40-file ceiling' "$C/warnings.txt" \
+    || fail "a 45-file merge day was audited whole with no truncation warning; the digest would not say the pass was partial"
+grep -q 'f01.jac' "$C/prompts.txt" || fail "the truncated scope dropped the highest-ranked file"
+grep -q 'f45.jac' "$C/prompts.txt" \
+    && fail "the ceiling did not actually truncate: the 45th file reached the audit prompt"
+[ "$(wc -l < "$C/reactive-summary.tsv" | tr -d ' ')" = "4" ] \
+    || fail "reactive-summary.tsv is not one row per lens: $(cat "$C/reactive-summary.tsv")"
+
+# RECONCILIATION B2 -- the reactive marker goes AFTER the task in the branch slug, never in front.
+# ns_task_of_branch resolves the task BY PREFIX and that resolution is the sole input to
+# protect_unless, so a `reactive-` prefix would fail every reactive branch at S4 and would never
+# grant reactive-coverage-* its tests/** exemption. Driven against the REAL statement extracted
+# from lib/tier2.sh and the REAL resolver, not grepped for.
+# The `*)` case-arm prefix is stripped so the assignment can be eval'd on its own; everything to
+# the right of it is byte-for-byte what lib/tier2.sh runs.
+bslug_expr="$(grep -F 'bslug="$theme_task-$phase-${slug#"$theme_task"-}"' "$NS_ROOT/lib/tier2.sh" \
+              | head -1 | sed -e 's/^[[:space:]]*\*)[[:space:]]*//' || true)"
+case "$bslug_expr" in
+    "") fail "lib/tier2.sh no longer builds the reactive branch slug as <task>-reactive-<hint>; section 22's B2 check would be vacuous" ;;
+esac
+built="$( theme_task=coverage; phase=reactive; slug="coverage-cli-gaps"; eval "$bslug_expr"; printf '%s' "$bslug" )"
+case "$built" in
+    "coverage-reactive-cli-gaps") : ;;
+    *) fail "the reactive branch slug is '$built', not 'coverage-reactive-cli-gaps'" ;;
+esac
+resolved="$( . "$NS_ROOT/lib/common.sh"; ns_load_config; ns_task_of_branch "nightshift/2026-07-30/$built" || true )"
+case "$resolved" in
+    coverage) : ;;
+    *) fail "ns_task_of_branch resolved '$built' to '$resolved', not 'coverage' -- this branch would fail S4 and never get its tests/** exemption" ;;
+esac
+# ...and the check is not vacuous: the shape RECONCILIATION B2 forbids must actually be unresolvable.
+bad="$( . "$NS_ROOT/lib/common.sh"; ns_load_config; ns_task_of_branch "nightshift/2026-07-30/reactive-coverage-cli-gaps" || true )"
+case "$bad" in
+    "") : ;;
+    *) fail "ns_task_of_branch resolved the forbidden 'reactive-<task>-' shape to '$bad'; the assertion above proves nothing" ;;
+esac
+
+# RECONCILIATION B6 -- the cycle phase must keep the EXACT names lib/dataset.sh and
+# scripts/dataset.jac hardcode. A `-cycle` infix makes dataset_record_night return 0 recording
+# nothing, which this repo already shipped once (ffdf856/e0db4a3).
+sfx_cycle="$( . "$NS_ROOT/lib/tier2.sh"; ns_phase_suffix cycle )"
+sfx_react="$( . "$NS_ROOT/lib/tier2.sh"; ns_phase_suffix reactive )"
+case "$sfx_cycle" in
+    "") : ;;
+    *) fail "the cycle phase adds the suffix '$sfx_cycle' to findings/selection; lib/dataset.sh reads findings.json by name and would record nothing" ;;
+esac
+case "$sfx_react" in
+    "-reactive") : ;;
+    *) fail "the reactive phase suffix is '$sfx_react', so its artifacts would collide with the cycle phase's" ;;
+esac
+grep -q 'LOG_DIR/findings.json' "$NS_ROOT/lib/dataset.sh" \
+    || fail "lib/dataset.sh no longer reads findings.json by that name -- the B6 check above is pinned to the wrong fact"
+
+# RECONCILIATION B7 -- carry-over is consumed and rewritten by the CYCLE phase only. The reactive
+# phase runs first; if it also owned carryover.json it would pack yesterday's deferrals into the
+# reactive phase and then overwrite them with its own, spending them twice in one night.
+R="$T/carry"; mkdir -p "$R/state"
+# NS_ROOT is overridden below so tier2_select's "$NS_ROOT/state/carryover.json" lands in the
+# sandbox; ns_jac resolves scripts/ relative to the same variable, so link the real ones in.
+ln -sfn "$NS_ROOT/scripts" "$R/scripts"
+printf '[{"file":"jac/jaclang/cli/carried.jac","rule":"dead-code","snippet":"s","summary":"x","task":"dead-code","theme_hint":"cli","est_loc_saved":40,"confidence":5,"risk":1,"complexity":"trivial","fingerprint":"carry1"}]\n' \
+    > "$R/state/carryover.json"
+cp "$R/state/carryover.json" "$R/carryover.before"
+printf '[{"file":"jac/jaclang/scale/new.jac","rule":"dead-code","snippet":"s","summary":"y","task":"dead-code","theme_hint":"scale","est_loc_saved":10,"confidence":5,"risk":1,"complexity":"trivial","fingerprint":"react1"}]\n' \
+    > "$R/findings-reactive.json"
+(
+    . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"
+    NS_ROOT="$R"; LOG_DIR="$R"; LEDGER="$R/ledger.jsonl"; STATE="$R/state.json"
+    REPO="/nonexistent-repo"; date +%s > "$R/start_epoch"
+    tier2_select reactive
+) > "$R/out.txt" 2>&1 || fail "tier2_select reactive failed: $(cat "$R/out.txt")"
+cmp -s "$R/state/carryover.json" "$R/carryover.before" \
+    || fail "the REACTIVE phase rewrote carryover.json; yesterday's carry-over is consumed twice in one night and then lost (RECONCILIATION B7)"
+[ -f "$R/selection-reactive.json" ] || fail "tier2_select reactive wrote no selection-reactive.json"
+[ -e "$R/selection.json" ] && fail "tier2_select reactive wrote the CYCLE phase's selection.json"
+grep -q 'carried.jac' "$R/selection-reactive.json" \
+    && fail "the reactive phase packed yesterday's carry-over; spec section 4 says reactive OUTRANKS carry-over, not that it absorbs it"
+echo "quiet day: 0 sessions, 0 failure rows, 0 artifacts, 1 log line; ceiling truncates; B2/B6/B7 hold"
+
 echo "ALL HARNESS TESTS PASSED"
