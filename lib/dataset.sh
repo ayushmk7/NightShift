@@ -35,6 +35,11 @@ dataset_record_refactor() {
 # signal, joined to refactors.jsonl by branch name at training time.
 dataset_record_review() {
     local branch=$1 accepted=$2 reason=$3
+    # Both siblings above guard on NS_DRY_RUN; this one did not, and it is the only recorder reached
+    # from an INTERACTIVE command (promote/discard) rather than from a night. So every rehearsal of
+    # the ship or kill path appended a synthetic row to dataset/review.jsonl -- which, unlike
+    # logs/ and state/, is TRACKED. Caught during a Plan 3 rehearsal that dirtied the tree.
+    [ -n "${NS_DRY_RUN:-}" ] && return 0
     mkdir -p "$DATASET_DIR"
     ns_jac dataset record-review "$branch" "$DATASET_DIR" "$accepted" "$reason" >/dev/null
 }
