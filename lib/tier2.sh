@@ -257,7 +257,11 @@ tier2_apply() {
         local fragment; fragment="$(ns_jac render_draft frag "$LOG_DIR/report-$slug.json")"
         if [ -n "$fragment" ]; then
             mkdir -p "$(dirname "$REPO/$fragment")"
-            ns_jac parse_result field release_note_md < "$LOG_DIR/report-$slug.json" > "$REPO/$fragment"
+            # `fragment`, not `field`: normalizes into bullet form (nslib.normalize_fragment_body)
+            # so an agent's plain-English release_note_md can't reach a commit unbulleted and
+            # fail CI's content-format check (ci.yml contribution-checks, check-release-notes.sh
+            # ~line 176) while the local gate (fragcheck.jac) would have passed it.
+            ns_jac parse_result fragment release_note_md < "$LOG_DIR/report-$slug.json" > "$REPO/$fragment"
             git add "$fragment"
             git commit -m "docs: release note fragment (nightshift)"
         else

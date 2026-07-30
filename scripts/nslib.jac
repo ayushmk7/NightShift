@@ -190,6 +190,24 @@ def fragment_path(paths: list[str], kind: str) -> str {
     return "";
 }
 
+"""scripts/check-release-notes.sh's content-format check (~line 176) rejects any fragment line
+that does not start with whitespace or '-': a bare sentence like "Removed dead plugin config."
+fails CI even though the local gate used to pass it. The agent's `release_note_md` is free-form
+English with no format requirement in its own prompt schema, so the write path -- not just the
+prompt -- must not let an unbulleted sentence reach a commit. If the text already starts with '-'
+(the agent followed the convention), it is left alone; otherwise it is prefixed. This does not
+attempt to repair a "- #### heading" disguised as a bullet (check-release-notes.sh's OTHER
+malformed-content branch) -- that shape essentially never falls out of a plain-English sentence,
+so fragcheck.jac's content-format check exists to catch it rather than this function guessing
+how to un-disguise it."""
+def normalize_fragment_body(text: str) -> str {
+    stripped: str = text.strip();
+    if stripped.startswith("-") {
+        return stripped + "\n";
+    }
+    return "- " + stripped + "\n";
+}
+
 test "fingerprint is stable per (file, rule) and sensitive to both" {
     assert fingerprint("f.jac", "dup") == fingerprint("f.jac", "dup");
     assert fingerprint("f.jac", "dup") != fingerprint("g.jac", "dup");
@@ -219,6 +237,13 @@ test "fragment_path maps only jac/jaclang changes, and validates the kind" {
     # an invalid kind falls back to refactor rather than emitting a path CI will reject
     assert fragment_path(["jac/jaclang/cli/b.jac"], "nonsense")
         == "release_notes/unreleased/jaclang/0000.refactor.md";
+}
+
+test "normalize_fragment_body bullets a bare sentence, leaves an already-bulleted one alone" {
+    assert normalize_fragment_body("Removed dead plugin config.") == "- Removed dead plugin config.\n";
+    assert normalize_fragment_body("- **Fix: x**: y") == "- **Fix: x**: y\n";
+    # leading/trailing whitespace on the raw agent string is stripped before the bullet check
+    assert normalize_fragment_body("  Removed dead plugin config.  ") == "- Removed dead plugin config.\n";
 }
 
 test "ledger last-writer-wins" {

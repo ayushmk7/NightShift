@@ -54,7 +54,10 @@ errors you resolved and how).
   "files": ["every file you edited"],
   "loc_before": <int>, "loc_after": <int>,
   "risk": "low | medium",
-  "release_note_md": "one-sentence release-note fragment",
+  "release_note_md": "release-note fragment. MUST start with '- ' (a bullet point); the convention
+      this repo already uses is '- **Category: Brief title**: one-sentence description.' -- a
+      plain paragraph or a '#' heading fails CI's content-format check even though it will still
+      be auto-bulleted before it reaches a commit",
   "skipped": [{"file": "...", "reason": "..."}],
   "suspected_bugs": [{"file": "...", "line": <int>, "note": "..."}]
 }

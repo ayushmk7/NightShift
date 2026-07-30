@@ -2,6 +2,11 @@
 
 argv:  findings | report | meta      (stdin: the full envelope from --output-format json)
        field <key>                   (stdin: any JSON object; print the raw value — bash's jq)
+       fragment <key>                 (stdin: any JSON object; print field <key> NORMALIZED into
+                                       release-note-fragment bullet form — see nslib.normalize_-
+                                       fragment_body. Distinct from `field` on purpose: `field` is
+                                       used for package/branch/title/etc. too, where prefixing a
+                                       bullet would corrupt the value.)
        len                           (stdin: any JSON array; print its length)
        merge <f1.json> <f2.json> ..  (per-shard findings arrays; print one deduped array)
 - findings: validate the audit's fenced JSON array; print the normalized array.
@@ -11,7 +16,7 @@ Malformed output → message on stderr, exit 50 (TPRD 18) so the caller skips th
 """
 import sys;
 import json;
-import from nslib { eprint, read_stdin, parse_obj, parse_list, as_dict }
+import from nslib { eprint, read_stdin, parse_obj, parse_list, as_dict, normalize_fragment_body }
 
 """Return the body of the last ```json fenced block, or the whole text if none."""
 def extract_fenced_json(text: str) -> str {
@@ -125,6 +130,10 @@ with entry {
         if value is not None {
             print(value if isinstance(value, str) else json.dumps(value));
         }
+    } elif cmd == "fragment" and len(args) == 3 {
+        value2: any = parse_obj(read_stdin()).get(args[2]);
+        text: str = value2 if isinstance(value2, str) else json.dumps(value2);
+        print(normalize_fragment_body(text), end="");
     } elif cmd == "len" {
         print(len(parse_list(read_stdin())));
     } elif cmd in ["findings", "report", "meta"] {
@@ -151,7 +160,7 @@ with entry {
         print(json.dumps(merge_findings(arrays)));
     } elif cmd != "" and cmd != "test" {
         eprint("usage: claude -p ... --output-format json | jac run parse_result.jac findings|report|meta");
-        eprint("       ... | jac run parse_result.jac field <key> | len");
+        eprint("       ... | jac run parse_result.jac field <key> | fragment <key> | len");
         eprint("       jac run parse_result.jac merge <findings1.json> <findings2.json> ...");
     }
 }
