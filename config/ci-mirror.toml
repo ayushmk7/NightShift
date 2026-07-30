@@ -72,14 +72,21 @@ ci_job = "contribution-checks"
 # AI co-author check: CI's exact command is
 #   git log origin/${{ github.base_ref }}..HEAD --format='%b' | grep -iP '...'
 # `github.base_ref` only exists for a real PR event. Locally there is no PR object, so this
-# mirrors it as `git log main..HEAD` -- the commits unique to the current branch vs `main`,
-# which is exactly what CI's `origin/base..HEAD` log range means for a PR opened against main.
-# Nightshift IS an AI agent producing commits, so this is precisely the check most likely to
-# bite one of its own PRs -- it stays a hard gate, not a nice-to-have.
+# mirrors it as `git log $NS_REPO_DEFAULT_BRANCH..HEAD` -- the commits unique to the current
+# branch vs the default branch, which is exactly what CI's `origin/base..HEAD` log range means
+# for a PR opened against it. Nightshift IS an AI agent producing commits, so this is precisely
+# the check most likely to bite one of its own PRs -- it stays a hard gate, not a nice-to-have.
 #
 # Block Python files: CI diffs `origin/${{ github.base_ref }}...HEAD` (triple-dot, i.e. relative
 # to the merge-base). Mirrored the same way lib/verify.sh already diffs
-# ("$NS_REPO_DEFAULT_BRANCH...HEAD") for consistency: `main...HEAD`.
+# ("$NS_REPO_DEFAULT_BRANCH...HEAD") for consistency.
+#
+# EVAL NOTE for whoever builds the executor (Task 5/6): these command strings are `eval`ed in a
+# subshell that already has the config env loaded (see lib/common.sh's ns_load_config /
+# NS_REPO_DEFAULT_BRANCH, NS_PATHS_JAC, NS_ROOT), so `$NS_REPO_DEFAULT_BRANCH` and the leading
+# `CI=true`-style env prefix on the fragment-check command below expand/apply correctly at eval
+# time. Do NOT "sanitize" a bare `$VAR` or a leading `VAR=value` out of these strings -- both are
+# intentional and load-bearing.
 #
 # `-P` -> `-E`: CI's runners are Linux/GNU grep, where `-P` (PCRE) works. This dev host's real
 # /usr/bin/grep is BSD grep with NO PCRE support at all -- `grep -P` hard-errors
@@ -94,26 +101,31 @@ ci_job = "contribution-checks"
 # directly (env -i PATH=/usr/bin:/bin, i.e. no shell shim): both patterns behave identically
 # under `-iE`/`-E` here to their documented `-iP`/`-P` CI behavior.
 #
-# Check Release Notes Updated: CI runs this with `env: CI: "true"` (ci.yml:507). Without CI=true,
-# scripts/check-release-notes.sh (line 16) takes its "local mode" branch and reads
-# `git diff --cached` -- against a committed tree (no staged files) that is always empty, so the
-# script hits its `[ -z "$CHANGED_FILES" ] && exit 0` early-out and silently passes regardless of
-# whether a fragment is actually missing. `CI=true` is required for this gate to gate anything.
-# KNOWN LIMITATION, measured 2026-07-30: even with CI=true, `bash scripts/check-release-notes.sh`
-# currently fails immediately on this dev host with "line 12: jac: unbound variable" -- the
-# script's `declare -A FOLDER_TO_FRAGMENTS=(...)` needs bash 4+ associative arrays, and this
-# host's only bash (both /bin/bash and `env bash`) is 3.2.57. This is a pre-existing defect in
-# the TARGET repo's own script (it assumes a bash newer than what CI's ubuntu runners are not the
-# only place this can run), not something introduced by this fix, and out of scope to patch here
-# (work/repo is upstream-tracked, not ours to edit). Whoever wires this command up (Task 5/6)
-# needs a bash >= 4 on PATH for this one command specifically, or the gate will hard-error before
-# it can ever pass or fail meaningfully.
+# Check Release Notes Updated: CI's ACTUAL command is `bash scripts/check-release-notes.sh` with
+# `env: CI: "true"` (ci.yml:502-512). That command CANNOT run on this host: the script's line
+# 12 `declare -A FOLDER_TO_FRAGMENTS=(...)` needs bash 4+ associative arrays, and this harness's
+# only available bash (both /bin/bash and whatever `env bash` resolves to) is 3.2.57. Under 3.2,
+# `declare -A` is silently rejected and bash then mis-parses the parenthesized initializer as an
+# INDEXED-array subscript, evaluating `["jac/jaclang/"]` arithmetically -- which references the
+# unset variable `jac` under `set -u` and crashes ("line 12: jac: unbound variable")
+# unconditionally, before the script's own CI/local branching ever runs. Adding the required
+# `CI=true` alone does NOT fix this -- it still crashes -- so this is a DELIBERATE, DISCLOSED
+# EQUIVALENT rather than the literal script: scripts/fragcheck.jac (in this harness's own
+# scripts/, run under $NS_PATHS_JAC, never $NS_PATHS_JAC_REPO -- it is a Nightshift tool, not a
+# repo-facing one) reimplements exactly the folder_changed/fragment_added rule from
+# check-release-notes.sh:122-144 in Jac, using the harness's existing nslib.fragment_path mapping.
+# It deliberately does NOT reimplement that script's PR-number-match check, its
+# directly-edited-release-notes-file check, or its fragment-content-format check (see
+# fragcheck.jac's own header for why each is out of scope). CI itself remains the authority on the
+# real, complete rule; this is a local approximation for a pre-PR gate that would otherwise be
+# unable to run at all on this host. Piped the same way CI's diff-derived file list would be:
+# `git diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD" | ...`.
 commands = [
-  "if git log main..HEAD --format='%b' | grep -iE 'co-authored-by:.*\\b(claude|anthropic|openai|copilot|composer|cursor|gpt|gemini|ai|bot)\\b'; then echo \"AI co-author attribution found in commit messages. Remove Co-Authored-By lines referencing AI tools.\"; exit 1; fi",
-  "if git diff --name-only --diff-filter=A main...HEAD | grep -E '\\.py$'; then echo \"New Python (.py) files detected in this PR. This codebase does not allow adding Python files.\"; exit 1; fi",
+  "if git log $NS_REPO_DEFAULT_BRANCH..HEAD --format='%b' | grep -iE 'co-authored-by:.*\\b(claude|anthropic|openai|copilot|composer|cursor|gpt|gemini|ai|bot)\\b'; then echo \"AI co-author attribution found in commit messages. Remove Co-Authored-By lines referencing AI tools.\"; exit 1; fi",
+  "if git diff --name-only --diff-filter=A $NS_REPO_DEFAULT_BRANCH...HEAD | grep -E '\\.py$'; then echo \"New Python (.py) files detected in this PR. This codebase does not allow adding Python files.\"; exit 1; fi",
   '''jac_ver=$(grep -oE 'glob BUN_VERSION = "[^"]+"' jac/jaclang/runtimelib/client/bun_installer.jac | grep -oE '"[^"]+"' | tr -d '"'); zig_ver=$(grep -oE 'const BUN_VERSION = "[^"]+"' jac/launcher/payload.zig | grep -oE '"[^"]+"' | tr -d '"'); if [ -z "$jac_ver" ] || [ -z "$zig_ver" ]; then echo "Could not read BUN_VERSION from both bun_installer.jac and payload.zig"; exit 1; fi; if [ "$jac_ver" != "$zig_ver" ]; then echo "BUN_VERSION mismatch: bun_installer.jac=$jac_ver vs payload.zig=$zig_ver"; exit 1; fi''',
   "jac run scripts/validate_docs_code.jac",
-  "CI=true bash scripts/check-release-notes.sh",
+  "git diff --name-only \"$NS_REPO_DEFAULT_BRANCH...HEAD\" | \"$NS_PATHS_JAC\" run \"$NS_ROOT/scripts/fragcheck.jac\" check",
 ]
 
 # Step 2b decision (whole-repo `jac check . --ignore ... --nowarn`, ci.yml:412-424):
