@@ -69,9 +69,16 @@ test "scope renders paths and appends exclusions only when present" {
 
 test "shards do not overlap once exclusions are applied" {
     cfg: dict = load_config_toml("config/nightshift.toml");
-    # compiler-core must exclude compiler-passes or the two shards audit the same files twice
+    # compiler-core must exclude compiler-passes or the two shards audit the same files twice.
+    # The expected value is DERIVED from compiler-passes' own [shards.paths] entry, never retyped:
+    # with the literal hardcoded, renaming that shard's path (say to .../passes2) left this test
+    # green while the two shards silently started overlapping again -- the exact drift it exists
+    # to catch.
+    paths_table: dict = as_dict(as_dict(cfg["shards"])["paths"]);
+    passes: list[str] = [str(p) for p in as_list(paths_table["compiler-passes"])];
     excl_table: dict = as_dict(as_dict(cfg["shards"])["exclude"]);
-    assert "jac/jaclang/compiler/passes" in [
-        str(p) for p in as_list(excl_table["compiler-core"])
-    ];
+    excluded: list[str] = [str(p) for p in as_list(excl_table["compiler-core"])];
+    for p in passes {
+        assert p in excluded;
+    }
 }

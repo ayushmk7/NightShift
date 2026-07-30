@@ -175,15 +175,22 @@ def is_protected(path: str, globs: list[str]) -> bool {
 }
 
 """scripts/check-release-notes.sh in the target repo maps exactly one folder:
-jac/jaclang/ -> release_notes/unreleased/jaclang/. Everything else (jac-mcp/,
-jac/tests/, docs/) requires no fragment, so return "" and let callers skip it.
-The 0000 placeholder is renamed to the PR number after the PR is opened."""
+jac/jaclang/ -> release_notes/unreleased/jaclang/. Everything else (jac/tests/, docs/) requires
+no fragment, so return "" and let callers skip it.
+The 0000 placeholder is renamed to the PR number after the PR is opened.
+
+The `/tests/` exclusion mirrors check-release-notes.sh:131's `[[ "$file" != */tests/* ]]`, which
+fragcheck.is_gated_change already reproduces. Without it the two disagreed in the permissive-
+looking but wrong direction: a tests-only jac/jaclang/** theme -- the vestigial test sweep, which
+is Nightshift's single most common outcome -- got a fragment that CI does not require, written and
+committed by the orchestrator, on every such branch. Both encodings of the rule now live here and
+in fragcheck.is_gated_change; they must stay in lockstep."""
 glob VALID_FRAGMENT_KINDS: list[str] = ["feature", "bugfix", "breaking", "refactor", "docs"];
 
 def fragment_path(paths: list[str], kind: str) -> str {
     safe_kind: str = kind if kind in VALID_FRAGMENT_KINDS else "refactor";
     for p in paths {
-        if str(p).startswith("jac/jaclang/") {
+        if str(p).startswith("jac/jaclang/") and "/tests/" not in str(p) {
             return "release_notes/unreleased/jaclang/0000." + safe_kind + ".md";
         }
     }
@@ -221,6 +228,14 @@ test "protected globs with negation" {
     # fragments live outside docs/ now, so they are simply never protected
     assert not is_protected("release_notes/unreleased/jaclang/0000.refactor.md", globs);
     assert not is_protected("jac/jaclang/compiler/passes.jac", globs);
+    # The `!` branch above is NOT exercised by the release_notes assertion: no positive glob in
+    # that list matches a release_notes/ path, so the negation never has a `hit` to flip and the
+    # assertion passes with the whole `startswith("!")` arm deleted (verified by mutation).
+    # This pair is the one that actually flips: `docs/**` marks both files protected, and only the
+    # negation carves the first one back out.
+    carve: list[str] = ["docs/**", "!docs/api/generated.md"];
+    assert not is_protected("docs/api/generated.md", carve);
+    assert is_protected("docs/api/other.md", carve);
 }
 
 test "fragment_path maps only jac/jaclang changes, and validates the kind" {
@@ -231,6 +246,14 @@ test "fragment_path maps only jac/jaclang changes, and validates the kind" {
     # jac-mcp and the top-level test tree map to nothing: no fragment required
     assert fragment_path(["jac-mcp/server.jac"], "refactor") == "";
     assert fragment_path(["jac/tests/test_x.jac"], "refactor") == "";
+    # a tests-only jac/jaclang/** change needs none either -- check-release-notes.sh:131 excludes
+    # */tests/*, and fragcheck.is_gated_change mirrors it. This is the vestigial-test sweep, which
+    # used to get a fragment CI never asked for.
+    assert fragment_path(["jac/jaclang/compiler/tests/test_x.jac"], "refactor") == "";
+    assert fragment_path(["jac/jaclang/byllm/tests/test_byllm.jac"], "refactor") == "";
+    # a mixed diff (deleted tests plus real source) still gets exactly one fragment
+    assert fragment_path(["jac/jaclang/byllm/tests/test_x.jac", "jac/jaclang/byllm/y.jac"], "refactor")
+        == "release_notes/unreleased/jaclang/0000.refactor.md";
     # first matching path wins; a mixed diff still gets exactly one fragment
     assert fragment_path(["jac-mcp/a.jac", "jac/jaclang/cli/b.jac"], "docs")
         == "release_notes/unreleased/jaclang/0000.docs.md";

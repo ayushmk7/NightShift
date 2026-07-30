@@ -36,7 +36,10 @@ jac run scripts/parse_result.jac merge "$T/f.json" "$T/f2.json" > "$T/m.json"
     || fail "merge failed to dedupe an identical findings array"
 
 echo "== 4. scope gate: protected diff must be rejected =="
-printf '{"package":"pkg","files":["pkg/tests/fixtures/weird.jac"]}' > "$T/theme.json"
+# no "package" key: check_scope.jac has not read one since the audit went whole-repo/sharded
+# (violations() reads only files / fragment_kind / vestigial_deletions), and a dead key in a
+# fixture reads as a requirement the code no longer has.
+printf '{"files":["pkg/tests/fixtures/weird.jac"]}' > "$T/theme.json"
 if printf 'M\tpkg/tests/fixtures/weird.jac\n' \
     | jac run scripts/check_scope.jac check "$T/theme.json" config/nightshift.toml >/dev/null; then
     fail "scope gate let a protected path through"
@@ -134,9 +137,9 @@ probe() {              # probe <label> <branch> <path>... -> sets $got, fails lo
     got="$(printf '%s' "$raw" | tr '\n' ' ')"
 }
 
-# every routed class at once: compiler src, compiler tests, byllm, runtime, and the two no-gate ones
+# every routed class at once: compiler src, compiler tests, byllm, runtime, and the no-gate one
 probe "all classes" all jac/jaclang/compiler/x.jac jac/tests/compiler/t.jac jac/jaclang/byllm/b.jac \
-                        jac/jaclang/runtimelib/y.jac jac-mcp/z.jac \
+                        jac/jaclang/runtimelib/y.jac \
                         release_notes/unreleased/jaclang/1.refactor.md
 case "$got" in
     "byllm compiler runtime") : ;;
@@ -157,14 +160,17 @@ case "$got" in
     *) fail "jac/tests/compiler routed to '$got' -- runtime --ignores exactly those tests" ;;
 esac
 
-# an mcp-only or fragment-only change must gate NO suite at all. This is the assertion whose
-# expected value IS the empty string, so probe()'s status check above is what keeps it honest.
-probe "mcp+fragment" nogate jac-mcp/z.jac release_notes/unreleased/jaclang/2.docs.md
+# a fragment-only change must gate NO suite at all. This is the assertion whose expected value IS
+# the empty string, so probe()'s status check above is what keeps it honest.
+# (The jac-mcp/ probe that used to share this case was dropped 2026-07-30 along with the shard
+# registry entry and gated_suites_from_diff's arm: upstream deleted jac-mcp in 59f68a7a1, so no
+# path the harness can produce starts with it.)
+probe "fragment-only" nogate release_notes/unreleased/jaclang/2.docs.md
 case "$got" in
     "") : ;;
-    *) fail "mcp/fragment-only change should gate no suite, got '$got'" ;;
+    *) fail "a fragment-only change should gate no suite, got '$got'" ;;
 esac
-echo "routing correct: byllm-only stays byllm, compiler tests reach compiler, mcp/fragments gate nothing"
+echo "routing correct: byllm-only stays byllm, compiler tests reach compiler, fragments gate nothing"
 
 echo "== 8. S4 gate order: the cheap CI-mirror jobs must precede the expensive test suites =="
 # Ordering is a CORRECTNESS property here, not style. Get it backwards and every doomed branch pays
@@ -329,5 +335,142 @@ case "$(grep -vE '^[[:space:]]*#' lib/verify.sh | grep -c 'mirror fmt+check+jir 
     *) fail "lib/verify.sh publishes the flat literal 'mirror fmt+check+jir ✓' again -- fmt and check legitimately skip, so it must name only the jobs that ran" ;;
 esac
 echo "skip strings in lockstep with config/ci-mirror.toml; no flat mirror ✓ literal"
+
+echo "== 10. the did-not-run guards themselves: suite_test_raw / assert_suite_ran / assert_check_ran =="
+# These three functions carry this whole plan's thesis -- "a stage that did not run must never
+# score as passed" -- and until now NONE of them appeared anywhere in this file. They are correct
+# today, but they are also exactly one character away from being useless: deleting the `|0` from
+# either numeric guard (lib/verify.sh's `case "$want"` / `case "$collected"` / assert_check_ran's
+# `case "$ran"`) or the `*"jac test"*) return 0` arm in suite_test_raw made the ENTIRE harness pass.
+# mirror_job_skipped -- the sibling with the least consequence -- got a behavioural test in section
+# 9b; these did not.
+#
+# Driven behaviourally against fixture captures under $T, never against work/repo: cimirror_job is
+# STUBBED for the suite_test_raw cases (the thing under test is the classification of its rc, not
+# the running of real commands), and assert_suite_ran/assert_check_ran only read a file plus
+# config/ci-mirror.toml. Nothing here checks out a branch or runs a suite.
+G="$T/guards"
+mkdir -p "$G/logs"
+
+# A healthy single-session capture, written the way lib/cimirror.sh actually appends one
+# (`\n$ <cmd>` before the command's own output).
+cat > "$G/healthy.txt" <<'EOF'
+
+$ jac test jac/jaclang/byllm/tests
+============================= test session starts ==============================
+18 workers [219 items]
+...............................................................................
+========================= 219 passed in 30.11s =========================
+EOF
+# The runner STARTED (banner present) but collected nothing -- the exact shape of a collection
+# error. `collected 0 items` is what makes this different from the healthy capture.
+cat > "$G/collected0.txt" <<'EOF'
+
+$ jac test jac/jaclang/byllm/tests
+============================= test session starts ==============================
+collected 0 items / 1 error
+========================= 1 error in 0.30s =========================
+EOF
+# Items reported with NO session banner at all. Nonsense in practice, and that is the point: it is
+# the only capture shape that reaches the `case "$want"` guard's `0` arm with everything else
+# looking fine, so it is what keeps that arm honest (see the fmt case below).
+cat > "$G/nosession.txt" <<'EOF'
+
+$ jac fmt --check --lintfix
+18 workers [219 items]
+EOF
+cat > "$G/check-ran.txt" <<'EOF'
+✖ Error: error[E1053]: Cannot assign Any
+  10 |     x = float(cfg.get('a', 1.0))
+     |         ^^^^^^^^^^^^^^^^^^^^^^^
+============================== 1 failed in 0.25s ===============================
+EOF
+# `jac check` never started: a missing/unexecutable binary exits 127 and prints no run summary.
+printf '(eval): no such file or directory: /nonexistent/jac\n' > "$G/check-never.txt"
+
+# guard_env runs one call against the REAL functions in a subshell, with $LOG_DIR redirected into
+# the scratch dir so ns_log/ns_die cannot write into logs/<today>/.
+guard_suite() {        # guard_suite <label> <want-rc> <suite> <capture> <rc-from-suite_test_raw>
+    local label=$1 want=$2 suite=$3 cap=$4 srr=$5 got=0
+    (
+        . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/cimirror.sh"; . "$NS_ROOT/lib/verify.sh"
+        LOG_DIR="$G/logs"; ns_bootstrap_jac
+        rc=0; assert_suite_ran "$suite" "$cap" "$srr" harness-test || rc=$?; exit "$rc"
+    ) >/dev/null 2>&1 || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "assert_suite_ran '$label': expected rc=$want, got rc=$got" ;;
+    esac
+}
+guard_check() {        # guard_check <label> <want-rc> <capture>
+    local label=$1 want=$2 cap=$3 got=0
+    (
+        . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/cimirror.sh"; . "$NS_ROOT/lib/verify.sh"
+        LOG_DIR="$G/logs"; ns_bootstrap_jac
+        rc=0; assert_check_ran harness-branch "$cap" branch || rc=$?; exit "$rc"
+    ) >/dev/null 2>&1 || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "assert_check_ran '$label': expected rc=$want, got rc=$got" ;;
+    esac
+}
+guard_raw() {          # guard_raw <label> <want-rc> <stub-rc> <stub-failed-cmd>
+    local label=$1 want=$2 stub_rc=$3 stub_cmd=$4 got=0
+    (
+        . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/cimirror.sh"; . "$NS_ROOT/lib/verify.sh"
+        LOG_DIR="$G/logs"; ns_bootstrap_jac
+        # The unit under test is how suite_test_raw CLASSIFIES cimirror_job's outcome, so
+        # cimirror_job itself is replaced. Nothing touches work/repo.
+        cimirror_job() { CIMIRROR_FAILED_CMD="$stub_cmd"; return "$stub_rc"; }
+        rc=0; suite_test_raw byllm "$G/raw-out.txt" || rc=$?; exit "$rc"
+    ) >/dev/null 2>&1 || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "suite_test_raw '$label': expected rc=$want, got rc=$got" ;;
+    esac
+}
+
+# --- assert_suite_ran ---------------------------------------------------------------------------
+# healthy: [jobs.byllm] declares 1 test command, the capture has 1 session and 219 items.
+guard_suite "healthy byllm" 0 byllm "$G/healthy.txt" 0
+# THE COLLECTED-0 CASE. Guards the `|0` in `case "$collected"`: a run that starts and collects
+# nothing scores every unreached test as "not failing", and a baseline recorded from it disables
+# the collection floor permanently. Delete that `|0` and this line goes green.
+guard_suite "collected 0" 70 byllm "$G/collected0.txt" 0
+# SESSION-COUNT MISMATCH. [jobs.compiler] declares TWO test commands (tests/compiler and the
+# cross-backend equivalence suite), so a one-session capture means half of it never ran -- which is
+# precisely how the equivalence suite could silently not run behind a plausible baseline.
+guard_suite "session mismatch" 70 compiler "$G/healthy.txt" 0
+# THE want=0 CASE. Guards the `|0` in `case "$want"`: [jobs.fmt] declares no test command at all,
+# and a capture with zero sessions would MATCH that zero. Delete that `|0` and a job that cannot
+# run a single test is accepted as a passing gate; this is the only fixture shape that reaches it.
+guard_suite "job declares no test command" 70 fmt "$G/nosession.txt" 0
+# every rc suite_test_raw can hand over is fatal here, and none may be read as "ran clean"
+guard_suite "reader failure rc" 70 byllm "$G/healthy.txt" 70
+guard_suite "setup failure rc"  70 byllm "$G/healthy.txt" 71
+guard_suite "unexpected rc"     70 byllm "$G/healthy.txt" 99
+
+# --- assert_check_ran ---------------------------------------------------------------------------
+guard_check "checker ran" 0 "$G/check-ran.txt"
+# Guards the `|0` in `case "$ran"`: both `jac check` calls in verify_branch end in `|| true`, so a
+# missing $NS_PATHS_JAC_REPO yields an empty capture, checkgate finds no NEW identity, and the PR
+# body says "jac check ✓".
+guard_check "checker never ran" 70 "$G/check-never.txt"
+
+# --- suite_test_raw -----------------------------------------------------------------------------
+guard_raw "green job" 0 0 ""
+# a TEST command failing is the NORMAL case (baseline failures live on main; testgate.jac decides
+# on NEW failures only) -- deleting the `*"jac test"*) return 0` arm turns every red suite into a
+# night-fatal EX_MIRROR_SETUP
+guard_raw "test command failed"  0  1 "cd jac && JAC_TEST_JOBS=auto jac test tests/compiler"
+# ...but a SETUP command failing is night-wide, not branch-attributable ([jobs.byllm] leads with
+# ci.yml's `jac install --global`; without it byllm collects 105 instead of 219 on EVERY branch)
+guard_raw "setup command failed" 71 1 'jac install "litellm>=1.70.0" --global'
+# an empty CIMIRROR_FAILED_CMD next to a nonzero rc should be impossible -> fail closed, not guess
+guard_raw "nonzero rc, no failed command" 71 1 ""
+# a reader failure is propagated verbatim, never collapsed into "the suite ran"
+guard_raw "reader failure" 70 70 ""
+rm -rf .jac
+echo "did-not-run guards behave: collected-0 and session-mismatch are fatal, a healthy capture is not"
 
 echo "ALL HARNESS TESTS PASSED"

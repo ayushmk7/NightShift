@@ -63,7 +63,7 @@ flowchart TD
         ROT["shards list · 8 LOC-balanced shards of the whole repo · concurrency 2"]
         AUDIT["per shard · claude -p AUDIT · read-only · dontAsk · ponytail-audit scoped to the shard"]
         PJSON{"parse_result merge · any shard produced valid findings JSON?"}
-        SEL["select.jac · drop ledger-known / protected / twice-failed · score loc*conf/risk · pack <=3 themes <=10 files <=300 LOC · fit clock"]
+        SEL["select.jac · drop ledger-known / protected / twice-failed · score loc*conf/risk · pack <=6 themes <=10 files <=600 LOC · fit clock"]
         APPLY["per theme · fresh branch + fresh claude -p APPLY · acceptEdits · scoped tools · NO push/gh/network · validate_jac before commit"]
         RJSON{"report JSON ok and diff non-empty?"}
         FRAG["orchestrator writes release-note fragment · dir mapped jac to jaclang etc · ledger upsert-theme · queue.tsv"]

@@ -27,6 +27,17 @@ ns_on_exit() {
     if [ "$code" -ne 0 ] && [ -f "$LOG_DIR/CURRENT_STAGE" ]; then
         cp "$LOG_DIR/CURRENT_STAGE" "$LOG_DIR/ERROR_STAGE"
     fi
+    # ERROR_STAGE names WHERE the night died; FATAL_REASON (written by ns_die, lib/common.sh) says
+    # WHY. Folded into warnings.txt because that is the one channel scripts/sendmail.jac already
+    # renders verbatim in the digest -- the operator's only unattended feedback loop. Without this
+    # every ns_die in the pipeline reads identically as "ERROR S4" in the email, and there are 13
+    # of them in lib/verify.sh alone. `>>` on the same file the digest reads, not a new schema
+    # field: the full digest treatment is Plan 4's job.
+    if [ "$code" -ne 0 ] && [ -f "$LOG_DIR/FATAL_REASON" ]; then
+        printf 'FATAL (%s): %s\n' \
+            "$(cat "$LOG_DIR/ERROR_STAGE" 2>/dev/null || echo "no stage")" \
+            "$(cat "$LOG_DIR/FATAL_REASON")" >> "$LOG_DIR/warnings.txt" 2>/dev/null || true
+    fi
     email_main >> "$LOG_DIR/S6.log" 2>&1 || true
     ns_lock_release
     # Explicitly reap our self-caffeinate/self-timebox background children instead of trusting
@@ -42,6 +53,10 @@ ns_run() {
     # Unconditional: the watchdog sleeps from *process* start, so the budget clock must too.
     # A same-day re-run inheriting the 02:00 epoch once yielded "-414m remaining" and a skipped S3.
     date +%s > "$LOG_DIR/start_epoch"
+    # Same-night re-runs share $LOG_DIR (it is date-keyed), so a FATAL_REASON left by an earlier
+    # attempt would be re-reported against this one. Cleared here, next to the epoch, for the same
+    # reason that is unconditional.
+    rm -f "$LOG_DIR/FATAL_REASON"
 
     # Self-caffeinate AND self-timebox as OUR OWN background children (forked, never exec'd/wrapped).
     # Two macOS/TCC footguns on an external-volume repo, both found the hard way under launchd:

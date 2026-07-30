@@ -20,7 +20,19 @@ import from nslib {
 
 """Non-project imports a test file may keep and still be "100% about this theme's dead code" --
 stdlib, test frameworks, and common third-party libs. Deliberately short: anything NOT in here is
-treated as a real project dependency and disqualifies the file (fail closed)."""
+treated as a real project dependency and disqualifies the file (fail closed).
+
+CROSS-REFERENCE, and the reason "deliberately short" is load-bearing rather than stylistic:
+WIDENING THIS SET CAN BREAK THE TEST GATE, in a file nothing here points at. testgate.jac's
+COLLECTION_FLOOR (0.75) tolerates a vestigial-test sweep shrinking a suite's collection, and its
+whole safety margin is measured against WHICH byllm test files this allowlist currently
+disqualifies. Seven of byllm's ten test-bearing files are permanently ineligible today purely
+because they import io / shutil / uuid / ast / contextlib / contextvars / jaclang / fixtures /
+enum_with_semstr -- none of which is in this set. Adding those (a small, benign-looking change)
+makes test_byllm.jac eligible, and test_byllm.jac alone is 100 of byllm's 219 collected items
+(46%) -- far past any floor above 0.55. The result would be a legitimate theme reding twice and
+being auto-rejected as failed_verify. The full arithmetic lives in testgate.jac's COLLECTION_FLOOR
+docstring; read it before extending this list."""
 def import_allowlist() -> set[str] {
     return {
         "os", "sys", "re", "json", "time", "types", "pathlib", "tempfile", "threading",

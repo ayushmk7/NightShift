@@ -108,20 +108,48 @@ tier2_audit_all() {
     conc="${NS_SHARDS_CONCURRENCY:-2}"
     rm -f "$LOG_DIR/.session-limit"
 
-    # `for` over command substitution, NOT a pipe: a piped `while` loop would run in a subshell
+    # The shard list is MATERIALIZED and both its exit status and its emptiness checked, rather
+    # than iterated straight out of `for shard in $(ns_jac shards list "$CONFIG")`. `set -e` does
+    # not fire on `for x in $(false)`, so a malformed [shards] table -- or any jac error in the
+    # reader -- made both loops below iterate ZERO times: no session was ever started, n_found
+    # stayed 0, and the night logged "every shard failed or produced nothing" while tier2_main
+    # returned 0. The entire agentic tier silently no-ops and the message blames the audit rather
+    # than the config. This is byte-for-byte the discarded-reader bug lib/cimirror.sh:119-144 and
+    # lib/verify.sh:407-420 both already document fixing; it survived here.
+    # Read ONCE and reused by the collect loop below, so the two cannot disagree either.
+    local shard_list shard_rc=0 n_total
+    shard_list="$(ns_jac shards list "$CONFIG")" || shard_rc=$?
+    if [ "$shard_rc" -ne 0 ] || [ -z "$shard_list" ]; then
+        ns_die "$EX_BUG" "could not read the shard list from $CONFIG (rc=$shard_rc, $(printf '%s' "$shard_list" | wc -w | tr -d ' ') names). An empty list iterates zero times and is indistinguishable from 'every shard failed', which is what this used to be reported as."
+    fi
+    n_total="$(printf '%s\n' "$shard_list" | wc -w | tr -d ' ')"
+
+    # `for` over the materialized list, NOT a pipe: a piped `while` loop would run in a subshell
     # whose `jobs -rp` cannot see the sessions, and ns_jobs_wait would never throttle anything.
     # Concurrent shards each fork their own `ns_jac` calls, which SHARE one .jac/data/anchor_store.db;
     # jac can print "database is locked" on stderr under that contention (exit status and stdout stay
     # correct). That stderr lands in parse-err-audit-$shard.txt, which the corrective re-prompt below
     # pastes verbatim — so a lock warning can show up inside a re-prompt. Cosmetic, not a failure.
-    for shard in $(ns_jac shards list "$CONFIG"); do
+    for shard in $shard_list; do
         # log the collapse ONCE, not once per remaining shard
         if [ -f "$LOG_DIR/.session-limit" ] && [ "$conc" != 1 ]; then
             ns_log S3 "session limit seen — dropping to serial for the remaining shards"
             conc=1
         fi
+        # WHAT THIS ACTUALLY RESERVES, stated honestly because the obvious reading is wrong: it
+        # stops SCHEDULING once fewer than AUDIT+APPLY minutes remain, which is NOT the same as
+        # guaranteeing tier2_apply an APPLY window. The shards already in flight when the guard
+        # last passed still run to their own AUDIT_TIMEOUT, and the unconditional `wait` after the
+        # loop drains them -- so up to another full AUDIT_TIMEOUT can elapse after the last
+        # scheduling decision. Worst case the apply phase starts with roughly APPLY - AUDIT
+        # minutes, not APPLY. Reserving 2*AUDIT+APPLY (65m of a 180m night at today's budgets)
+        # would make the reservation real, at the cost of ending the fan-out much earlier; not
+        # done, because tier2_apply already re-checks the clock per theme
+        # (APPLY_TIMEOUT + 20 below) and defers themes to a future night rather than truncating
+        # one mid-session. So the failure mode this under-reservation causes is "fewer themes
+        # tonight", not a corrupted branch.
         if [ "$(ns_remaining_min)" -lt $(( NS_BUDGETS_AUDIT_TIMEOUT_MIN + NS_BUDGETS_APPLY_TIMEOUT_MIN )) ]; then
-            ns_warn "clock too short to audit remaining shards — stopping the fan-out at $shard"
+            ns_warn "clock too short to schedule more audit shards — stopping the fan-out at $shard (in-flight shards still drain below)"
             break
         fi
         ns_jobs_wait "$conc"
@@ -136,7 +164,7 @@ tier2_audit_all() {
     # a property of the install path, not of the shard names. If the harness is ever installed under a
     # path with a space, the word-split below hands `merge` broken paths and the guard on it fires.
     local found="" n_found=0
-    for shard in $(ns_jac shards list "$CONFIG"); do
+    for shard in $shard_list; do
         if [ -s "$LOG_DIR/findings-$shard.json" ]; then
             found="$found $LOG_DIR/findings-$shard.json"
             n_found=$(( n_found + 1 ))
@@ -156,7 +184,7 @@ tier2_audit_all() {
         return 1
     fi
     merged="$(ns_jac parse_result len < "$LOG_DIR/findings.json" || echo 0)"
-    ns_log S3 "merged $n_found/$(ns_jac shards count "$CONFIG") shards into $merged findings"
+    ns_log S3 "merged $n_found/$n_total shards into $merged findings"
     return 0
 }
 

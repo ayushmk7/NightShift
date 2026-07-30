@@ -22,8 +22,14 @@ jac0core        = ["jac/jaclang/jac0core"]
 runtimelib      = ["jac/jaclang/runtimelib"]
 cli             = ["jac/jaclang/cli"]
 byllm           = ["jac/jaclang/byllm"]
+# `jac-mcp` was removed from periphery 2026-07-30: upstream DELETED it in 59f68a7a1 and
+# `git ls-files jac-mcp` in work/repo returns 0 tracked files (every other shard path has
+# 94-466). The directory only still exists on disk as leftover from an earlier sync. Auditing it
+# burned a whole 25-minute apply session that could only ever end in "agent made no committed
+# changes" -- or worse, that session holds `Bash(git add *)` (lib/tier2.sh) and could have staged
+# a deleted-upstream tree into a PR.
 periphery       = ["jac/jaclang/langserve", "jac/jaclang/lsp", "jac/jaclang/project",
-                   "jac/jaclang/publish", "jac/jaclang/utils", "jac-mcp"]
+                   "jac/jaclang/publish", "jac/jaclang/utils"]
 
 [shards.exclude]                             # subtracted from the shard's own paths in the prompt
 compiler-core   = ["jac/jaclang/compiler/passes", "jac/jaclang/compiler/tests"]

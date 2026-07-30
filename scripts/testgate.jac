@@ -52,9 +52,15 @@ did not):
     applies files_per_theme/loc_per_theme to FINDINGS only; vestigial_test_files is called at :199,
     AFTER packing, and its result is appended to the theme with no budget check at all.
   - "10 of byllm's 76 test files is ~13%." byllm has TEN test-bearing files; the other 66 are
-    fixtures/. Ten files IS the whole suite. And the item distribution is severely skewed --
-    measured 100 / 42 / 29 / 14 / 13 / 13 / 11 / 5 / 5 / 1, so test_byllm.jac ALONE is 100 of 219
-    items (46%), which on its own would blow through any floor above 0.55.
+    fixtures/. Ten files IS the whole suite. And the item distribution is severely skewed:
+    test_byllm.jac ALONE is 100 of the suite's 219 collected items (46%), which on its own would
+    blow through any floor above 0.55.
+    (A per-file list used to sit here -- 100 / 42 / 29 / 14 / 13 / 13 / 11 / 5 / 5 / 1 -- and it
+    SUMMED TO 233, not the 219 the suite actually collects, so at least one of its numbers was
+    wrong. Dropped rather than re-guessed: this comment has already had one round of false
+    justifying claims, and only the three per-file counts cited below are load-bearing. Re-measure
+    with `jac test jac/jaclang/byllm/tests` under a warm HOME before quoting a full distribution
+    again.)
 
 The real ceiling is incidental, which is the thing to keep an eye on: is_vestigial's import
 allowlist (selector.jac:24-30) fails closed on any import that is neither stdlib-ish nor one of the

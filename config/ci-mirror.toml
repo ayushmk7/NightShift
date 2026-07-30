@@ -287,14 +287,39 @@ ci_job = "contribution-checks"
 # real, complete rule; this is a local approximation for a pre-PR gate that would otherwise be
 # unable to run at all on this host. Piped the same way CI's diff-derived file list would be:
 # `git diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD" | ...`.
+#
+# CORRECTED 2026-07-30 (code review): the first two commands used to be written as
+# `if git ... | grep ...; then fail; fi` with the git command INSIDE the `if` condition's pipeline.
+# Both then reported CLEAN whenever the git command itself failed. Under the inherited
+# `set -o pipefail` (bin/nightshift.sh:3, which cimirror_job's `( ... eval ... )` subshell
+# inherits) a pipeline's status is that of the rightmost failing command -- grep's 1-on-no-match --
+# so `git log nosuchbranch..HEAD` exiting 128 still left the `if` FALSE and the check silently
+# passed. Same shape as [jobs.fmt]/[jobs.check]'s merge-base hole, which got explicit `exit 70`
+# guards for exactly this reason; these two were missed in that round. Now each git command is its
+# own statement with `|| { echo ...; exit 70; }`, and only the grep -- which legitimately exits 1
+# when there is nothing to find -- stays in the `if`.
 commands = [
-  "if git log $NS_REPO_DEFAULT_BRANCH..HEAD --format='%b' | grep -iE 'co-authored-by:.*\\b(claude|anthropic|openai|copilot|composer|cursor|gpt|gemini|ai|bot)\\b'; then echo \"AI co-author attribution found in commit messages. Remove Co-Authored-By lines referencing AI tools.\"; exit 1; fi",
-  "if git diff --name-only --diff-filter=A $NS_REPO_DEFAULT_BRANCH...HEAD | grep -E '\\.py$'; then echo \"New Python (.py) files detected in this PR. This codebase does not allow adding Python files.\"; exit 1; fi",
+  '''NS_AI_LOG="$(git log $NS_REPO_DEFAULT_BRANCH..HEAD --format='%b' 2>&1)" || { echo "ERROR: could not read the commit range $NS_REPO_DEFAULT_BRANCH..HEAD for the AI co-author check: $NS_AI_LOG" >&2; exit 70; }; if printf '%s\n' "$NS_AI_LOG" | grep -iE 'co-authored-by:.*\b(claude|anthropic|openai|copilot|composer|cursor|gpt|gemini|ai|bot)\b'; then echo "AI co-author attribution found in commit messages. Remove Co-Authored-By lines referencing AI tools."; exit 1; fi''',
+  '''NS_ADDED="$(git diff --name-only --diff-filter=A $NS_REPO_DEFAULT_BRANCH...HEAD 2>&1)" || { echo "ERROR: could not diff $NS_REPO_DEFAULT_BRANCH...HEAD for the added-Python-files check: $NS_ADDED" >&2; exit 70; }; if printf '%s\n' "$NS_ADDED" | grep -E '\.py$'; then echo "New Python (.py) files detected in this PR. This codebase does not allow adding Python files."; exit 1; fi''',
   '''jac_ver=$(grep -oE 'glob BUN_VERSION = "[^"]+"' jac/jaclang/runtimelib/client/bun_installer.jac | grep -oE '"[^"]+"' | tr -d '"'); zig_ver=$(grep -oE 'const BUN_VERSION = "[^"]+"' jac/launcher/payload.zig | grep -oE '"[^"]+"' | tr -d '"'); if [ -z "$jac_ver" ] || [ -z "$zig_ver" ]; then echo "Could not read BUN_VERSION from both bun_installer.jac and payload.zig"; exit 1; fi; if [ "$jac_ver" != "$zig_ver" ]; then echo "BUN_VERSION mismatch: bun_installer.jac=$jac_ver vs payload.zig=$zig_ver"; exit 1; fi''',
   "jac run scripts/validate_docs_code.jac",
   "git diff --name-only \"$NS_REPO_DEFAULT_BRANCH...HEAD\" | \"$NS_PATHS_JAC\" run \"$NS_ROOT/scripts/fragcheck.jac\" check",
 ]
 
+# build-jac decision, recorded 2026-07-30 (code review): NOT mirrored, deliberately, even though
+# the design spec's mirror table (spec section 7) names it. ci.yml:61-143 is a Zig BUILD job -- zig
+# build + fetch-typeshed, an `ldd`/`env -i` hermeticity smoke, two end-to-end `jac run` programs and
+# a three-test `jac test` smoke file -- all of which exercise the COMPILED BINARY, not the tree a
+# Nightshift diff touches. Measured against this checkout: `git ls-files '*.zig'` returns ELEVEN
+# tracked files repo-wide (build.zig, launcher/*.zig, one example, one test fixture), none of them
+# in any [shards.paths] entry, and every janitorial diff this harness produces is `.jac`. So a
+# Nightshift branch cannot change what build-jac builds, and mirroring it would re-run a full Zig
+# build (the single most expensive job in ci.yml) once per queued branch to re-prove a property no
+# branch altered. The gate already runs against $NS_PATHS_JAC_REPO -- a binary built from this same
+# checkout -- so a genuinely broken build makes every other mirrored job fail loudly anyway.
+# REVISIT IF: a shard ever covers jac/launcher/ or jac/build.zig, or the agent's allow-list gains a
+# tool that can edit them. Today neither is true.
+#
 # Step 2b decision, CORRECTED 2026-07-30 (code review): the note that used to live here concluded
 # "NOT added as [jobs.check]" after measuring ONLY the whole-repo `else` branch of ci.yml:412-424
 # (`jac check . --ignore $IGNORE_ARGS --nowarn`, ci.yml:423) -- RED, 182 files failed within the

@@ -62,10 +62,15 @@ suite_test_raw() {
 }
 
 # Map changed paths to the mirrored TEST suites that cover them, and emit the unique set.
-# Post-restructure geography: byllm and scale live under jac/jaclang/, and jac-mcp has no suite of
-# its own (a recorded baseline confirmed "no tests ran"), so an mcp-only change gets no test gate --
-# the fmt, check, jir and contribution jobs still gate it. A release-note-fragment-only change
-# likewise gets no test gate.
+# Post-restructure geography: byllm and scale live under jac/jaclang/. A release-note-fragment-only
+# change gets no test gate -- the fmt, check, jir and contribution jobs still gate it.
+#
+# There is deliberately NO `jac-mcp/*` arm any more (removed 2026-07-30 with the shard-registry
+# entry): upstream deleted jac-mcp in 59f68a7a1 and `git ls-files jac-mcp` returns 0 tracked files,
+# so nothing this harness audits can produce such a path. The arm's justifying evidence -- "a
+# recorded baseline confirmed no tests ran" -- was a baseline for a directory that no longer exists
+# upstream, i.e. it proved nothing about today's repo. A stray `jac-mcp/` path would now simply
+# match no case arm, which is the same "gates no suite" answer the explicit arm gave.
 #
 # ORDER MATTERS: the compiler and byllm cases MUST precede the jac/* catch-all, or a byllm-only
 # change routes to the large, env-flaky runtime suite. That exact mis-routing (via `cut -d/ -f1`,
@@ -94,7 +99,6 @@ gated_suites_from_diff() {
             # reaches this gate. Without this arm, deleting a compiler test that another compiler
             # test depends on would be "gated" by a suite that never collects either of them.
             jac/tests/compiler/*)   echo compiler ;;
-            jac-mcp/*)              ;;                 # no suite of its own
             release_notes/*)        ;;                 # fragment only
             jac/*)                  echo runtime ;;
         esac
@@ -270,7 +274,15 @@ verify_branch() {
     local branch=$1 theme=$2 t0 t1
     t0="$(date +%s)"
     cd "$REPO"
-    git checkout "$branch"
+    # `|| ns_die`, NOT bare. verify_branch is only ever invoked as an `if` CONDITION
+    # (lib/verify.sh's verify_main, lib/promote.sh:62), so bash suspends errexit for its entire
+    # body -- and the suspension propagates into the `( ... )` subshells below too. A bare
+    # `git checkout` that failed (a branch deleted underneath us, an index lock, a dirty tree from
+    # a killed apply session) would therefore run every stage below against whatever IS checked
+    # out -- normally main, which passes -- return 0, reach ns_mark_green, and hand ship_branch a
+    # ref that does not exist. Did-not-run scored as passed, in the function that decides what
+    # becomes a PR.
+    git checkout "$branch" || ns_die "$EX_BUG" "could not check out $branch in $REPO -- the gate would otherwise have run against whatever is currently checked out (normally $NS_REPO_DEFAULT_BRANCH) and scored THAT as this branch passing."
     rm -rf "$REPO/.jac"        # `jac clean --cache` prompts [y/N] non-interactively -> aborts; nuke directly
 
     # 1. scope containment FIRST — reject before spending a second on tests (anti-injection, T1).
@@ -318,13 +330,23 @@ verify_branch() {
             git -C "$REPO" cat-file -e "$NS_REPO_DEFAULT_BRANCH:$f" 2>/dev/null && main_jac="$main_jac $f"
         done
         if [ -n "$main_jac" ]; then
+            # Both checkouts are `|| ns_die` for the same errexit-is-suspended reason as the branch
+            # checkout at the top of this function, and each has its own did-not-run failure mode:
+            #   * a failed SWAP-TO-MAIN leaves branch content in place, so `$mr` is captured from
+            #     the BRANCH -- identical to `$br` -- and checkgate can then never see a new error
+            #     while assert_check_ran still passes happily. A gate that structurally cannot fail.
+            #   * a failed RESTORE leaves MAIN's content for those files in the working tree, so
+            #     every stage below (fmt/check/jir, the test suites, pre-commit, contribution)
+            #     gates main instead of the branch, and the branch ships ungated.
             # shellcheck disable=SC2086
-            git -C "$REPO" checkout "$NS_REPO_DEFAULT_BRANCH" -- $main_jac
+            git -C "$REPO" checkout "$NS_REPO_DEFAULT_BRANCH" -- $main_jac \
+                || ns_die "$EX_BUG" "could not restore $NS_REPO_DEFAULT_BRANCH content for the jac-check baseline side ($main_jac) in $REPO. The main-side capture would have been taken from BRANCH content, making 'no NEW type errors' impossible to violate."
             rm -rf "$REPO/.jac"
             # shellcheck disable=SC2086
             ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $main_jac ) > "$mr" 2>&1 || true
             # shellcheck disable=SC2086
-            git -C "$REPO" checkout HEAD -- $main_jac        # back to branch content
+            git -C "$REPO" checkout HEAD -- $main_jac \
+                || ns_die "$EX_BUG" "could not restore BRANCH content for $main_jac in $REPO after the jac-check baseline side. Every remaining gate stage would have run against $NS_REPO_DEFAULT_BRANCH's version of those files."
         else
             : > "$mr"
         fi
@@ -395,8 +417,8 @@ verify_branch() {
 
     # 4. tests: baseline-diff gate. Run the mirrored CI suite for each gated SUITE the branch
     #    touched, and fail only on NEW failures vs the recorded main baseline (testgate.jac).
-    #    jac-mcp-only and fragment-only changes get no test gate — fmt/check/jir/contribution and
-    #    pre-commit still gate them (see gated_suites_from_diff).
+    #    A fragment-only change gets no test gate — fmt/check/jir/contribution and pre-commit
+    #    still gate it (see gated_suites_from_diff).
     #
     #    testgate.jac exit codes: 0 = no new failures, 1 = new failures, 2 = no baseline recorded
     #    (== no gate for this suite). This loop used to `if !` on the raw exit status, which cannot
@@ -528,9 +550,17 @@ verify_branch() {
     #    was replacing): none of [jobs.contribution]'s five commands writes to the tree, so a second
     #    pass could only ever reproduce the first pass's verdict.
     #
-    #    Unlike the fast three, rc=70 here is UNAMBIGUOUSLY a cimirror reader failure — no command in
-    #    [jobs.contribution] exits 70 of its own accord — but it gets the same treatment for the same
-    #    reason: a broken registry is night-wide and must not consume this branch's attempts.
+    #    rc=70 here is handled exactly like the fast three, and for the same reason. TWO things
+    #    return it, both harness/repo-state faults rather than branch faults: cimirror_job's own
+    #    EX_MIRROR_READ (unreadable or renamed [jobs.contribution]), and the AI-co-author and
+    #    added-.py commands' own `exit 70` when their git range cannot be computed at all (bad or
+    #    unset $NS_REPO_DEFAULT_BRANCH, detached HEAD, no shared history). Both fail identically for
+    #    every queued branch, so reding would burn every finding's attempt counter and auto-reject
+    #    the whole ledger after two nights over one config or checkout problem.
+    #    (This block used to assert that no command in [jobs.contribution] exits 70 of its own
+    #    accord. That stopped being true when those two commands gained explicit merge-range guards
+    #    — see config/ci-mirror.toml's note — and the ambiguity is harmless because the correct
+    #    response to either cause is identical.)
     #
     #    KNOWN EXPOSURE, recorded rather than fixed (code review 2026-07-30, Minor). Three of the
     #    five commands are branch-scoped (the AI-co-author log range, the added-.py diff, the
@@ -556,7 +586,7 @@ verify_branch() {
     case "$cj_rc" in
         0) : ;;
         "$EX_MIRROR_READ")
-            ns_die "$EX_BUG" "CI mirror job 'contribution' returned $EX_MIRROR_READ: cimirror could not read [jobs.contribution] from config/ci-mirror.toml. That is a harness fault, identical for every queued branch, so $branch is not being blamed for it (see $(basename "$cj"))." ;;
+            ns_die "$EX_BUG" "CI mirror job 'contribution' returned $EX_MIRROR_READ: either config/ci-mirror.toml could not be read, or one of its git-range guards could not compute a range against '$NS_REPO_DEFAULT_BRANCH'. Both are harness faults, identical for every queued branch, so $branch is not being blamed for it (see $(basename "$cj"))." ;;
         *)  case "$CIMIRROR_FAILED_CMD" in
                 *validate_docs_code*|*BUN_VERSION*)
                     ns_warn "$(basename "$branch"): the contribution job failed on a WHOLE-REPO check, not a branch-scoped one ($CIMIRROR_FAILED_CMD). If every branch reds here tonight the cause is upstream, not the branches — verify it against main before letting a second night auto-reject their findings." ;;
@@ -573,7 +603,7 @@ verify_branch() {
 
     # This line goes STRAIGHT INTO THE PR BODY a human reviews (lib/ship.sh:35), so it has to be
     # true. It used to be the hardcoded string "jac check ✓ · tests (no new failures vs baseline) ✓",
-    # which claimed a passing test gate for a jac-mcp-only change that gates no suite, for any suite
+    # which claimed a passing test gate for a fragment-only change that gates no suite, for any suite
     # with no baseline recorded, and — since state/test-baseline/ is currently empty — for every
     # branch until `nightshift.sh baseline` has run. Telling an upstream reviewer the tests passed
     # when nothing ran is the one failure in this file that escapes the repo.

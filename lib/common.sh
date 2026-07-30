@@ -54,7 +54,19 @@ ns_jac() {
 ns_log()  { printf '%s [%s] %s\n' "$(date '+%H:%M:%S')" "$1" "$2" | tee -a "$LOG_DIR/run.log" >&2; }
 ns_warn() { ns_log WARN "$1"; echo "$1" >> "$LOG_DIR/warnings.txt"; }
 ns_fail() { printf '%s\t%s\n' "$1" "$2" >> "$LOG_DIR/failed.tsv"; ns_log FAIL "$1: $2"; }
-ns_die()  { local code=$1; shift; ns_log FATAL "$*"; exit "$code"; }
+# ns_die RECORDS WHY, not just that. bin/nightshift.sh's ns_on_exit copies only CURRENT_STAGE to
+# ERROR_STAGE, and the stage NAME is all the digest reports -- but this branch multiplied ns_die
+# call sites in the unattended path (13 in lib/verify.sh alone, every one of them EX_BUG=70), so
+# "the night died in S4" is now almost no information at all. The reason text is written here and
+# folded into the digest by ns_on_exit. Best-effort (`|| true`): $LOG_DIR may not exist yet on the
+# earliest failure paths, and losing the reason must never change the exit code the caller asked
+# for. Stopgap for the unattended channel; the real digest work is Plan 4.
+ns_die()  {
+    local code=$1; shift
+    ns_log FATAL "$*"
+    printf '%s\n' "$*" > "$LOG_DIR/FATAL_REASON" 2>/dev/null || true
+    exit "$code"
+}
 
 # --- lock (mkdir is atomic on APFS; no flock on stock macOS) ---
 ns_lock_acquire() {
