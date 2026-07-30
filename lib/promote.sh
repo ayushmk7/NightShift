@@ -47,7 +47,7 @@ promote_main() {
     ns_log S7 "opened $pr_url"
 
     # 3. rename the release-note fragment 0000 → <PR#> (the PR updates itself on push)
-    fragment="$(ns_jac render_draft frag "$pkg")"
+    fragment="$(ns_jac render_draft meta "$draft" | ns_jac parse_result field release_note)"
     if git -C "$REPO" ls-files --error-unmatch "$fragment" >/dev/null 2>&1; then
         git -C "$REPO" checkout "$branch"
         git -C "$REPO" mv "$fragment" "${fragment%0000.refactor.md}$pr_num.refactor.md"

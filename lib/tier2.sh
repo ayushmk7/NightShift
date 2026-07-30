@@ -93,7 +93,7 @@ Re-emit ONLY the corrected \`\`\`json fenced findings array — same schema, no 
 # Phase B — select (pure function in selector.jac; deterministic, unit-tested)
 tier2_select() {
     local pkg=$1
-    ns_jac selector select "$pkg" "$CONFIG" "$LEDGER" "$STATE" "$(ns_remaining_min)" "$REPO" \
+    ns_jac selector select "$CONFIG" "$LEDGER" "$STATE" "$(ns_remaining_min)" "$REPO" \
         < "$LOG_DIR/findings.json" > "$LOG_DIR/selection.json"
 
     # findings the selector shed for budget/clock reasons are remembered as deferred (TPRD 9)
@@ -182,12 +182,13 @@ tier2_apply() {
         fi
 
         # The ORCHESTRATOR writes the release-note fragment — the agent has no Write tool (TPRD S3-C).
-        # Fragment dir is the repo's name (jac->jaclang, jac-byllm->byllm), not the package name.
-        local fragment; fragment="$(ns_jac render_draft frag "$pkg")"
-        mkdir -p "$(dirname "$REPO/$fragment")"
-        ns_jac parse_result field release_note_md < "$LOG_DIR/report-$slug.json" > "$REPO/$fragment"
-        git add "$fragment"
-        git commit -m "docs($pkg): release note fragment (nightshift)"
+        local fragment; fragment="$(ns_jac render_draft frag "$LOG_DIR/report-$slug.json")"
+        if [ -n "$fragment" ]; then
+            mkdir -p "$(dirname "$REPO/$fragment")"
+            ns_jac parse_result field release_note_md < "$LOG_DIR/report-$slug.json" > "$REPO/$fragment"
+            git add "$fragment"
+            git commit -m "docs($pkg): release note fragment (nightshift)"
+        fi
 
         ns_jac ledger upsert-theme "$theme_file" "$branch" "$LEDGER" >/dev/null
         ns_queue_branch "$branch" "$theme_file" "$LOG_DIR/report-$slug.json"
