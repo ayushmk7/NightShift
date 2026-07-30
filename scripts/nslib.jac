@@ -174,16 +174,45 @@ def is_protected(path: str, globs: list[str]) -> bool {
     return hit;
 }
 
-"""The repo's release-note dir names differ from package names (check-release-notes.sh):
-jac code lives in jac/jaclang -> fragment dir 'jaclang'; jac-byllm/byllm -> 'byllm'."""
-def fragment_dir(pkg: str) -> str {
-    mapping: dict[str, str] = {"jac": "jaclang", "jac-byllm": "byllm",
-                               "jac-mcp": "jac-mcp", "jac-scale": "jac-scale"};
-    return mapping[pkg] if pkg in mapping else pkg;
+"""scripts/check-release-notes.sh in the target repo maps exactly one folder:
+jac/jaclang/ -> release_notes/unreleased/jaclang/. Everything else (jac/tests/, docs/) requires
+no fragment, so return "" and let callers skip it.
+The 0000 placeholder is renamed to the PR number after the PR is opened.
+
+The `/tests/` exclusion mirrors check-release-notes.sh:131's `[[ "$file" != */tests/* ]]`, which
+fragcheck.is_gated_change already reproduces. Without it the two disagreed in the permissive-
+looking but wrong direction: a tests-only jac/jaclang/** theme -- the vestigial test sweep, which
+is Nightshift's single most common outcome -- got a fragment that CI does not require, written and
+committed by the orchestrator, on every such branch. Both encodings of the rule now live here and
+in fragcheck.is_gated_change; they must stay in lockstep."""
+glob VALID_FRAGMENT_KINDS: list[str] = ["feature", "bugfix", "breaking", "refactor", "docs"];
+
+def fragment_path(paths: list[str], kind: str) -> str {
+    safe_kind: str = kind if kind in VALID_FRAGMENT_KINDS else "refactor";
+    for p in paths {
+        if str(p).startswith("jac/jaclang/") and "/tests/" not in str(p) {
+            return "release_notes/unreleased/jaclang/0000." + safe_kind + ".md";
+        }
+    }
+    return "";
 }
 
-def release_fragment(pkg: str) -> str {
-    return "docs/docs/community/release_notes/unreleased/" + fragment_dir(pkg) + "/0000.refactor.md";
+"""scripts/check-release-notes.sh's content-format check (~line 176) rejects any fragment line
+that does not start with whitespace or '-': a bare sentence like "Removed dead plugin config."
+fails CI even though the local gate used to pass it. The agent's `release_note_md` is free-form
+English with no format requirement in its own prompt schema, so the write path -- not just the
+prompt -- must not let an unbulleted sentence reach a commit. If the text already starts with '-'
+(the agent followed the convention), it is left alone; otherwise it is prefixed. This does not
+attempt to repair a "- #### heading" disguised as a bullet (check-release-notes.sh's OTHER
+malformed-content branch) -- that shape essentially never falls out of a plain-English sentence,
+so fragcheck.jac's content-format check exists to catch it rather than this function guessing
+how to un-disguise it."""
+def normalize_fragment_body(text: str) -> str {
+    stripped: str = text.strip();
+    if stripped.startswith("-") {
+        return stripped + "\n";
+    }
+    return "- " + stripped + "\n";
 }
 
 test "fingerprint is stable per (file, rule) and sensitive to both" {
@@ -193,11 +222,51 @@ test "fingerprint is stable per (file, rule) and sensitive to both" {
 }
 
 test "protected globs with negation" {
-    globs: list[str] = ["**/tests/**", "docs/**", "!docs/docs/community/release_notes/unreleased/**"];
+    globs: list[str] = ["**/tests/**", "docs/**", "!release_notes/unreleased/**"];
     assert is_protected("jac/tests/fixtures/x.jac", globs);
     assert is_protected("docs/guide/intro.md", globs);
-    assert not is_protected("docs/docs/community/release_notes/unreleased/jac/0000.refactor.md", globs);
-    assert not is_protected("jac/compiler/passes.jac", globs);
+    # fragments live outside docs/ now, so they are simply never protected
+    assert not is_protected("release_notes/unreleased/jaclang/0000.refactor.md", globs);
+    assert not is_protected("jac/jaclang/compiler/passes.jac", globs);
+    # The `!` branch above is NOT exercised by the release_notes assertion: no positive glob in
+    # that list matches a release_notes/ path, so the negation never has a `hit` to flip and the
+    # assertion passes with the whole `startswith("!")` arm deleted (verified by mutation).
+    # This pair is the one that actually flips: `docs/**` marks both files protected, and only the
+    # negation carves the first one back out.
+    carve: list[str] = ["docs/**", "!docs/api/generated.md"];
+    assert not is_protected("docs/api/generated.md", carve);
+    assert is_protected("docs/api/other.md", carve);
+}
+
+test "fragment_path maps only jac/jaclang changes, and validates the kind" {
+    assert fragment_path(["jac/jaclang/compiler/x.jac"], "refactor")
+        == "release_notes/unreleased/jaclang/0000.refactor.md";
+    assert fragment_path(["jac/jaclang/byllm/y.jac"], "bugfix")
+        == "release_notes/unreleased/jaclang/0000.bugfix.md";
+    # jac-mcp and the top-level test tree map to nothing: no fragment required
+    assert fragment_path(["jac-mcp/server.jac"], "refactor") == "";
+    assert fragment_path(["jac/tests/test_x.jac"], "refactor") == "";
+    # a tests-only jac/jaclang/** change needs none either -- check-release-notes.sh:131 excludes
+    # */tests/*, and fragcheck.is_gated_change mirrors it. This is the vestigial-test sweep, which
+    # used to get a fragment CI never asked for.
+    assert fragment_path(["jac/jaclang/compiler/tests/test_x.jac"], "refactor") == "";
+    assert fragment_path(["jac/jaclang/byllm/tests/test_byllm.jac"], "refactor") == "";
+    # a mixed diff (deleted tests plus real source) still gets exactly one fragment
+    assert fragment_path(["jac/jaclang/byllm/tests/test_x.jac", "jac/jaclang/byllm/y.jac"], "refactor")
+        == "release_notes/unreleased/jaclang/0000.refactor.md";
+    # first matching path wins; a mixed diff still gets exactly one fragment
+    assert fragment_path(["jac-mcp/a.jac", "jac/jaclang/cli/b.jac"], "docs")
+        == "release_notes/unreleased/jaclang/0000.docs.md";
+    # an invalid kind falls back to refactor rather than emitting a path CI will reject
+    assert fragment_path(["jac/jaclang/cli/b.jac"], "nonsense")
+        == "release_notes/unreleased/jaclang/0000.refactor.md";
+}
+
+test "normalize_fragment_body bullets a bare sentence, leaves an already-bulleted one alone" {
+    assert normalize_fragment_body("Removed dead plugin config.") == "- Removed dead plugin config.\n";
+    assert normalize_fragment_body("- **Fix: x**: y") == "- **Fix: x**: y\n";
+    # leading/trailing whitespace on the raw agent string is stripped before the bullet check
+    assert normalize_fragment_body("  Removed dead plugin config.  ") == "- Removed dead plugin config.\n";
 }
 
 test "ledger last-writer-wins" {

@@ -4,6 +4,8 @@ argv:
   render <report.json> [k=v ...]   report from parse_result.jac plus string overrides
                                    (branch=, package=, date=, tests=) so bash never
                                    composes JSON; stdout: full draft (frontmatter + body)
+  frag <report.json>              stdout: release-note fragment path for this report's files
+                                   ("" if none of them touch jac/jaclang/)
   git-report <repo_dir> <summary>  synthesize a report JSON from the branch's git diff
                                    (used for the tier-1 autofix branch, which has no agent report)
   meta <draft.md>                  stdout: frontmatter as JSON (machine side of the draft)
@@ -12,7 +14,7 @@ argv:
 import sys;
 import json;
 import subprocess;
-import from nslib { eprint, read_stdin, parse_obj, as_list, as_int, release_fragment }
+import from nslib { eprint, read_stdin, parse_obj, as_list, as_int, fragment_path }
 
 """Frontmatter values are JSON literals, so `meta` can parse every value with json.loads."""
 def frontmatter_lines(d: dict) -> list[str] {
@@ -81,9 +83,23 @@ def render(d: dict) -> str {
         d["title"] = "refactor(" + str(d["package"]) + "): " + str(d["summary"])[:60];
     }
     if "release_note" not in d {
-        d["release_note"] = release_fragment(str(d["package"]));
+        d["release_note"] = fragment_path([str(f) for f in as_list(d["files"])], "refactor");
     }
     return "\n".join(frontmatter_lines(d) + [""] + body_lines(d)) + "\n";
+}
+
+"""What `frag <report.json>` prints: the fragment path implied by the files the agent actually
+edited (the report's `files`, not the theme's -- the theme lists what was planned).
+
+LATENT COUPLING: the kind is hardcoded "refactor" here, while the S4 scope gate
+(check_scope.jac:23) honors `theme.get("fragment_kind", "refactor")`. Identical today because
+nothing emits `fragment_kind`. The day a theme carries e.g. "bugfix", the gate will allow
+0000.bugfix.md while this writes 0000.refactor.md -- both sites must change together."""
+def frag_for_report(report_path: str) -> str {
+    with open(report_path, "r") as f {
+        rep: dict = parse_obj(f.read());
+    }
+    return fragment_path([str(p) for p in as_list(rep["files"])], "refactor");
 }
 
 """Inverse of render: (frontmatter dict, body string)."""
@@ -134,7 +150,7 @@ with entry:__main__ {   # only dispatch the CLI on direct `jac run`; sendmail.ja
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "frag" and len(args) == 3 {
-        print(release_fragment(args[2]));
+        print(frag_for_report(args[2]));
     } elif cmd == "git-report" and len(args) == 4 {
         print(json.dumps(git_report(args[2], args[3])));
     } elif cmd == "render" and len(args) >= 3 {
@@ -158,7 +174,7 @@ with entry:__main__ {   # only dispatch the CLI on direct `jac run`; sendmail.ja
         }
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run render_draft.jac render <report.json> [branch=... package=... date=... tests=... url=...]");
-        eprint("       jac run render_draft.jac frag <pkg>");
+        eprint("       jac run render_draft.jac frag <report.json>");
         eprint("       jac run render_draft.jac git-report <repo_dir> <summary>");
         eprint("       jac run render_draft.jac meta <draft.md>");
         eprint("       jac run render_draft.jac body <draft.md>");
@@ -171,8 +187,8 @@ test "render then split roundtrips the frontmatter" {
         "date": "2026-07-10", "risk": "low",
         "tests": "jac check ok; jac test ok; pre-commit ok",
         "summary": "remove dead render-path duplication",
-        "files": ["jac-client/render/pipe.jac"], "loc_before": 512, "loc_after": 143,
-        "skipped": [{"file": "jac-client/render/pipe.jac", "reason": "ponytail: kept boundary check"}],
+        "files": ["jac/jaclang/cli/pipe.jac"], "loc_before": 512, "loc_after": 143,
+        "skipped": [{"file": "jac/jaclang/cli/pipe.jac", "reason": "ponytail: kept boundary check"}],
     };
     text: str = render(d);
     (meta, body) = split_draft(text);
@@ -180,9 +196,42 @@ test "render then split roundtrips the frontmatter" {
     assert meta["loc"]["removed"] == 512;
     assert meta["loc"]["added"] == 143;
     assert meta["files"] == 1;
-    assert meta["release_note"] == "docs/docs/community/release_notes/unreleased/jac-client/0000.refactor.md";
+    assert meta["release_note"] == "release_notes/unreleased/jaclang/0000.refactor.md";
     assert body.startswith("# refactor(jac-client):");
     assert "+143 -512" in body;
     assert "net -369" in body;
     assert "Consciously deferred" in body;
+}
+
+test "frag returns a jaclang path for core changes and empty for jac-mcp only" {
+    # Exercises what the VERB computes off a real report file, not nslib.fragment_path directly
+    # (already covered in nslib.jac): pointing frag at the wrong key turns this red.
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    core_path: str = d + "/report-core.json";
+    mcp_path: str = d + "/report-mcp.json";
+    with open(core_path, "w") as f {
+        f.write(json.dumps({"summary": "s", "files": ["jac/jaclang/cli/a.jac"],
+                            "loc_before": 10, "loc_after": 2, "risk": "low",
+                            "release_note_md": "note"}));
+    }
+    with open(mcp_path, "w") as f {
+        f.write(json.dumps({"summary": "s", "files": ["jac-mcp/server.jac"],
+                            "loc_before": 10, "loc_after": 2, "risk": "low",
+                            "release_note_md": "note"}));
+    }
+    assert frag_for_report(core_path) == "release_notes/unreleased/jaclang/0000.refactor.md";
+    assert frag_for_report(mcp_path) == "";
+}
+
+test "render leaves release_note empty when no file touches jac/jaclang/" {
+    d: dict = {
+        "branch": "nightshift/2026-07-10/dead-code-jac-mcp", "package": "jac-mcp",
+        "date": "2026-07-10", "risk": "low",
+        "tests": "jac check ok; jac test ok; pre-commit ok",
+        "summary": "remove dead mcp handler",
+        "files": ["jac-mcp/server.jac"], "loc_before": 20, "loc_after": 0,
+    };
+    (meta, _body) = split_draft(render(d));
+    assert meta["release_note"] == "";
 }

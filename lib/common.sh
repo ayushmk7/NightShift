@@ -11,6 +11,22 @@ LEDGER="$NS_ROOT/state/ledger.jsonl.cache"
 CONFIG="$NS_ROOT/config/nightshift.toml"
 LOCK_DIR="/tmp/nightshift.lock"
 
+# The slug of tier-1's agent-less autofix branch (`nightshift/<date>/autofix`). SINGLE SOURCE OF
+# TRUTH: lib/tier1.sh builds its branch name from it, lib/promote.sh tests against it, and
+# bin/test-harness.sh section 9 asserts the two stay in lockstep.
+#
+# It exists because "this branch has no theme file" is AMBIGUOUS and the two meanings need opposite
+# handling. Tier-1 legitimately has none — it is deterministic `jac fmt --lintfix` output with no
+# agent and nothing to scope-check. A tier-2 branch always had one, but $LOG_DIR is DATE-KEYED
+# (line 6 above), so the file is simply not where S7 looks the moment a human promotes on a
+# different calendar day than the run that produced it — the normal case for a 23:00 night. Reading
+# that absence as "no theme" would hand verify_branch a theme of "-", which makes it skip scope
+# containment entirely (lib/verify.sh stage 1) — i.e. re-gate the one class of branch an LLM wrote,
+# without the anti-injection check. So tier-1 is recognised POSITIVELY, by name, and every other
+# branch must produce its theme file or die loudly.
+NS_TIER1_SLUG="autofix"
+ns_is_tier1_branch() { [ "$(basename "$1")" = "$NS_TIER1_SLUG" ]; }
+
 # --- exit codes (TechnicalPRD 18; 50=audit-parse and 60=ceiling live in their tools) ---
 EX_LOCK=40; EX_DISABLED=41; EX_AUTH=42; EX_OFFLINE=43; EX_SYNC=44; EX_ALLFAIL=51; EX_BUG=70
 
@@ -38,7 +54,19 @@ ns_jac() {
 ns_log()  { printf '%s [%s] %s\n' "$(date '+%H:%M:%S')" "$1" "$2" | tee -a "$LOG_DIR/run.log" >&2; }
 ns_warn() { ns_log WARN "$1"; echo "$1" >> "$LOG_DIR/warnings.txt"; }
 ns_fail() { printf '%s\t%s\n' "$1" "$2" >> "$LOG_DIR/failed.tsv"; ns_log FAIL "$1: $2"; }
-ns_die()  { local code=$1; shift; ns_log FATAL "$*"; exit "$code"; }
+# ns_die RECORDS WHY, not just that. bin/nightshift.sh's ns_on_exit copies only CURRENT_STAGE to
+# ERROR_STAGE, and the stage NAME is all the digest reports -- but this branch multiplied ns_die
+# call sites in the unattended path (13 in lib/verify.sh alone, every one of them EX_BUG=70), so
+# "the night died in S4" is now almost no information at all. The reason text is written here and
+# folded into the digest by ns_on_exit. Best-effort (`|| true`): $LOG_DIR may not exist yet on the
+# earliest failure paths, and losing the reason must never change the exit code the caller asked
+# for. Stopgap for the unattended channel; the real digest work is Plan 4.
+ns_die()  {
+    local code=$1; shift
+    ns_log FATAL "$*"
+    printf '%s\n' "$*" > "$LOG_DIR/FATAL_REASON" 2>/dev/null || true
+    exit "$code"
+}
 
 # --- lock (mkdir is atomic on APFS; no flock on stock macOS) ---
 ns_lock_acquire() {
@@ -76,6 +104,24 @@ ns_retry() {
 ns_timebox() {
     local min=$1; shift
     gtimeout "${min}m" "$@"
+}
+
+# Block until fewer than <max> of THIS shell's background jobs are still running.
+# bash 3.2 (macOS stock, confirmed 3.2.57) has no `wait -n`, so poll instead of blocking on one job.
+# ponytail: 5s poll, not a job-control state machine. Audit sessions run for minutes.
+# LOAD-BEARING DEPENDENCY: this counts *every* running job of the calling shell, so the `disown`s on
+# the caffeinate and watchdog children (bin/nightshift.sh:60,66) are what keep them out of the count.
+# Drop either disown and the two long-lived children occupy the budget forever -- ns_jobs_wait 2 then
+# blocks until the watchdog kills the night, and no audit shard ever starts.
+# max<1 (or a non-numeric [shards].concurrency) would make `-ge` always true and spin here until
+# that same watchdog fires, so clamp to 1. `case`, not `[ -lt ] &&`, because a false `&&` list is
+# itself a nonzero return that would abort any caller running with errexit active.
+ns_jobs_wait() {
+    local max=$1
+    case "$max" in ''|0|*[!0-9]*) max=1 ;; esac
+    while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$max" ]; do
+        sleep 5
+    done
 }
 
 ns_remaining_min() {
@@ -126,19 +172,18 @@ ns_precommit() {
     PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" "$NS_PATHS_PRECOMMIT" "$@"
 }
 
-# Real path(s) to audit for a "package" — neither is an actual top-level directory (jac core
-# lives under jac/jaclang/). The audit prompt would otherwise say "look in {pkg}/" literally.
-ns_audit_scope() {
-    case "$1" in
-        jac-byllm) echo "jac/jaclang/byllm/" ;;
-        *)         echo "jac/jaclang/ (excluding jac/jaclang/byllm/ and jac/jaclang/scale/, which are separate packages)" ;;
-    esac
-}
-
 # --- secrets ---
 ns_load_env() {
-    # shellcheck disable=SC1090
-    [ -f "$HOME/.nightshift.env" ] && . "$HOME/.nightshift.env"
+    # `if`, never `[ -f x ] && . x`: a false `&&` list is itself a nonzero return, and this function
+    # is called BARE (not from an `if`) by bin/nightshift.sh's promote / baseline / mirror arms,
+    # where errexit is live and ns_run_inner's EXIT trap does not exist — so a missing env file
+    # would abort the command with status 1, no [FATAL] line and no autopsy email. Latent only
+    # because the file happens to exist on this host; Plan 5's move to ~/nightshift is exactly the
+    # kind of change that makes it not.
+    if [ -f "$HOME/.nightshift.env" ]; then
+        # shellcheck disable=SC1090
+        . "$HOME/.nightshift.env"
+    fi
     # A set ANTHROPIC_API_KEY silently outranks the subscription (TPRD feasibility row 7).
     unset ANTHROPIC_API_KEY
 }

@@ -20,11 +20,23 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 . "$NS_ROOT/lib/email.sh"
 . "$NS_ROOT/lib/promote.sh"
 . "$NS_ROOT/lib/dataset.sh"
+. "$NS_ROOT/lib/cimirror.sh"
 
 ns_on_exit() {
     local code=$?
     if [ "$code" -ne 0 ] && [ -f "$LOG_DIR/CURRENT_STAGE" ]; then
         cp "$LOG_DIR/CURRENT_STAGE" "$LOG_DIR/ERROR_STAGE"
+    fi
+    # ERROR_STAGE names WHERE the night died; FATAL_REASON (written by ns_die, lib/common.sh) says
+    # WHY. Folded into warnings.txt because that is the one channel scripts/sendmail.jac already
+    # renders verbatim in the digest -- the operator's only unattended feedback loop. Without this
+    # every ns_die in the pipeline reads identically as "ERROR S4" in the email, and there are 13
+    # of them in lib/verify.sh alone. `>>` on the same file the digest reads, not a new schema
+    # field: the full digest treatment is Plan 4's job.
+    if [ "$code" -ne 0 ] && [ -f "$LOG_DIR/FATAL_REASON" ]; then
+        printf 'FATAL (%s): %s\n' \
+            "$(cat "$LOG_DIR/ERROR_STAGE" 2>/dev/null || echo "no stage")" \
+            "$(cat "$LOG_DIR/FATAL_REASON")" >> "$LOG_DIR/warnings.txt" 2>/dev/null || true
     fi
     email_main >> "$LOG_DIR/S6.log" 2>&1 || true
     ns_lock_release
@@ -41,6 +53,10 @@ ns_run() {
     # Unconditional: the watchdog sleeps from *process* start, so the budget clock must too.
     # A same-day re-run inheriting the 02:00 epoch once yielded "-414m remaining" and a skipped S3.
     date +%s > "$LOG_DIR/start_epoch"
+    # Same-night re-runs share $LOG_DIR (it is date-keyed), so a FATAL_REASON left by an earlier
+    # attempt would be re-reported against this one. Cleared here, next to the epoch, for the same
+    # reason that is unconditional.
+    rm -f "$LOG_DIR/FATAL_REASON"
 
     # Self-caffeinate AND self-timebox as OUR OWN background children (forked, never exec'd/wrapped).
     # Two macOS/TCC footguns on an external-volume repo, both found the hard way under launchd:
@@ -90,6 +106,7 @@ usage: nightshift.sh run                        # the nightly pipeline (launchd 
        nightshift.sh discard <branch> [reason]  # bury the branch; the finding never resurfaces
        nightshift.sh status                     # last run summary + ledger tallies
        nightshift.sh baseline                   # record the test baseline on main (slow; M0)
+       nightshift.sh mirror [branch]            # run the whole CI mirror against a branch (slow)
        nightshift.sh dataset-backfill           # rebuild dataset/*.jsonl from past real nights
 EOF
     exit 2
@@ -105,6 +122,58 @@ case "$cmd" in
     discard)    [ $# -ge 1 ] || usage; mkdir -p "$LOG_DIR"; discard_main "$@" ;;
     status)     status_main ;;
     baseline)   mkdir -p "$LOG_DIR" "$NS_ROOT/state"; ns_load_env; baseline_main ;;
+    # Hand-debugging a red branch. Runs EVERY gate job in config order (fmt, check, jir, byllm,
+    # compiler, runtime, contribution), stopping at the first failure -- so it is fast on a branch
+    # that is broken early and ~40min+ on one that is only broken late. That breadth is the point:
+    # S4 runs a deliberately narrowed subset (only the suites gated_suites_from_diff routes to), and
+    # this is the command for "CI is red and the gate was green, what did the gate not run?".
+    #
+    # Every line below is written the way it is because bin/nightshift.sh runs under `set -e`:
+    #   * `|| rc=$?`, not `cimirror_all ...; rc=$?` -- a nonzero from cimirror_all is the NORMAL way
+    #     a red job is reported, and as a bare simple command it would abort this script before
+    #     `rc=$?` ever ran, losing both the exit code and the tail below.
+    #   * `if`, not `[ -f ... ] && echo ...` -- on a GREEN run the file does not exist, the `&&` list
+    #     returns nonzero, and errexit would kill the script right before `exit "$rc"`, turning a
+    #     passing mirror into a nonzero exit.
+    # mirror-failed-job.txt is cleared first so a stale one from an earlier run in the same night
+    # cannot be reported against this one, and its two reader sentinels are handled by name
+    # (lib/cimirror.sh writes "(job-list-read-failure)" / "(empty-job-list)" there instead of a job).
+    mirror)     mkdir -p "$LOG_DIR"; ns_load_env
+                # Refuse to run underneath a live night. This is the command an operator is most
+                # tempted to fire mid-run, and it would `git checkout` in $REPO out from under
+                # S2/S3/S4 and share $LOG_DIR/mirror-home with them. It deliberately does NOT call
+                # ns_lock_acquire: that reclaims a stale lock and there is no EXIT trap on this path
+                # to release it, so a manual mirror would leave /tmp/nightshift.lock held forever
+                # and block every subsequent night. Read-only liveness check instead.
+                if [ -f "$LOCK_DIR/pid" ]; then
+                    holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+                    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+                        ns_die "$EX_LOCK" "a nightly run (pid $holder) is live; 'mirror' would git-checkout in $REPO underneath it and share its mirror-home. Wait for it to finish, or stop it first."
+                    fi
+                fi
+                rm -f "$LOG_DIR/mirror-failed-job.txt"
+                # `|| ns_die`: a typo'd branch name otherwise exits 1 under errexit — the SAME code a
+                # genuinely red job returns — with none of this arm's diagnostics printed.
+                if [ $# -ge 1 ]; then
+                    git -C "$REPO" checkout "$1" \
+                        || ns_die "$EX_BUG" "no such branch '$1' in $REPO — nothing was mirrored."
+                fi
+                rc=0; cimirror_all "$LOG_DIR/mirror-manual.txt" || rc=$?
+                if [ -f "$LOG_DIR/mirror-failed-job.txt" ]; then
+                    failed_job="$(cat "$LOG_DIR/mirror-failed-job.txt")"
+                    case "$failed_job" in
+                        '(job-list-read-failure)')
+                            echo "mirror: could not read the job list from config/ci-mirror.toml — the harness is broken, not the branch" >&2 ;;
+                        '(empty-job-list)')
+                            echo "mirror: config/ci-mirror.toml yielded an EMPTY job list — the harness is broken, not the branch" >&2 ;;
+                        *)  echo "failed job: $failed_job" >&2 ;;
+                    esac
+                elif [ "$rc" -ne 0 ]; then
+                    # Should be unreachable: cimirror_all writes that file on every failure path.
+                    echo "mirror: rc=$rc but no failing job was recorded — see $LOG_DIR/mirror-manual.txt" >&2
+                fi
+                tail -40 "$LOG_DIR/mirror-manual.txt"
+                exit "$rc" ;;
     dataset-backfill) mkdir -p "$LOG_DIR"; dataset_backfill ;;
     *)          usage ;;
 esac

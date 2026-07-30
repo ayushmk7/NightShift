@@ -2,7 +2,13 @@
 
 argv:  findings | report | meta      (stdin: the full envelope from --output-format json)
        field <key>                   (stdin: any JSON object; print the raw value — bash's jq)
+       fragment <key>                 (stdin: any JSON object; print field <key> NORMALIZED into
+                                       release-note-fragment bullet form — see nslib.normalize_-
+                                       fragment_body. Distinct from `field` on purpose: `field` is
+                                       used for package/branch/title/etc. too, where prefixing a
+                                       bullet would corrupt the value.)
        len                           (stdin: any JSON array; print its length)
+       merge <f1.json> <f2.json> ..  (per-shard findings arrays; print one deduped array)
 - findings: validate the audit's fenced JSON array; print the normalized array.
 - report:   validate the apply session's fenced JSON object; print the normalized object.
 - meta:     print {num_turns, total_cost_usd, session_id, is_error} for logging/email.
@@ -10,7 +16,7 @@ Malformed output → message on stderr, exit 50 (TPRD 18) so the caller skips th
 """
 import sys;
 import json;
-import from nslib { eprint, read_stdin, parse_obj, parse_list }
+import from nslib { eprint, read_stdin, parse_obj, parse_list, as_dict, normalize_fragment_body }
 
 """Return the body of the last ```json fenced block, or the whole text if none."""
 def extract_fenced_json(text: str) -> str {
@@ -89,6 +95,24 @@ def validate_report(raw: str) -> dict {
     return rep;
 }
 
+"""Merge per-shard findings arrays into one. Two shards can legitimately surface the
+same (file, rule) pair when a file sits on a shard boundary; the ledger fingerprint is
+sha1(file \x1f rule), so shipping both would double-count one finding. First wins."""
+def merge_findings(arrays: list[list[dict]]) -> list[dict] {
+    seen: set[str] = set();
+    out: list[dict] = [];
+    for arr in arrays {
+        for f in arr {
+            key: str = str(f.get("file", "")) + "\x1f" + str(f.get("rule", ""));
+            if key not in seen {
+                seen.add(key);
+                out.append(f);
+            }
+        }
+    }
+    return out;
+}
+
 def meta(envelope: dict) -> dict {
     return {
         "num_turns": envelope.get("num_turns"),
@@ -106,6 +130,10 @@ with entry {
         if value is not None {
             print(value if isinstance(value, str) else json.dumps(value));
         }
+    } elif cmd == "fragment" and len(args) == 3 {
+        value2: any = parse_obj(read_stdin()).get(args[2]);
+        text: str = value2 if isinstance(value2, str) else json.dumps(value2);
+        print(normalize_fragment_body(text), end="");
     } elif cmd == "len" {
         print(len(parse_list(read_stdin())));
     } elif cmd in ["findings", "report", "meta"] {
@@ -122,9 +150,18 @@ with entry {
             eprint("parse_result: " + str(e));
             sys.exit(50);
         }
+    } elif cmd == "merge" and len(args) >= 3 {
+        arrays: list[list[dict]] = [];
+        for path in args[2:] {
+            with open(path, "r") as f {
+                arrays.append([as_dict(item) for item in parse_list(f.read())]);
+            }
+        }
+        print(json.dumps(merge_findings(arrays)));
     } elif cmd != "" and cmd != "test" {
         eprint("usage: claude -p ... --output-format json | jac run parse_result.jac findings|report|meta");
-        eprint("       ... | jac run parse_result.jac field <key> | len");
+        eprint("       ... | jac run parse_result.jac field <key> | fragment <key> | len");
+        eprint("       jac run parse_result.jac merge <findings1.json> <findings2.json> ...");
     }
 }
 
@@ -145,6 +182,24 @@ test "report: missing key raises" {
         raised = True;
     }
     assert raised;
+}
+
+test "merge dedupes on (file, rule) and preserves first-seen order" {
+    a: list[dict] = [{"file": "x.jac", "rule": "dead-code", "confidence": 5},
+                     {"file": "y.jac", "rule": "simplify", "confidence": 3}];
+    b: list[dict] = [{"file": "x.jac", "rule": "dead-code", "confidence": 1},
+                     {"file": "z.jac", "rule": "duplication", "confidence": 4}];
+    merged: list[dict] = merge_findings([a, b]);
+    assert len(merged) == 3;
+    assert merged[0]["file"] == "x.jac" and merged[0]["confidence"] == 5;
+    assert [str(m["file"]) for m in merged] == ["x.jac", "y.jac", "z.jac"];
+}
+
+test "merge tolerates empty and single arrays" {
+    assert merge_findings([]) == [];
+    assert merge_findings([[], []]) == [];
+    one: list[dict] = [{"file": "a.jac", "rule": "simplify"}];
+    assert len(merge_findings([one])) == 1;
 }
 
 test "error envelope raises" {

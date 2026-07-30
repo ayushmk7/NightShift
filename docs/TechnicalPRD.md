@@ -1,3 +1,13 @@
+> **SUPERSEDED for stages S3 onward (2026-07-30).** Written before the target repo restructured.
+> Upstream is now **`jaseci-labs/jac`**; `jac-byllm`/`jac-scale` are not packages; package rotation is
+> replaced by an 8-shard whole-repo audit; fragments live at `release_notes/unreleased/jaclang/`; and
+> the S4 gate now runs a local replica of the CI jobs a fork PR cannot reach
+> (`config/ci-mirror.toml` + `lib/cimirror.sh`). Current design:
+> [`docs/superpowers/specs/2026-07-30-nightshift-4task-design.md`](superpowers/specs/2026-07-30-nightshift-4task-design.md).
+> **The line below pointing at `docs/steps/` as the source of truth is obsolete** — that directory was a
+> build log for a pipeline since rebuilt and was deleted on 2026-07-30 (recoverable from git history).
+> The code itself, plus `WORKFLOW.md`, is the source of truth. Kept for provenance.
+
 # Technical PRD — Nightshift v0.4
 
 Companion to `PRD-nightshift.md`. That document says *what and why*; this one says *exactly how*.

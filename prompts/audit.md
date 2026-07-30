@@ -1,6 +1,6 @@
 /ponytail-audit
 
-You are auditing ONLY {scope} of the Jaseci monorepo (package: `{pkg}`) for over-engineering,
+You are auditing ONLY {scope} of the Jaseci monorepo (audit shard: `{shard}`) for over-engineering,
 dead code, duplication, and reinvented stdlib — using the ponytail ladder (mode: {ponytail_mode}).
 
 Be VERY THOROUGH and VERY DETAILED. This is not a skim: read every file in scope fully, not

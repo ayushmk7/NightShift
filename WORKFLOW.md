@@ -1,8 +1,11 @@
 # Nightshift — Workflow
 
-End-to-end map of the harness. Reflects the corrected single-binary `jac test` model
-(docs v0.5). Stages `S0–S6` run nightly and unattended; `S7` is the human morning loop.
-See `docs/PRD.md`, `docs/TechnicalPRD.md`, and `docs/steps/` for detail.
+End-to-end map of the harness, current as of the v2 foundations work (2026-07-30): whole-repo
+sharded audit, and an S4 gate that runs a local replica of the CI jobs a fork PR cannot reach.
+Stages `S0–S6` run nightly and unattended; `S7` is the human morning loop.
+Current design: `docs/superpowers/specs/2026-07-30-nightshift-4task-design.md`; open items:
+`docs/superpowers/specs/2026-07-30-nightshift-followups.md`. `docs/PRD.md` and `docs/TechnicalPRD.md`
+are pre-restructure and superseded for S3 onward (they carry banners saying so).
 
 ## 1. Nightly pipeline (S0 → S6)
 
@@ -60,10 +63,10 @@ flowchart TD
 
     subgraph S3["S3 · Tier 2 · agentic clean"]
         direction TB
-        ROT["rotate · pick tonight's package · jac / jac-byllm / jac-mcp / jac-scale"]
-        AUDIT["claude -p AUDIT · read-only · dontAsk · ponytail-audit scoped to pkg"]
-        PJSON{"parse_result · valid findings JSON?"}
-        SEL["select.jac · drop ledger-known / protected / twice-failed · score loc*conf/risk · pack <=3 themes <=10 files <=300 LOC · fit clock"]
+        ROT["shards list · 8 LOC-balanced shards of the whole repo · concurrency 2"]
+        AUDIT["per shard · claude -p AUDIT · read-only · dontAsk · ponytail-audit scoped to the shard"]
+        PJSON{"parse_result merge · any shard produced valid findings JSON?"}
+        SEL["select.jac · drop ledger-known / protected / twice-failed · score loc*conf/risk · pack <=6 themes <=10 files <=600 LOC · fit clock"]
         APPLY["per theme · fresh branch + fresh claude -p APPLY · acceptEdits · scoped tools · NO push/gh/network · validate_jac before commit"]
         RJSON{"report JSON ok and diff non-empty?"}
         FRAG["orchestrator writes release-note fragment · dir mapped jac to jaclang etc · ledger upsert-theme · queue.tsv"]
@@ -79,19 +82,25 @@ flowchart TD
     subgraph S4["S4 · Verify gate · fail-closed · per queued branch"]
         direction TB
         SCOPE{"scope contained? · diff subset of theme files + fragment · no protected"}
-        CHK{"jac check ok?"}
-        TST{"jac test tests per pkg · one retry each"}
+        CHK{"jac check baseline-diff ok? · new errors vs main only"}
+        FAST{"CI mirror fast jobs ok? · fmt · check · jir · ~3s"}
+        TST{"mirrored CI suites per gated suite · baseline-diff · one retry each"}
         PC{"pre-commit ok? · fold self-mutation"}
+        CTRB{"CI mirror contribution ok? · AI co-author · no .py · bun lockstep · docs · fragment"}
         DISCARD["delete branch · ledger failed_verify++ · failed.tsv"]
         GREEN["green.tsv · record tests line · tune verify_estimate"]
         SCOPE -->|"no · possible injection"| DISCARD
         SCOPE -->|"yes"| CHK
         CHK -->|"no"| DISCARD
-        CHK -->|"yes"| TST
+        CHK -->|"yes"| FAST
+        FAST -->|"red · seconds, not 40min"| DISCARD
+        FAST -->|"green"| TST
         TST -->|"red x2"| DISCARD
         TST -->|"green"| PC
         PC -->|"red"| DISCARD
-        PC -->|"green"| GREEN
+        PC -->|"green"| CTRB
+        CTRB -->|"red"| DISCARD
+        CTRB -->|"green"| GREEN
     end
     GREEN --> S5
 
@@ -124,10 +133,9 @@ flowchart TD
 
     %% data stores
     LEDGER[("ledger.jsonl · fingerprint to status")]
-    STATE[("state.json · next_package · verify_estimate")]
+    STATE[("state.json · verify_estimate · last_jac_version")]
     DRAFTSB[("nightshift/drafts orphan branch · drafts/*.md")]
     PULL -.->|read| LEDGER
-    ROT -.->|advance| STATE
     SEL -.->|read| LEDGER
     FRAG -.->|write| LEDGER
     DISCARD -.->|write| LEDGER
@@ -168,7 +176,7 @@ stateDiagram-v2
     [*] --> new: audit surfaces it
     new --> in_theme: selected + applied
     new --> deferred: did not fit budget/clock
-    deferred --> in_theme: eligible next rotation
+    deferred --> in_theme: eligible on a later night
     in_theme --> drafted: S4 green then S5
     in_theme --> failed_verify: S4 red
     failed_verify --> in_theme: first failure · retry later
@@ -186,7 +194,7 @@ bash sequences processes; Jac owns every data and logic transformation. No Pytho
 ```mermaid
 flowchart LR
     subgraph ENTRY["bin"]
-        NS["nightshift.sh · run / dry-run / promote / discard / status"]
+        NS["nightshift.sh · run / dry-run / promote / discard / status / baseline / mirror"]
         TH["test-harness.sh"]
     end
     subgraph LIB["lib · bash stages"]
@@ -199,6 +207,7 @@ flowchart LR
         SH["ship.sh"]
         EM["email.sh"]
         PR2["promote.sh"]
+        CMR["cimirror.sh · runs config/ci-mirror.toml jobs"]
     end
     subgraph JAC["scripts · Jac helpers"]
         NL["nslib.jac · shared · fingerprint · globs · fragment map"]
@@ -217,12 +226,13 @@ flowchart LR
         SMTP["smtplib SSL"]
     end
 
-    NS --> CM & PF & SY & T1 & T2 & VF & SH & EM & PR2
+    NS --> CM & PF & SY & T1 & T2 & VF & SH & EM & PR2 & CMR
     PF --> CF & LG
     SY --> LG & GH
-    T1 --> JB & RD
+    T1 --> JB & RD & CMR
     T2 --> CC & PRz & SE & LG & RD
-    VF --> JB & CS & LG
+    VF --> JB & CS & LG & CMR
+    CMR --> JB
     SH --> RD & LG & GH
     EM --> SM & RD
     PR2 --> GH & LG & RD & CS & JB

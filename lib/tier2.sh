@@ -20,20 +20,21 @@ tier2_main() {
         return 0
     fi
 
-    local pkg; pkg="$(ns_jac selector rotate "$CONFIG" "$STATE")"
-    ns_log S3 "tonight's package: $pkg"
-
-    tier2_audit "$pkg" || return 0        # malformed audit skips the tier; tier-1 still ships
-    tier2_select "$pkg"
-    tier2_apply "$pkg"
-    dataset_record_night "$pkg"           # after select+apply: selection.json + every meta-*.json exist
+    tier2_audit_all || return 0        # no usable findings skips the tier; tier-1 still ships
+    tier2_select
+    tier2_apply
+    dataset_record_night               # after select+apply: selection.json + every meta-*.json exist
 }
 
-# Phase A — audit, physically read-only (dontAsk + no Edit/Write in the allow-list)
-tier2_audit() {
-    local pkg=$1 prompt attempt
+# Phase A — audit, physically read-only (dontAsk + no Edit/Write in the allow-list).
+# ONE SHARD per session: 365k LOC cannot be audited in one context (design spec 5).
+# Writes $LOG_DIR/findings-<shard>.json on success. Never returns nonzero for a single
+# shard failure -- a dead shard must not kill the tier, the way a dead package used to.
+tier2_audit_shard() {
+    local shard=$1 prompt attempt scope
+    scope="$(ns_jac shards scope "$shard" "$CONFIG")"
     prompt="$(render_prompt "$NS_ROOT/prompts/audit.md" \
-        "pkg=$pkg" "scope=$(ns_audit_scope "$pkg")" \
+        "shard=$shard" "scope=$scope" \
         "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
 
     # empty NS_AGENT_MODEL (config: [agent].model) means "account default" -- that's the exact
@@ -43,57 +44,153 @@ tier2_audit() {
     [ -n "$NS_AGENT_MODEL" ] && model_args=(--model "$NS_AGENT_MODEL")
 
     # Up to 2 attempts: a transient API error (e.g. "Connection closed mid-response") shouldn't
-    # burn the whole agentic tier. Each attempt is time-boxed; the parse decides success.
+    # burn this shard. Each attempt is time-boxed; the parse decides success.
+    # </dev/null on every claude call is load-bearing: the driver loop feeds stdin, and without
+    # it one session EATS the remaining shard list (the same bug that cost 5 of 6 themes in
+    # tier2_apply — see the comment there).
     for attempt in 1 2; do
         # dev jac first on PATH so the agent's Bash(jac *) and the jac MCP server hit the repo binary.
         (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
             && ns_timebox "$NS_BUDGETS_AUDIT_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
-            "${model_args[@]}" \
+            ${model_args[@]+"${model_args[@]}"} \
             --permission-mode dontAsk \
             --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
-            --max-turns "$NS_BUDGETS_AUDIT_MAX_TURNS" --output-format json) > "$LOG_DIR/audit.json" || true
+            --max-turns "$NS_BUDGETS_AUDIT_MAX_TURNS" --output-format json) \
+            > "$LOG_DIR/audit-$shard.json" < /dev/null || true
 
         # 0-byte envelope = the timebox killed the session before it printed anything; a longer
         # audit_timeout_min (not a re-prompt) is the lever for that failure mode.
-        if [ ! -s "$LOG_DIR/audit.json" ]; then
-            ns_log S3 "audit attempt $attempt produced no output (killed at ${NS_BUDGETS_AUDIT_TIMEOUT_MIN}m?) — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"
+        if [ ! -s "$LOG_DIR/audit-$shard.json" ]; then
+            ns_log S3 "audit[$shard] attempt $attempt produced no output (killed at ${NS_BUDGETS_AUDIT_TIMEOUT_MIN}m?)"
             continue
         fi
 
-        ns_jac parse_result meta < "$LOG_DIR/audit.json" > "$LOG_DIR/meta-audit.json" || true
+        ns_jac parse_result meta < "$LOG_DIR/audit-$shard.json" > "$LOG_DIR/meta-audit-$shard.json" || true
 
-        if ns_jac parse_result findings < "$LOG_DIR/audit.json" > "$LOG_DIR/findings.json" 2> "$LOG_DIR/parse-err-audit.txt"; then
-            ns_log S3 "audit produced $(ns_jac parse_result len < "$LOG_DIR/findings.json" || echo 0) findings"
+        if ns_jac parse_result findings < "$LOG_DIR/audit-$shard.json" \
+                > "$LOG_DIR/findings-$shard.json" 2> "$LOG_DIR/parse-err-audit-$shard.txt"; then
+            ns_log S3 "audit[$shard]: $(ns_jac parse_result len < "$LOG_DIR/findings-$shard.json" || echo 0) findings"
             return 0
         fi
 
-        # Hard account limit: the retry and the corrective re-prompt both fail until it resets.
-        if grep -q "hit your session limit" "$LOG_DIR/audit.json"; then
-            ns_fail "audit ($pkg)" "Claude session limit hit — agentic tier skipped tonight"
+        # Hard account limit: leave a marker so the DRIVER can drop to serial / stop scheduling.
+        if grep -q "hit your session limit" "$LOG_DIR/audit-$shard.json"; then
+            touch "$LOG_DIR/.session-limit"
+            ns_fail "audit[$shard]" "Claude session limit hit"
+            rm -f "$LOG_DIR/findings-$shard.json"
             return 1
         fi
 
         # Live envelope, bad JSON: one cheap single-turn corrective re-prompt before burning
         # the attempt — two whole nights died to malformed audit output with no salvage.
-        ns_timebox 3 "$NS_PATHS_CLAUDE" -p "Your audit output failed validation: $(cat "$LOG_DIR/parse-err-audit.txt")
+        ns_timebox 3 "$NS_PATHS_CLAUDE" -p "Your audit output failed validation: $(cat "$LOG_DIR/parse-err-audit-$shard.txt")
 Previous output:
-$(ns_jac parse_result field result < "$LOG_DIR/audit.json")
+$(ns_jac parse_result field result < "$LOG_DIR/audit-$shard.json")
 Re-emit ONLY the corrected \`\`\`json fenced findings array — same schema, no prose." \
-            "${model_args[@]}" --max-turns 1 --output-format json > "$LOG_DIR/audit-repair.json" || true
-        if ns_jac parse_result findings < "$LOG_DIR/audit-repair.json" > "$LOG_DIR/findings.json"; then
-            ns_log S3 "audit salvaged via corrective re-prompt — $(ns_jac parse_result len < "$LOG_DIR/findings.json" || echo 0) findings"
+            ${model_args[@]+"${model_args[@]}"} --max-turns 1 --output-format json \
+            > "$LOG_DIR/audit-repair-$shard.json" < /dev/null || true
+        if ns_jac parse_result findings < "$LOG_DIR/audit-repair-$shard.json" > "$LOG_DIR/findings-$shard.json"; then
+            ns_log S3 "audit[$shard] salvaged via corrective re-prompt — $(ns_jac parse_result len < "$LOG_DIR/findings-$shard.json" || echo 0) findings"
             return 0
         fi
-        ns_log S3 "audit attempt $attempt failed to parse even after corrective re-prompt — $([ "$attempt" = 1 ] && echo retrying || echo giving up)"
+        ns_log S3 "audit[$shard] attempt $attempt failed to parse even after corrective re-prompt"
     done
-    ns_fail "audit ($pkg)" "malformed/failed audit after retry (exit 50) — agentic tier skipped tonight"
+    ns_fail "audit[$shard]" "malformed/failed audit after retry — this shard contributes nothing"
+    rm -f "$LOG_DIR/findings-$shard.json"
     return 1
+}
+
+# Fan out audit shards, <concurrency> at a time, then merge into one findings array.
+# A session limit collapses the fan-out to serial rather than aborting the tier: the old
+# behavior lost every remaining shard to one limit signal.
+tier2_audit_all() {
+    local shard conc merged
+    conc="${NS_SHARDS_CONCURRENCY:-2}"
+    rm -f "$LOG_DIR/.session-limit"
+
+    # The shard list is MATERIALIZED and both its exit status and its emptiness checked, rather
+    # than iterated straight out of `for shard in $(ns_jac shards list "$CONFIG")`. `set -e` does
+    # not fire on `for x in $(false)`, so a malformed [shards] table -- or any jac error in the
+    # reader -- made both loops below iterate ZERO times: no session was ever started, n_found
+    # stayed 0, and the night logged "every shard failed or produced nothing" while tier2_main
+    # returned 0. The entire agentic tier silently no-ops and the message blames the audit rather
+    # than the config. This is byte-for-byte the discarded-reader bug lib/cimirror.sh:119-144 and
+    # lib/verify.sh:407-420 both already document fixing; it survived here.
+    # Read ONCE and reused by the collect loop below, so the two cannot disagree either.
+    local shard_list shard_rc=0 n_total
+    shard_list="$(ns_jac shards list "$CONFIG")" || shard_rc=$?
+    if [ "$shard_rc" -ne 0 ] || [ -z "$shard_list" ]; then
+        ns_die "$EX_BUG" "could not read the shard list from $CONFIG (rc=$shard_rc, $(printf '%s' "$shard_list" | wc -w | tr -d ' ') names). An empty list iterates zero times and is indistinguishable from 'every shard failed', which is what this used to be reported as."
+    fi
+    n_total="$(printf '%s\n' "$shard_list" | wc -w | tr -d ' ')"
+
+    # `for` over the materialized list, NOT a pipe: a piped `while` loop would run in a subshell
+    # whose `jobs -rp` cannot see the sessions, and ns_jobs_wait would never throttle anything.
+    # Concurrent shards each fork their own `ns_jac` calls, which SHARE one .jac/data/anchor_store.db;
+    # jac can print "database is locked" on stderr under that contention (exit status and stdout stay
+    # correct). That stderr lands in parse-err-audit-$shard.txt, which the corrective re-prompt below
+    # pastes verbatim — so a lock warning can show up inside a re-prompt. Cosmetic, not a failure.
+    for shard in $shard_list; do
+        # log the collapse ONCE, not once per remaining shard
+        if [ -f "$LOG_DIR/.session-limit" ] && [ "$conc" != 1 ]; then
+            ns_log S3 "session limit seen — dropping to serial for the remaining shards"
+            conc=1
+        fi
+        # WHAT THIS ACTUALLY RESERVES, stated honestly because the obvious reading is wrong: it
+        # stops SCHEDULING once fewer than AUDIT+APPLY minutes remain, which is NOT the same as
+        # guaranteeing tier2_apply an APPLY window. The shards already in flight when the guard
+        # last passed still run to their own AUDIT_TIMEOUT, and the unconditional `wait` after the
+        # loop drains them -- so up to another full AUDIT_TIMEOUT can elapse after the last
+        # scheduling decision. Worst case the apply phase starts with roughly APPLY - AUDIT
+        # minutes, not APPLY. Reserving 2*AUDIT+APPLY (65m of a 180m night at today's budgets)
+        # would make the reservation real, at the cost of ending the fan-out much earlier; not
+        # done, because tier2_apply already re-checks the clock per theme
+        # (APPLY_TIMEOUT + 20 below) and defers themes to a future night rather than truncating
+        # one mid-session. So the failure mode this under-reservation causes is "fewer themes
+        # tonight", not a corrupted branch.
+        if [ "$(ns_remaining_min)" -lt $(( NS_BUDGETS_AUDIT_TIMEOUT_MIN + NS_BUDGETS_APPLY_TIMEOUT_MIN )) ]; then
+            ns_warn "clock too short to schedule more audit shards — stopping the fan-out at $shard (in-flight shards still drain below)"
+            break
+        fi
+        ns_jobs_wait "$conc"
+        tier2_audit_shard "$shard" &
+    done
+    wait
+
+    # Collect the shards that produced findings. NOT a bash array: under `set -u` (which
+    # bin/nightshift.sh sets) bash 3.2 aborts on ${#arr[@]} and "${arr[@]}" when the array is
+    # EMPTY -- and "every shard failed" is exactly the case this branch has to survive.
+    # ponytail: a space-joined string is fine because $NS_ROOT (and so $LOG_DIR) contains no space --
+    # a property of the install path, not of the shard names. If the harness is ever installed under a
+    # path with a space, the word-split below hands `merge` broken paths and the guard on it fires.
+    local found="" n_found=0
+    for shard in $shard_list; do
+        if [ -s "$LOG_DIR/findings-$shard.json" ]; then
+            found="$found $LOG_DIR/findings-$shard.json"
+            n_found=$(( n_found + 1 ))
+        fi
+    done
+    if [ "$n_found" -eq 0 ]; then
+        ns_fail "audit" "every shard failed or produced nothing — agentic tier skipped tonight"
+        return 1
+    fi
+    # Guarded: the redirect has already TRUNCATED findings.json by the time merge can fail, and an
+    # unguarded failure here would leave 0 bytes, fail tier2_select, and abort the whole night under
+    # errexit -- taking S4/S5 and tier-1's already-queued branches with it. Skip the tier instead.
+    # shellcheck disable=SC2086  # deliberate word-split into one arg per shard findings file
+    if ! ns_jac parse_result merge $found > "$LOG_DIR/findings.json"; then
+        ns_fail "audit" "merge of $n_found shard findings failed — agentic tier skipped tonight"
+        rm -f "$LOG_DIR/findings.json"
+        return 1
+    fi
+    merged="$(ns_jac parse_result len < "$LOG_DIR/findings.json" || echo 0)"
+    ns_log S3 "merged $n_found/$n_total shards into $merged findings"
+    return 0
 }
 
 # Phase B — select (pure function in selector.jac; deterministic, unit-tested)
 tier2_select() {
-    local pkg=$1
-    ns_jac selector select "$pkg" "$CONFIG" "$LEDGER" "$STATE" "$(ns_remaining_min)" "$REPO" \
+    ns_jac selector select "$CONFIG" "$LEDGER" "$STATE" "$(ns_remaining_min)" "$REPO" \
         < "$LOG_DIR/findings.json" > "$LOG_DIR/selection.json"
 
     # findings the selector shed for budget/clock reasons are remembered as deferred (TPRD 9)
@@ -109,7 +206,7 @@ tier2_select() {
 
 # Phase C — apply: fresh branch + fresh headless session per theme
 tier2_apply() {
-    local pkg=$1 slug branch theme_file prompt remaining attempt got_report limit_hit
+    local slug branch theme_file prompt remaining attempt got_report limit_hit
     local -a model_args=()
     [ -n "$NS_AGENT_MODEL" ] && model_args=(--model "$NS_AGENT_MODEL")
     ns_jac selector split "$LOG_DIR/selection.json" "$LOG_DIR" | while IFS= read -r slug; do
@@ -123,7 +220,7 @@ tier2_apply() {
         fi
 
         prompt="$(render_prompt "$NS_ROOT/prompts/apply.md" \
-            "pkg=$pkg" "theme=$(cat "$theme_file")" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
+            "theme=$(cat "$theme_file")" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
 
         # Up to 2 attempts, each on a FRESH branch: a transient API error mid-session (same class
         # tier2_audit already retries) shouldn't burn the whole theme for the night.
@@ -142,7 +239,7 @@ tier2_apply() {
             # (observed live: 6 themes selected, 1 attempted, 5 silently never ran).
             (cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
                 && ns_timebox "$NS_BUDGETS_APPLY_TIMEOUT_MIN" "$NS_PATHS_CLAUDE" -p "$prompt" \
-                "${model_args[@]}" \
+                ${model_args[@]+"${model_args[@]}"} \
                 --permission-mode acceptEdits \
                 --allowedTools "Read,Edit,Grep,Glob,Bash(jac fmt *),Bash(jac check *),Bash(jac code *),Bash(jac test *),Bash(git diff *),Bash(git status *),Bash(git log *),Bash(git add *),Bash(git rm *),Bash(git commit *),mcp__jac__*" \
                 --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \
@@ -182,12 +279,22 @@ tier2_apply() {
         fi
 
         # The ORCHESTRATOR writes the release-note fragment — the agent has no Write tool (TPRD S3-C).
-        # Fragment dir is the repo's name (jac->jaclang, jac-byllm->byllm), not the package name.
-        local fragment; fragment="$(ns_jac render_draft frag "$pkg")"
-        mkdir -p "$(dirname "$REPO/$fragment")"
-        ns_jac parse_result field release_note_md < "$LOG_DIR/report-$slug.json" > "$REPO/$fragment"
-        git add "$fragment"
-        git commit -m "docs($pkg): release note fragment (nightshift)"
+        # Path derives from the theme's own files (via the report the agent returned): only
+        # jac/jaclang/** needs a fragment at all, and a theme can now span shards, so there is
+        # no package name left to put in the path or the commit subject.
+        local fragment; fragment="$(ns_jac render_draft frag "$LOG_DIR/report-$slug.json")"
+        if [ -n "$fragment" ]; then
+            mkdir -p "$(dirname "$REPO/$fragment")"
+            # `fragment`, not `field`: normalizes into bullet form (nslib.normalize_fragment_body)
+            # so an agent's plain-English release_note_md can't reach a commit unbulleted and
+            # fail CI's content-format check (ci.yml contribution-checks, check-release-notes.sh
+            # ~line 176) while the local gate (fragcheck.jac) would have passed it.
+            ns_jac parse_result fragment release_note_md < "$LOG_DIR/report-$slug.json" > "$REPO/$fragment"
+            git add "$fragment"
+            git commit -m "docs: release note fragment (nightshift)"
+        else
+            ns_log S3 "theme $slug touches no jac/jaclang/ path — no fragment required"
+        fi
 
         ns_jac ledger upsert-theme "$theme_file" "$branch" "$LEDGER" >/dev/null
         ns_queue_branch "$branch" "$theme_file" "$LOG_DIR/report-$slug.json"

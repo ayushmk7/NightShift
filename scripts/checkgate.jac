@@ -13,12 +13,37 @@ that inserting/removing lines elsewhere never fabricates a "new" error. Only har
 
 argv:
   parse <raw.txt>                 print sorted unique error identities (code<TAB>src)
+  ran   <raw.txt>                 print how many checker runs the capture contains
+                                  (0 == `jac check` never started; see run_count)
   gate  <main_raw> <branch_raw>   exit 0 if branch adds no new error identity, 1 if it does
                                   (prints the new ones), 2 if main_raw is missing
 """
 import sys;
 import os;
+import re;
 import from nslib { eprint }
+
+"""How many `jac check` runs the capture contains -- 0 means the checker never actually ran.
+
+Same hole `testgate.jac`'s session_count closes for the test gate, on this gate: `identities()`
+returns an empty set both for "the checker ran and found nothing" and for "the checker never
+started" (missing/unexecutable $NS_PATHS_JAC_REPO, an argument list too long for exec, a crash).
+`gate` then finds no new identity and returns 0, and verify_branch publishes `jac check ✓`.
+
+The signal is the run summary the checker always prints when it truly ran -- measured 2026-07-30
+against the repo's own binary: a clean file, a file with real errors, and even a NONEXISTENT path
+all end in `N passed in Xs` / `N failed in Xs` (exit 1 whenever errors exist, which is why the
+caller's `|| true` is legitimate and stays). A missing binary exits 127 and prints no summary at
+all."""
+def run_count(raw: str) -> int {
+    n: int = 0;
+    for line in raw.splitlines() {
+        if re.search(r"\d+ (passed|failed) in ", line) {
+            n += 1;
+        }
+    }
+    return n;
+}
 
 def is_caret(line: str) -> bool {
     stripped: str = line.strip();
@@ -83,7 +108,20 @@ def gate(main_path: str, branch_path: str) -> (int, list[str]) {
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
-    if cmd == "gate" and len(args) == 4 {
+    # `parse` was documented in this file's argv header from the start but had no dispatch branch,
+    # so it silently printed nothing -- the identical omission testgate.jac carried. Found by
+    # running it against a real capture with two known errors and getting zero back.
+    if cmd == "parse" and len(args) == 3 {
+        with open(args[2], "r") as f {
+            for i in identities(f.read()) {
+                print(i);
+            }
+        }
+    } elif cmd == "ran" and len(args) == 3 {
+        with open(args[2], "r") as f {
+            print(run_count(f.read()));
+        }
+    } elif cmd == "gate" and len(args) == 4 {
         (code, new_errs) = gate(args[2], args[3]);
         if code == 2 {
             eprint("checkgate: main-side check output missing: " + args[2]);
@@ -93,7 +131,9 @@ with entry {
         }
         sys.exit(code);
     } elif cmd != "" and cmd != "test" {
-        eprint("usage: jac run checkgate.jac gate <main_raw> <branch_raw>");
+        eprint("usage: jac run checkgate.jac parse <raw.txt>");
+        eprint("       jac run checkgate.jac gate <main_raw> <branch_raw>");
+        eprint("       jac run checkgate.jac ran <raw.txt>");
     }
 }
 
@@ -108,6 +148,24 @@ test "identities keys on (code, source line), ignores warnings and line numbers"
         + "     |                       ^^^\n";
     ids: list[str] = identities(raw);
     assert ids == ["E1053\t'timeout': float(fallback_config.get('timeout', 60.0))"];
+}
+
+test "run_count tells a checker that never started apart from one that found nothing" {
+    # the real summary shapes, measured against the repo binary on 2026-07-30
+    assert run_count("============================== 1 passed in 0.81s ===============================") == 1;
+    assert run_count("============================== 1 failed in 1.48s ===============================") == 1;
+    assert run_count("=== 12 failed in 31.02s ===\n=== 3 passed in 0.40s ===\n") == 2;
+    # the "never ran" capture: a missing binary exits 127 and prints no summary
+    never: str = "(eval): no such file or directory: /nonexistent/jac\n";
+    assert run_count(never) == 0;
+    assert identities(never) == [];        # indistinguishable from clean WITHOUT this check
+    # a real error capture still counts as HAVING run
+    errcap: str = "✖ Error: error[E1053]: bad\n"
+        + "  10 |     x = float(cfg.get('a', 1.0))\n"
+        + "     |         ^^^^^^^^^^^^^^^^^^^^^^^\n"
+        + "============================== 1 failed in 0.25s ===============================\n";
+    assert run_count(errcap) == 1;
+    assert len(identities(errcap)) == 1;
 }
 
 test "gate: branch error absent on main is new (red); same set is green" {

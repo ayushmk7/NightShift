@@ -79,7 +79,7 @@ def upsert_theme(path: str, theme: dict, branch: str) -> int {
     for item in as_list(theme["findings"]) {
         f: dict = as_dict(item);
         row: dict = {
-            "fingerprint": f["fingerprint"], "package": theme["package"], "file": f["file"],
+            "fingerprint": f["fingerprint"], "file": f["file"],
             "rule": f["rule"], "summary": f["summary"], "score": f.get("score"),
             "est_loc_saved": f["est_loc_saved"], "confidence": f["confidence"], "risk": f["risk"],
             "branch": branch,
@@ -172,6 +172,30 @@ test "upsert then set-status: last writer wins, attempts increment" {
     assert tally(path)["failed_verify"] == 1;
 }
 
+test "upsert_theme accepts a theme shaped like selector split's real output (no package key)" {
+    import tempfile;
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tf {
+        path: str = tf.name;
+    }
+    fp: str = fingerprint("jac/jaclang/cli/pipe.jac", "dead-code");
+    # selector.jac's pack_themes/split no longer emit a "package" key at all -- this is the real
+    # shape (name/slug/files/vestigial_deletions/findings/est_loc/score), not a hypothetical one.
+    theme: dict = {
+        "name": "pipe cleanup", "slug": "pipe-cleanup",
+        "files": ["jac/jaclang/cli/pipe.jac"], "vestigial_deletions": [],
+        "findings": [{"fingerprint": fp, "file": "jac/jaclang/cli/pipe.jac", "rule": "dead-code",
+                       "summary": "dead branch", "est_loc_saved": 40, "confidence": 5, "risk": 1,
+                       "theme_hint": "pipe cleanup", "score": 200.0}],
+        "est_loc": 40, "score": 200.0,
+    };
+    n: int = upsert_theme(path, theme, "nightshift/2026-07-30/pipe-cleanup");
+    assert n == 1;
+    rows: dict[str, dict] = load_ledger(path);
+    assert "package" not in rows[fp];
+    assert rows[fp]["branch"] == "nightshift/2026-07-30/pipe-cleanup";
+    assert rows[fp]["file"] == "jac/jaclang/cli/pipe.jac";
+}
+
 test "state roundtrip" {
     import tempfile;
     import os;
@@ -180,7 +204,7 @@ test "state roundtrip" {
     }
     os.remove(path);
     state: dict = state_read(path);
-    state["next_package"] = "jac-byllm";
+    state["verify_estimate_min"] = 7;
     state_write(path, state);
-    assert state_read(path)["next_package"] == "jac-byllm";
+    assert state_read(path)["verify_estimate_min"] == 7;
 }

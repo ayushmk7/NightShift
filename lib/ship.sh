@@ -23,11 +23,24 @@ ship_branch() {
 
     slug="$(basename "$branch")"
     if [ "$theme" != "-" ]; then
+        # Themes carry no `package` key since the audit went whole-repo/sharded, so this is normally
+        # empty now. Fall back to the same "repo" the tier-1 branch below uses: pkg reaches the draft
+        # title AND dataset_record_refactor's row, where "" would sit inconsistently next to
+        # nights.jsonl's "repo" and historical rows' real package names.
         pkg="$(ns_jac parse_result field package < "$theme")"
+        [ -n "$pkg" ] || pkg="repo"
     else
         pkg="repo"          # tier-1 autofix touches whichever packages drifted
     fi
-    tests_line="$(cat "$LOG_DIR/tests-$slug.txt" 2>/dev/null || echo "gates green (see logs)")"
+    # The fallback must NOT assert a green gate. This string goes verbatim into the draft's
+    # "## Verification" section (render_draft.jac body_lines) and from there into the PR body a
+    # human reviews, and the file is missing exactly when verify_branch's summary line cannot be
+    # found -- most reachably when the draft is rendered under a different $NS_DATE than the night
+    # that gated the branch, since $LOG_DIR is date-keyed. "gates green (see logs)" claimed a
+    # passing gate on the strength of a file that was not there: an assertion with no evidence,
+    # in the one line that escapes this repo.
+    tests_line="$(cat "$LOG_DIR/tests-$slug.txt" 2>/dev/null \
+        || echo "gate result unavailable (tests-$slug.txt missing)")"
 
     # explicit refspec, only nightshift/* refs, never force (threat T3)
     ns_git_push "$REPO" -u origin "refs/heads/$branch:refs/heads/$branch"

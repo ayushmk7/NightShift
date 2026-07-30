@@ -1,3 +1,12 @@
+> **SUPERSEDED for stages S3 onward (2026-07-30).** The target repo restructured and this document
+> describes the world before it. Do not trust its facts: upstream is now **`jaseci-labs/jac`**,
+> `jac-byllm`/`jac-scale` are no longer packages (they are `jac/jaclang/byllm` and `jac/jaclang/scale`),
+> package rotation is gone in favour of an 8-shard whole-repo audit, and release-note fragments live at
+> `release_notes/unreleased/jaclang/`. The current design is
+> [`docs/superpowers/specs/2026-07-30-nightshift-4task-design.md`](superpowers/specs/2026-07-30-nightshift-4task-design.md);
+> open items are in [`…-nightshift-followups.md`](superpowers/specs/2026-07-30-nightshift-followups.md).
+> Sections 1-2 (goals, non-goals) and the S0-S2 stages still hold. Kept for provenance.
+
 # PRD — Nightshift: a nightly Jac code-cleanup harness for jaseci-labs/jaseci
 
 **Status:** Draft v0.4 · **Date:** 2026-07-10 · **Owner:** you · **Codename:** Nightshift (rename freely)

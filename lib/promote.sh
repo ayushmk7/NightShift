@@ -21,6 +21,8 @@ promote_main() {
     draft="$(find_draft "$branch")" || ns_die "$EX_BUG" "no draft found for $branch"
     title="$(ns_jac render_draft meta "$draft" | ns_jac parse_result field title)"
     pkg="$(ns_jac render_draft meta "$draft" | ns_jac parse_result field package)"
+    [ -n "$pkg" ] || pkg="repo"     # drafts for sharded nights carry no package; only used in the
+                                    # docs($pkg) fragment-commit subject below
 
     # 1. re-sync + rebase + re-gate: upstream may have moved overnight (PRD 7 stage 7)
     sync_main
@@ -31,8 +33,32 @@ promote_main() {
         demote_branch "$branch" "rebase conflict at promote time"
         ns_die "$EX_SYNC" "rebase conflict — branch downgraded to failed_verify, no stale PR opened"
     fi
-    local theme="-"
-    [ -f "$LOG_DIR/theme-$(basename "$branch").json" ] && theme="$LOG_DIR/theme-$(basename "$branch").json"
+    # Which theme (if any) verify_branch re-gates this branch against.
+    #
+    # Written as an `if`, NEVER `[ -f x ] && theme=x`. promote_main is invoked BARE from
+    # bin/nightshift.sh (not from an `if`), so errexit is live here, and ns_run_inner's EXIT trap
+    # does not exist on this path — a false `&&` list would abort `nightshift.sh promote` with a
+    # bare status 1, no [FATAL] line and no autopsy email, AFTER sync_main + checkout + rebase had
+    # already run and BEFORE the re-gate. That was not an edge case: tier-1's autofix branch never
+    # has a theme file at all (lib/tier1.sh queues it with "-"), so every tier-1 promote aborted,
+    # and $LOG_DIR is date-keyed (lib/common.sh), so any tier-2 branch promoted on a different
+    # calendar day than its run aborted too — the normal case for a 23:00 night.
+    #
+    # Absence must NOT silently become "-". verify_branch skips stage 1, scope containment, whenever
+    # theme is "-", so downgrading an aged-out tier-2 theme to "-" would re-gate an LLM-written
+    # branch with the anti-injection check switched off — a strictly worse bug than the abort, and
+    # the one the naive `&&` fix introduces. Tier-1 is therefore recognised POSITIVELY by slug
+    # (ns_is_tier1_branch / $NS_TIER1_SLUG, shared with lib/tier1.sh); everything else must produce
+    # its theme file or die loudly. Fail-closed: no PR is opened either way.
+    local theme="-" tf
+    tf="$LOG_DIR/theme-$(basename "$branch").json"
+    if ns_is_tier1_branch "$branch"; then
+        :   # deterministic `jac fmt --lintfix` output, no agent, nothing to scope — "-" is correct
+    elif [ -f "$tf" ]; then
+        theme="$tf"
+    else
+        ns_die "$EX_BUG" "no theme file for $branch at $tf. This is an agent-written (tier-2) branch, and re-gating it with theme '-' would skip verify_branch's scope-containment/anti-injection check — refusing. The theme lives in the date-keyed logs/<date>/ of the night that produced it: re-run as NS_DATE=<that night's date> nightshift.sh promote $branch, or copy theme-$(basename "$branch").json into $LOG_DIR."
+    fi
     if ! verify_branch "$branch" "$theme"; then
         ns_die "$EX_ALLFAIL" "re-gate red at promote time — branch downgraded, no stale PR opened"
     fi
@@ -47,7 +73,16 @@ promote_main() {
     ns_log S7 "opened $pr_url"
 
     # 3. rename the release-note fragment 0000 → <PR#> (the PR updates itself on push)
-    fragment="$(ns_jac render_draft frag "$pkg")"
+    #
+    # LATENT COUPLING (the third site of the same one; render_draft.jac:frag_for_report already
+    # carries this note): the fragment KIND is hardcoded `refactor` here, and the `%0000.refactor.md`
+    # suffix strip is what makes the rename a no-op for any other kind. render_draft's
+    # frag_for_report hardcodes `refactor` too, but check_scope.jac:23 honours
+    # `theme.get("fragment_kind", "refactor")` — so the S4 scope gate would happily let a
+    # `0000.bugfix.md` through while this line silently fails to renumber it and ships a fragment
+    # still named 0000. Identical today only because nothing emits `fragment_kind`. All three sites
+    # must change together.
+    fragment="$(ns_jac render_draft meta "$draft" | ns_jac parse_result field release_note)"
     if git -C "$REPO" ls-files --error-unmatch "$fragment" >/dev/null 2>&1; then
         git -C "$REPO" checkout "$branch"
         git -C "$REPO" mv "$fragment" "${fragment%0000.refactor.md}$pr_num.refactor.md"
