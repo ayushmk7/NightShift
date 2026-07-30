@@ -1617,12 +1617,11 @@ grep -q 'README.md' "$P/reactive-files.txt" \
 # The stage entry point must NOT propagate a failed poll: ns_stage runs it as a plain command under
 # errexit, so a nonzero would abort the night at S1.5 and cost S1.6, S3, S4 and S5 as well.
 printf '#!/usr/bin/env bash\nexit 4\n' > "$P/gh"; chmod +x "$P/gh"; echo '{}' > "$P/state.json"
-(
-    set -euo pipefail
+NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
     . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/reactive.sh"
-    LOG_DIR="$P"; STATE="$P/state.json"; NS_DATE=2026-01-02; NS_PATHS_GH="$P/gh"
-    reactive_stage
-) >/dev/null 2>&1 || fail "reactive_stage propagated a failed poll; under ns_stage's errexit that ends the night at S1.5"
+    LOG_DIR="$1"; STATE="$1/state.json"; NS_DATE=2026-01-02; NS_PATHS_GH="$1/gh"
+    reactive_stage' _ "$P" >/dev/null 2>&1 \
+    || fail "reactive_stage propagated a failed poll; under ns_stage's errexit that ends the night at S1.5"
 echo "merge poll distinguishes quiet, empty, malformed and real; a failed poll cannot end the night"
 
 echo "== 22. reactive pass: a quiet day spends nothing, and never looks like a failure =="
@@ -1634,10 +1633,12 @@ rm -rf .jac
 Q="$T/quiet"; mkdir -p "$Q"
 printf '#!/usr/bin/env bash\ntouch "%s/CLAUDE_WAS_CALLED"\n' "$Q" > "$Q/claude"; chmod +x "$Q/claude"
 : > "$Q/reactive-files.txt"
-(
+# A separate bash PROCESS, not a `( … ) || fail` subshell: bash suspends errexit for everything on
+# the left of a `||`, so the subshell form cannot catch a mid-function abort at all.
+NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
     . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"; . "$NS_ROOT/lib/reactive.sh"
-    LOG_DIR="$Q"; NS_PATHS_CLAUDE="$Q/claude"; date +%s > "$Q/start_epoch"; reactive_main
-) > "$Q/out.txt" 2>&1 || fail "reactive_main returned nonzero on a quiet day -- it must never fail the night"
+    LOG_DIR="$1"; NS_PATHS_CLAUDE="$1/claude"; date +%s > "$1/start_epoch"; reactive_main' _ "$Q" \
+    > "$Q/out.txt" 2>&1 || fail "reactive_main returned nonzero on a quiet day -- it must never fail the night"
 [ -e "$Q/CLAUDE_WAS_CALLED" ] && fail "a quiet day started an audit session; the reactive pass is not free"
 [ -e "$Q/failed.tsv" ] && fail "a quiet day wrote a failure row; 'nothing merged' is not a failure"
 [ -e "$Q/covmap.json" ] && fail "a quiet day built covmap evidence; the guard must return before any work at all"
@@ -1655,10 +1656,10 @@ esac
 # must not be reported with the same words as a poll that answered "nothing".
 N="$T/noask"; mkdir -p "$N"
 cp "$Q/claude" "$N/claude"
-(
+NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
     . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"; . "$NS_ROOT/lib/reactive.sh"
-    LOG_DIR="$N"; NS_PATHS_CLAUDE="$N/claude"; date +%s > "$N/start_epoch"; reactive_main
-) > "$N/out.txt" 2>&1 || fail "reactive_main returned nonzero when the poll had not answered"
+    LOG_DIR="$1"; NS_PATHS_CLAUDE="$1/claude"; date +%s > "$1/start_epoch"; reactive_main' _ "$N" \
+    > "$N/out.txt" 2>&1 || fail "reactive_main returned nonzero when the poll had not answered"
 [ -e "$N/CLAUDE_WAS_CALLED" ] && fail "a missing merge poll still started audit sessions"
 grep -q 'did not answer' "$N/out.txt" \
     || fail "a poll that never ran was reported as a quiet day: $(cat "$N/out.txt") -- 'did not ask' is being scored as 'nothing merged'"
@@ -1763,5 +1764,79 @@ cmp -s "$R/state/carryover.json" "$R/carryover.before" \
 grep -q 'carried.jac' "$R/selection-reactive.json" \
     && fail "the reactive phase packed yesterday's carry-over; spec section 4 says reactive OUTRANKS carry-over, not that it absorbs it"
 echo "quiet day: 0 sessions, 0 failure rows, 0 artifacts, 1 log line; ceiling truncates; B2/B6/B7 hold"
+
+echo "== 23. the digest must fire on EVERY exit path, and never abort the trap =="
+# A digest that only sends on success is worse than none: silence would then mean both "fine"
+# and "dead". ns_on_exit calls email_main unconditionally today -- this section is what keeps it
+# that way through the next refactor, because losing it is invisible for weeks.
+rm -rf .jac
+grep -q "trap 'ns_on_exit' EXIT TERM INT" bin/nightshift.sh \
+    || fail "the exit trap no longer covers TERM -- the watchdog kills with TERM, so the ceiling path would send no digest at all"
+# email_main must be called from ns_on_exit OUTSIDE any conditional. Extract the trap function and
+# assert the call is not nested: a `if [ "$code" -eq 0 ]` around it is the exact regression here.
+trap_fn="$(sed -n '/^ns_on_exit() {/,/^}/p' bin/nightshift.sh)"
+case "$trap_fn" in
+    "") fail "could not extract ns_on_exit from bin/nightshift.sh -- section 23 would be vacuous" ;;
+esac
+case "$(printf '%s\n' "$trap_fn" | grep -c 'email_main')" in
+    1) : ;;
+    *) fail "ns_on_exit calls email_main $(printf '%s\n' "$trap_fn" | grep -c 'email_main') times; it must be exactly once, unconditionally" ;;
+esac
+printf '%s\n' "$trap_fn" | grep -q '^    email_main' \
+    || fail "email_main is indented deeper than ns_on_exit's top level -- it is inside a conditional, so some exit paths send no digest"
+printf '%s\n' "$trap_fn" | grep -q 'email_main .*|| true' \
+    || fail "ns_on_exit's email_main call lost its '|| true'; under set -e a failing digest would abort the trap and skip ns_lock_release"
+
+# Behavioural: email_main must return 0 even when EVERYTHING under it is broken. The grep above
+# only proves the CALLER tolerates a failure; this proves email_main does not produce one, which is
+# what keeps ns_lock_release reachable if that '|| true' is ever lost.
+# A SEPARATE bash PROCESS, not a `( … ) || fail` subshell. bash suspends errexit for the entire
+# dynamic extent of anything on the left of a `||`, subshells included -- so the obvious form
+# cannot fail for a mid-function abort and is exactly the "assertion that cannot fail" this
+# project keeps shipping. Mutation-confirmed: restoring the unguarded run-summary.json write is
+# caught in this form and passes in the other.
+NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
+    . "$NS_ROOT/lib/common.sh"; ns_bootstrap_jac; . "$NS_ROOT/lib/email.sh"
+    LOG_DIR="/nonexistent/definitely-not-here"; NS_DATE=2026-01-02
+    osascript() { return 0; }
+    email_main' > /dev/null 2>&1 \
+    || fail "email_main returned nonzero with an unusable LOG_DIR; it runs inside the EXIT trap and must never abort it"
+# ...and the logging primitives it calls must not abort either -- they are also ns_die's, on the
+# earliest failure paths where $LOG_DIR does not exist yet.
+NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
+    . "$NS_ROOT/lib/common.sh"
+    LOG_DIR="/nonexistent/definitely-not-here"
+    ns_log X "probe"; ns_warn "probe"; ns_fail "probe" "probe"
+    printf "still alive\\n"' > /dev/null 2>&1 \
+    || fail "ns_log/ns_warn/ns_fail abort when \$LOG_DIR is unwritable; ns_die and email_main both call them on exactly that path"
+
+# ...and the NS_DRY_RUN seam must render without touching a socket. Run it with the credentials
+# deliberately UNSET: a dry-run that tried to send would fail on the live credential check.
+D="$T/dryrun"; mkdir -p "$D"
+NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
+    . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/email.sh"
+    LOG_DIR="$1"; NS_DATE=2026-01-02; NS_DRY_RUN=1
+    unset SMTP_USER SMTP_PASS
+    email_main' _ "$D" > "$D/out.txt" 2>&1 \
+    || fail "email_main failed in dry-run with no credentials; the NS_DRY_RUN seam is not holding"
+[ -e "$D/SMTP_RECEIPT" ] && fail "a DRY-RUN produced an SMTP receipt -- it opened a real socket"
+[ -e "$D/EMAIL_FAILED" ] && fail "a dry-run digest was reported as a failed send"
+[ -f "$D/run-summary.json" ] || fail "email_main did not persist run-summary.json in dry-run"
+# The rendered message must actually BE the multipart digest, not an empty shell. It is base64 (the
+# body carries '·' and '—'), so the check decodes rather than grepping the wire form -- a grep for
+# '<table' passes vacuously against a transfer-encoded part and would have proved nothing.
+grep -q 'Content-Type: multipart/alternative' "$D/out.txt" \
+    || fail "the dry-run render is not multipart/alternative: $(head -5 "$D/out.txt")"
+python3 - "$D/out.txt" <<'PY' || fail "the dry-run render does not contain a real HTML digest"
+import email, sys
+m = email.message_from_string(open(sys.argv[1]).read())
+parts = m.get_payload()
+assert m.get_content_subtype() == "alternative", m.get_content_subtype()
+assert parts[0].get_content_type() == "text/plain"
+assert parts[1].get_content_type() == "text/html"
+html = parts[1].get_payload(decode=True).decode("utf-8", "replace")
+assert "<table" in html and "</html>" in html, html[:200]
+PY
+echo "digest fires unconditionally, cannot abort the trap, and stays offline in dry-run"
 
 echo "ALL HARNESS TESTS PASSED"

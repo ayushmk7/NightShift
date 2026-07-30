@@ -87,9 +87,24 @@ ns_theme_for_branch() {
 }
 
 # --- logging & night bookkeeping ---
-ns_log()  { printf '%s [%s] %s\n' "$(date '+%H:%M:%S')" "$1" "$2" | tee -a "$LOG_DIR/run.log" >&2; }
-ns_warn() { ns_log WARN "$1"; echo "$1" >> "$LOG_DIR/warnings.txt"; }
-ns_fail() { printf '%s\t%s\n' "$1" "$2" >> "$LOG_DIR/failed.tsv"; ns_log FAIL "$1: $2"; }
+# NONE of these three may fail. They are called from ns_die -- whose own comment says $LOG_DIR may
+# not exist yet on the earliest failure paths -- and from email_main, which runs inside the EXIT
+# trap of a `set -euo pipefail` script. The old `| tee -a "$LOG_DIR/run.log" >&2` aborted the whole
+# pipeline when that directory was missing or unwritable, so on exactly the paths these exist to
+# report, ns_die logged nothing and email_main returned nonzero -- changing the exit code the night
+# reported and skipping ns_lock_release, which holds /tmp/nightshift.lock forever and blocks every
+# subsequent night. stderr ALWAYS gets the line; the on-disk copy is best-effort.
+#
+# 2>/dev/null goes BEFORE the append, not after: a redirection that cannot be opened is reported by
+# the shell on the stderr in effect when it is PROCESSED, so the usual trailing order still prints
+# "No such file or directory" into the night's output.
+ns_log()  {
+    local line; line="$(printf '%s [%s] %s' "$(date '+%H:%M:%S')" "$1" "$2")"
+    printf '%s\n' "$line" >&2
+    printf '%s\n' "$line" 2>/dev/null >> "$LOG_DIR/run.log" || true
+}
+ns_warn() { ns_log WARN "$1"; printf '%s\n' "$1" 2>/dev/null >> "$LOG_DIR/warnings.txt" || true; }
+ns_fail() { printf '%s\t%s\n' "$1" "$2" 2>/dev/null >> "$LOG_DIR/failed.tsv" || true; ns_log FAIL "$1: $2"; }
 # ns_die RECORDS WHY, not just that. bin/nightshift.sh's ns_on_exit copies CURRENT_STAGE to
 # ERROR_STAGE (WHERE), and this writes the reason text (WHY). Both are read as first-class fields
 # by scripts/sendmail.jac's summarize() and appear in the subject line and the digest body --
