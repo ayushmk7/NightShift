@@ -86,33 +86,49 @@ gated_suites_from_diff() {
     done | sort -u
 }
 
-# Refuse to write a baseline from a run that never actually EXECUTED.
+# Positively assert that a suite RAN, before anything is allowed to read meaning into its capture.
+# Used on BOTH paths -- recording a baseline and gating a branch. Dies; never returns nonzero.
 #
-# This is the most dangerous failure mode in the whole gate, and it was LIVE: `failing_ids` cannot
-# tell "the suite ran and nothing failed" from "the suite never started" -- both parse to zero ids.
-# Confirmed 2026-07-30: [jobs.compiler]/[jobs.runtime] carried ci.yml's `working-directory: jac`
-# relative paths but cimirror_job runs from the repo ROOT, so all three commands died instantly on
-# `File not found: 'tests/compiler'`. A baseline recorded from that capture would have said
-# count:0 for 4644 real tests, and every subsequent branch would have "passed" a gate running
-# nothing. testgate.jac's `sessions` verb is the signal that separates the two cases.
-baseline_assert_ran() {
-    local suite=$1 raw=$2 rc=$3 sessions want
+# `failing_ids` cannot tell "the suite ran and nothing failed" from "the suite never started":
+# both parse to zero ids. Confirmed live 2026-07-30 -- [jobs.compiler]/[jobs.runtime] carried
+# ci.yml's `working-directory: jac` relative paths but cimirror_job runs from the repo ROOT, so all
+# three commands died instantly on `File not found: 'tests/compiler'`, 4644 tests silently unrun.
+#
+# Guarding only baseline_main was not enough, and shipping it that way was the mistake this
+# function exists to correct (code review 2026-07-30, Critical): suite_test_raw converts every
+# nonzero except EX_MIRROR_READ into `return 0`, so on the BRANCH path a suite that never started
+# arrived at `testgate gate` as an empty capture and scored as a clean pass -- the same false-green,
+# on the path that actually decides which branches become PRs. Baselines are recorded once and
+# reused for months, so the next upstream restructure that moves jac/tests/ would have re-opened it
+# on every branch, silently.
+#
+# Session count is compared against the number of TEST commands ([jobs.byllm] leads with a non-test
+# `jac install`, so "one session per command" would be wrong), and a mismatch is FATAL rather than a
+# warning: none of the three test suites has a conditional command -- unlike [jobs.fmt]/[jobs.check],
+# which legitimately skip when nothing changed -- so a mismatch is always a bug. Concretely, it is
+# how [jobs.compiler]'s cross-backend equivalence half (the suite this whole task exists to start
+# gating) could silently not run while a plausible-looking baseline was written from the other half.
+assert_suite_ran() {
+    local suite=$1 raw=$2 rc=$3 where=$4 sessions want
     case "$rc" in
         0) : ;;
-        *) ns_die "$EX_BUG" "baseline $suite: cimirror could not read [jobs.$suite] from config/ci-mirror.toml (rc=$rc). Refusing to record a baseline from an empty capture." ;;
+        *) ns_die "$EX_BUG" "$where $suite: cimirror could not read [jobs.$suite] from config/ci-mirror.toml (rc=$rc) -- the gate is broken, not the branch." ;;
     esac
     sessions="$(ns_jac testgate sessions "$raw")"
+    want="$(ns_jac cimirror testcmds "$suite" "$CI_MIRROR_CONFIG")"
+    # Numeric-validate BOTH sides before comparing. Matching only the literal string `0` was a real
+    # hole (code review, Minor): the cold-cache "Setting up Jac for first use..." banner that
+    # lib/cimirror.sh's own header documents can land on stdout, and a non-numeric session count
+    # would then have silently failed to equal "0" and sailed through.
     case "$sessions" in
-        0) ns_die "$EX_BUG" "baseline $suite: the test runner never started (0 sessions in $(basename "$raw")). Refusing to record a baseline of 0 known failures -- that makes the gate vacuously green. Check [jobs.$suite]'s command paths and cwd in config/ci-mirror.toml." ;;
+        ''|*[!0-9]*) ns_die "$EX_BUG" "$where $suite: could not read a session count from $(basename "$raw") (got '$sessions')." ;;
     esac
-    # Per-command accounting: [jobs.compiler] has TWO commands, and one of them silently not
-    # running is exactly the half-broken state the check above would still wave through.
-    # `|| want=""` because `grep -c` exits 1 on a zero count, which pipefail would turn into an
-    # errexit abort of this whole function; an unreadable count degrades to "skip the warning".
-    want="$(cimirror_cmds "$suite" | grep -c . | tr -d ' ')" || want=""
     case "$want" in
-        ''|"$sessions") : ;;
-        *) ns_warn "baseline $suite: $sessions runner sessions but [jobs.$suite] declares $want commands -- one may not have run (see $(basename "$raw"))" ;;
+        ''|*[!0-9]*|0) ns_die "$EX_BUG" "$where $suite: [jobs.$suite] declares no runnable test command (got '$want') -- a suite that cannot run must not be treated as a gate." ;;
+    esac
+    case "$sessions" in
+        "$want") : ;;
+        *) ns_die "$EX_BUG" "$where $suite: expected $want test-runner session(s), one per test command in [jobs.$suite], but $(basename "$raw") has $sessions. Refusing to score a suite that did not run as a pass -- check that job's command paths and cwd in config/ci-mirror.toml." ;;
     esac
 }
 
@@ -132,12 +148,12 @@ baseline_main() {
         raw2="$LOG_DIR/baseline-raw-$suite-2.txt"
         ns_log BASELINE "recording $suite, run 1 of 2 (slow)..."
         rc=0; suite_test_raw "$suite" "$raw1" || rc=$?
-        baseline_assert_ran "$suite" "$raw1" "$rc"
+        assert_suite_ran "$suite" "$raw1" "$rc" baseline
         ns_log BASELINE "recording $suite, run 2 of 2 (slow)..."
         rc=0; suite_test_raw "$suite" "$raw2" || rc=$?
-        baseline_assert_ran "$suite" "$raw2" "$rc"
+        assert_suite_ran "$suite" "$raw2" "$rc" baseline
         n="$(ns_jac testgate record-union "$suite" "$raw1" "$raw2" "$BASELINE_DIR")"
-        ns_log BASELINE "$suite: $n known-failing tests recorded (union of 2 runs)"
+        ns_log BASELINE "$suite: $n known-failing tests recorded (union of 2 runs), $(ns_jac testgate collected "$raw1") tests collected"
     done
 }
 
@@ -181,8 +197,21 @@ verify_branch() {
     #    gate would reject any branch that merely touches such a file. Instead: check the changed
     #    files on the branch AND on their main content, fail only on NEW errors (checkgate.jac).
     #    A whole-repo check is avoided anyway — it would trip the repo's broken test fixtures.
-    local changed_jac main_jac f br mr
-    changed_jac="$(git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD" | grep '\.jac$' || true)"
+    #
+    #    The diff is materialized and its exit status checked BEFORE the `|| true` grep. Previously
+    #    the whole pipeline was wrapped in one `|| true`, so a failing `git diff` (bad or unset
+    #    $NS_REPO_DEFAULT_BRANCH, detached HEAD, no shared history) collapsed into an empty file
+    #    list -- indistinguishable from "this branch changed no .jac files" -- and skipped the
+    #    entire jac-check stage silently. Same shape as the reader bugs already fixed in
+    #    lib/cimirror.sh; found in the same code review. The `|| true` on the grep itself is
+    #    legitimate and stays: grep exits 1 when a branch genuinely touches no .jac file.
+    local changed_jac changed_all changed_rc=0 main_jac f br mr
+    changed_all="$(git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD")" || changed_rc=$?
+    case "$changed_rc" in
+        0) : ;;
+        *) ns_die "$EX_BUG" "could not diff $NS_REPO_DEFAULT_BRANCH...HEAD in $REPO (rc=$changed_rc) -- with no reliable file list neither the type-check nor the test gate can run, and an empty list would look like a clean branch." ;;
+    esac
+    changed_jac="$(printf '%s\n' "$changed_all" | grep '\.jac$' || true)"
     if [ -n "$changed_jac" ]; then
         br="$LOG_DIR/check-branch-$(basename "$branch").txt"
         mr="$LOG_DIR/check-main-$(basename "$branch").txt"
@@ -223,22 +252,39 @@ verify_branch() {
     #    tell 1 and 2 apart -- confirmed live: a genuinely safe branch got rejected as "new test
     #    failures" when the real story was "this suite has no baseline, so it cannot be gated."
     #    That distinction is load-bearing; keep 2 handled separately from any other nonzero.
-    local suite raw rc srr
-    for suite in $(gated_suites_from_diff); do
+    #
+    #    The suite list is materialized and its exit status checked, rather than iterated straight
+    #    out of `for suite in $(gated_suites_from_diff)`. `set -e` does not fire on
+    #    `for x in $(false)`, so a failing reader produced an empty list, iterated zero times, and
+    #    skipped the ENTIRE test gate on the way to a green branch -- verified: a bad
+    #    $NS_REPO_DEFAULT_BRANCH makes that function return 128 with no output. This is byte-for-byte
+    #    the bug lib/cimirror.sh:105-108 already documents fixing one file over. An EMPTY list is
+    #    still perfectly legal here (an mcp-only or fragment-only change gates no suite), so only a
+    #    nonzero status is fatal.
+    local suites suites_rc=0
+    suites="$(gated_suites_from_diff)" || suites_rc=$?
+    case "$suites_rc" in
+        0) : ;;
+        *) ns_die "$EX_BUG" "could not compute the gated suite list for $branch (rc=$suites_rc) -- an empty list is indistinguishable from 'no suite covers this change', so this must not fall through to a green branch." ;;
+    esac
+
+    # `gated` / `ungated` record what actually happened, so the line published to the PR body can
+    # tell the truth instead of always claiming the tests passed (see the summary below).
+    local suite raw rc srr gated="" ungated=""
+    for suite in $suites; do
         raw="$LOG_DIR/tests-raw-$(basename "$branch")-$suite.txt"
-        # A cimirror reader failure is a broken HARNESS, not a bad branch, and it is night-wide
-        # (the same malformed TOML fails identically for every queued branch). Burning this
-        # branch's attempt counter over it would, after two nights, auto-reject every finding in
-        # the ledger for a config typo. Abort loudly instead: the EXIT trap still fires the autopsy
-        # email, nothing is shipped, and no finding is blamed.
+        # A cimirror reader failure, or a suite that did not run, is a broken HARNESS rather than a
+        # bad branch, and it is night-wide (the same malformed TOML or bad path fails identically
+        # for every queued branch). Burning this branch's attempt counter over it would, after two
+        # nights, auto-reject every finding in the ledger for a config typo. assert_suite_ran
+        # aborts loudly instead: the EXIT trap still fires the autopsy email, nothing ships, and no
+        # finding is blamed.
         srr=0; suite_test_raw "$suite" "$raw" || srr=$?
-        case "$srr" in
-            0) : ;;
-            *) ns_die "$EX_BUG" "$suite: cimirror could not read [jobs.$suite] from config/ci-mirror.toml (rc=$srr) -- the gate is broken, not the branch. Aborting instead of mis-reading an empty capture as a clean suite." ;;
-        esac
+        assert_suite_ran "$suite" "$raw" "$srr" gate
         ns_jac testgate gate "$suite" "$raw" "$BASELINE_DIR"; rc=$?
         if [ "$rc" -eq 2 ]; then
             ns_log S4 "$suite: no test baseline recorded — no gate, skipping"
+            ungated="$ungated $suite"
             continue
         fi
         if [ "$rc" -ne 0 ]; then
@@ -250,13 +296,11 @@ verify_branch() {
             #           the branch just gets re-attempted next night. Tighten to id-intersection if it bites.
             ns_log S4 "$suite: new failures on run 1 — retrying once (flaky-test guard)"
             srr=0; suite_test_raw "$suite" "$raw" || srr=$?
-            case "$srr" in
-                0) : ;;
-                *) ns_die "$EX_BUG" "$suite: cimirror could not read [jobs.$suite] on retry (rc=$srr) -- the gate is broken, not the branch." ;;
-            esac
+            assert_suite_ran "$suite" "$raw" "$srr" "gate retry"
             ns_jac testgate gate "$suite" "$raw" "$BASELINE_DIR"; rc=$?
             if [ "$rc" -eq 2 ]; then
                 ns_log S4 "$suite: no test baseline recorded on retry — no gate, skipping"
+                ungated="$ungated $suite"
                 continue
             fi
             if [ "$rc" -ne 0 ]; then
@@ -264,6 +308,18 @@ verify_branch() {
                 return 1
             fi
         fi
+        # "Nothing NEW failed" is only meaningful if the run reached as much of the suite as the
+        # baseline did. assert_suite_ran proves the runner STARTED; this proves it did not die
+        # partway, and catches any future recurrence of the byllm dependency hole (219 -> 105
+        # collected, every unreached test scoring as "not failing"). Unlike a reader failure this
+        # IS branch-attributable -- a broken import in a changed file drops its whole test module
+        # out of collection -- so it reds the branch rather than aborting the night.
+        ns_jac testgate collection-check "$suite" "$raw" "$BASELINE_DIR"; rc=$?
+        if [ "$rc" -eq 1 ]; then
+            verify_red "$branch" "$suite: collected far fewer tests than the baseline — the suite did not run to completion, so its unreached tests cannot be read as passing (check the branch for an import error, or the environment for missing suite dependencies; see $(basename "$raw"))"
+            return 1
+        fi
+        gated="$gated $suite"
     done
 
     # 4. pre-commit (standalone contributor tool from PATH, installed via pipx at M0 — NOT a git
@@ -282,7 +338,27 @@ verify_branch() {
     local dur_min=$(( (t1 - t0) / 60 )); [ "$dur_min" -lt 1 ] && dur_min=1
     local old_est; old_est="$(ns_jac ledger state-get verify_estimate_min "$STATE" | tr -d '"')"
     ns_jac ledger state-set verify_estimate_min $(( ( ${old_est:-30} + dur_min ) / 2 )) "$STATE"
-    echo "jac check ✓ · tests (no new failures vs baseline) ✓ · pre-commit ✓ (${dur_min} min)" \
+
+    # This line goes STRAIGHT INTO THE PR BODY a human reviews (lib/ship.sh:35), so it has to be
+    # true. It used to be the hardcoded string "jac check ✓ · tests (no new failures vs baseline) ✓",
+    # which claimed a passing test gate for a jac-mcp-only change that gates no suite, for any suite
+    # with no baseline recorded, and — since state/test-baseline/ is currently empty — for every
+    # branch until `nightshift.sh baseline` has run. Telling an upstream reviewer the tests passed
+    # when nothing ran is the one failure in this file that escapes the repo.
+    local check_line="jac check ✓" tests_line
+    case "$changed_jac" in "") check_line="jac check (no .jac files changed)" ;; esac
+    case "$suites" in
+        "") tests_line="tests (no suite covers this change)" ;;
+        *)  case "$gated" in
+                "") tests_line="tests (no baseline for${ungated} — not gated)" ;;
+                *)  tests_line="tests (no new failures vs baseline:${gated}) ✓"
+                    case "$ungated" in
+                        "") : ;;
+                        *) tests_line="$tests_line · not gated (no baseline):${ungated}" ;;
+                    esac ;;
+            esac ;;
+    esac
+    echo "$check_line · $tests_line · pre-commit ✓ (${dur_min} min)" \
         > "$LOG_DIR/tests-$(basename "$branch").txt"
     git checkout "$NS_REPO_DEFAULT_BRANCH"
     return 0

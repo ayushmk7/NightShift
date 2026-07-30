@@ -27,6 +27,17 @@ def job_ci_job(cfg: dict, job: str) -> str {
     return str(job_tbl["ci_job"]);
 }
 
+"""How many of a job's commands actually INVOKE THE TEST RUNNER.
+
+lib/verify.sh asserts that a suite produced one runner session per test command -- the check that
+catches "[jobs.compiler]'s equivalence half silently did not run" while the other half still writes
+a plausible-looking baseline. That accounting has to ignore SETUP commands, which produce no
+session: [jobs.byllm] leads with ci.yml's `jac install --global` for its four soft dependencies.
+Counting every command instead would make a correct byllm job look half-broken forever."""
+def test_cmd_count(cfg: dict, job: str) -> int {
+    return len([c for c in job_cmds(cfg, job) if "jac test" in c]);
+}
+
 """The job names cimirror_all / `nightshift.sh mirror` (Task 7) should actually iterate as a
 gate: every entry whose `ci_job` names a real ci.yml job. A `ci_job` starting with "none" marks a
 LOCAL-ONLY step (currently just fmt_autofix, tier-1's own apply command) that must be reachable by
@@ -44,6 +55,8 @@ with entry {
         for n in gate_job_names(load_config_toml(args[2])) {
             print(n);
         }
+    } elif cmd == "testcmds" and len(args) == 4 {
+        print(test_cmd_count(load_config_toml(args[3]), args[2]));
     } elif cmd == "cmds" and len(args) == 4 {
         for c in job_cmds(load_config_toml(args[3]), args[2]) {
             print(c);
@@ -52,7 +65,7 @@ with entry {
         print(str(load_config_toml(args[2])["source"]["sha256"]));
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run cimirror.jac jobs|hash <ci-mirror.toml>");
-        eprint("       jac run cimirror.jac cmds <job> <ci-mirror.toml>");
+        eprint("       jac run cimirror.jac cmds|testcmds <job> <ci-mirror.toml>");
     }
 }
 
@@ -138,8 +151,30 @@ test "the two suites ci.yml runs under `working-directory: jac` cd there; the ro
     # with a root-relative path. A `cd jac` here would break it in the opposite direction.
     for cmd in job_cmds(cfg, "byllm") {
         assert not cmd.startswith("cd jac");
-        assert "jac/jaclang/byllm/tests" in cmd;
     }
+    assert "jac/jaclang/byllm/tests" in job_cmds(cfg, "byllm")[-1];
+    # ci.yml:202-203 forces the equivalence suite back through the checkout's dev-source loop
+    assert 'JAC_NO_DEV_SOURCE=""' in job_cmds(cfg, "compiler")[1];
+}
+
+test "byllm installs its four soft dependencies before running, and the counts stay honest" {
+    # Regression pin for a MEASURED coverage hole: without this install under cimirror_job's clean
+    # HOME, byllm collected 105 items instead of 219 -- the _optdeps shims turn a missing
+    # dependency into silently-absent tests, not an error, so nothing downstream could notice.
+    cfg: dict = load_config_toml("config/ci-mirror.toml");
+    cmds: list[str] = job_cmds(cfg, "byllm");
+    install: str = cmds[0];
+    assert install.startswith("jac install ");
+    assert "--global" in install;
+    for dep in ["litellm", "pillow", "httpx", "loguru"] {
+        assert dep in install;
+    }
+    # test_cmd_count must ignore the setup command, or lib/verify.sh's session accounting would
+    # declare a perfectly healthy byllm run half-broken forever.
+    assert len(cmds) == 2;
+    assert test_cmd_count(cfg, "byllm") == 1;
+    assert test_cmd_count(cfg, "compiler") == 2;
+    assert test_cmd_count(cfg, "runtime") == 1;
 }
 
 test "check mirrors ci.yml's literal IGNORE_ARGS shape: --ignore present, static globs present" {

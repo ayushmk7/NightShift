@@ -129,32 +129,38 @@ ci_job = "test-packages-and-docs"
 # `working-directory`, so ci.yml runs this from the repo ROOT, which is where cimirror_job already
 # runs it. Verified 2026-07-30: 219 items collected from the root.
 #
-# OPEN, MEASURED, NOT FIXED HERE (registry breadth is Task 4/5 territory; flagged for whoever owns
-# it). This entry transcribes ci.yml:608 but NOT the two steps that precede it in the same job:
-#   ci.yml:598-603  `jac install --global` for litellm, pillow, httpx, loguru
-#   ci.yml:605      `TEST_ENV=true`
-# and not ci.yml:610-611's docs-corpus step (`jac test jac/tests/cli/test_docs_content.jac
-# jac/tests/cli/test_guide_docs.jac`), which is part of the same CI job.
-#
-# The missing dep install is not cosmetic under cimirror_job's clean HOME. Those four packages live
-# in the jac GLOBAL env at $HOME/.cache/jac/rt/<hash>/python/lib/python3.14/site-packages, which is
-# HOME-derived, so a clean HOME strips them. Measured both ways on 2026-07-30, same command, same
+# The FIRST command is ci.yml:598-603's dependency install, and it is not optional here. Those four
+# packages live in the jac GLOBAL env at
+# $HOME/.cache/jac/rt/<hash>/python/lib/python3.14/site-packages, which is HOME-derived -- so
+# cimirror_job's clean $LOG_DIR/mirror-home strips them. Measured 2026-07-30, same command, same
 # cwd, only HOME differing:
 #   real HOME  (litellm 1.82.6, pillow 12.3.0, httpx 0.28.1, loguru 0.7.3 present, anyio plugin
-#               loaded):  219 items collected -> 3 failed, 215 passed, 1 skipped
+#              loaded):  219 items collected -> 3 failed, 215 passed, 1 skipped
 #   clean HOME (all four absent, no anyio plugin): 105 items collected -> 5 failed, 100 passed,
-#               plus three `agent error: No module named 'httpx'` lines
-# 114 tests vanish from COLLECTION with no collection-error line, so nothing downstream can notice:
-# testgate.jac's failing_ids() sees a shorter list of ids, not an error.
+#              plus three `agent error: No module named 'httpx'` lines
+# The 114 missing tests vanish from COLLECTION with no collection-error line, because
+# jac/jaclang/byllm/_optdeps/{litellm,pillow,loguru}.jac are SOFT-IMPORT shims exporting
+# HAS_LITELLM / HAS_LOGURU and llm.impl/model.impl.jac:25 branches on them -- a missing dependency
+# silently removes tests rather than raising. So testgate.jac would have seen a shorter list of
+# ids, never an error.
 #
-# This does NOT produce false reds today -- `nightshift.sh baseline` records under the same clean
-# HOME the gate later runs under, so those 5 failures get baselined and the two runs stay
-# self-consistent. The cost is COVERAGE: the local byllm gate exercises about half of what CI's
-# byllm job does, and the half it drops is exactly the LLM-facing surface. Fixing it means adding
-# ci.yml's `jac install --global` line (a one-time ~cold-cache cost per night's mirror-home) and
-# `TEST_ENV=true` to this entry. Deliberately left alone here so Task 6 does not silently rewrite
-# the registry it was told to consume.
-commands = ["jac test jac/jaclang/byllm/tests"]
+# Why this could not be deferred as "registry breadth": gated_suites_from_diff routes a byllm
+# change to the byllm suite ONLY, so nothing backstops it -- and [jobs.fmt_autofix] scopes tier-1's
+# nightly unattended autofix to jac/jaclang/byllm/*. The one directory Nightshift rewrites by
+# itself every night was the one whose gate ran at ~48% coverage. Paid once per night's
+# mirror-home, not per job or per branch.
+#
+# Two things from the same ci.yml job are deliberately NOT transcribed, both checked rather than
+# assumed:
+#   ci.yml:605 `TEST_ENV=true` is VESTIGIAL -- `grep -rn TEST_ENV` across the whole checkout hits
+#     only ci.yml:563 and :605. Nothing reads it. Adding it would be cargo cult.
+#   ci.yml:610-611's docs-corpus step (jac/tests/cli/test_docs_content.jac, test_guide_docs.jac) is
+#     ALREADY COVERED: both files live under jac/tests/, which [jobs.runtime] collects wholesale.
+#     Duplicating them here would just run them twice.
+commands = [
+  'jac install "litellm>=1.70.0,<=1.82.6" "pillow>=12.0.0,<13.0.0" "httpx>=0.27.0" "loguru>=0.7.2,<0.8.0" --global',
+  "jac test jac/jaclang/byllm/tests",
+]
 
 [jobs.compiler]
 ci_job = "test-compiler"
@@ -182,11 +188,27 @@ ci_job = "test-compiler"
 # cimirror_job already evals each command in its own subshell -- so the `cd` cannot leak into the
 # next command (which is also why BOTH commands below need their own) -- and `&&` makes a failed
 # `cd` return nonzero, i.e. the job fails loudly instead of running the suite in the wrong place.
-# lib/verify.sh's baseline_assert_ran is the belt to this braces: it refuses to write a baseline
-# from a capture containing zero runner sessions, so a regression here fails loudly next time.
+# lib/verify.sh's assert_suite_ran is the belt to this braces, on BOTH the baseline and the branch
+# path: it refuses to let a capture with the wrong number of runner sessions be scored at all, so a
+# regression here fails loudly instead of silently passing every branch.
+# `JAC_NO_DEV_SOURCE=""` on the SECOND command only, mirroring ci.yml:202-203's step-level `env:`.
+# ci.yml:196-201 explains why: the equivalence suite's cross-module tests build fixture paths under
+# jac/tests/ from jaclang.__file__, which only resolve in the CHECKOUT, not in the binary's bundled
+# site copy -- so that one step is deliberately forced back through the checkout's
+# `[dev] jaclang_source` loop. Harmless on this host today (the repo binary already reports
+# "jac dev mode -- using compiler source at work/repo/jac"), but a human shell that happened to
+# export JAC_NO_DEV_SOURCE=1 would otherwise silently compile this suite against the site copy and
+# fail on unresolvable fixtures. Explicit beats inherited.
+#
+# NOT transcribed from these two ci.yml jobs, recorded so nobody has to rediscover it: the
+# `zig build -Dno-ninja vendor-musl` step (ci.yml:174-179, :242-247) and test-runtime's Node/Bun
+# setup (:236-241). Whatever those enable is simply absent locally, so any test depending on them
+# fails identically on main and on the branch -- it lands in the baseline and is subtracted out.
+# That makes the local gate PERMISSIVE on those tests, never falsely red; real CI remains the
+# authority. Worth revisiting only if the baseline turns out to be dominated by them.
 commands = [
   "cd jac && JAC_TEST_JOBS=auto jac test tests/compiler",
-  "cd jac && JAC_TEST_JOBS=auto jac test jaclang/compiler/tests",
+  'cd jac && JAC_NO_DEV_SOURCE="" JAC_TEST_JOBS=auto jac test jaclang/compiler/tests',
 ]
 
 [jobs.runtime]

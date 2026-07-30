@@ -95,4 +95,57 @@ case "$autofix_cmd" in
 esac
 echo "fmt and fmt_autofix share one exclusion regex ($fmt_regex), no jac format / jac lint --fix"
 
+echo "== 7. test-gate routing: case ORDER, and the two path classes that must gate nothing =="
+# lib/*.sh gets `bash -n` only, so nothing else in this file executes gated_suites_from_diff --
+# yet its own comment says "ORDER MATTERS ... do not alphabetize it", and this codebase has already
+# shipped the exact mis-route it warns about (`cut -d/ -f1` sent jac/jaclang/byllm -> "jac" ->
+# the large, env-flaky core suite). Drive the REAL function against a scratch repo; ~2s.
+R="$T/routerepo"
+mkdir -p "$R"
+(
+    cd "$R" && git init -q . && git config user.email t@t && git config user.name t \
+      && echo x > README && git add -A && git commit -qm base && git branch -M main
+) >/dev/null 2>&1 || fail "could not build the routing scratch repo"
+
+route_probe() {        # route_probe <branch> <path>... -> prints the suites, one per line
+    local br=$1; shift
+    (
+        cd "$R" && git checkout -q main && git checkout -qb "$br" \
+          && for p in "$@"; do mkdir -p "$(dirname "$p")"; echo c > "$p"; done \
+          && git add -A && git commit -qm "$br"
+    ) >/dev/null 2>&1 || return 1
+    ( . "$NS_ROOT/lib/verify.sh"; REPO="$R"; NS_REPO_DEFAULT_BRANCH=main; gated_suites_from_diff )
+}
+
+# every routed class at once: compiler src, compiler tests, byllm, runtime, and the two no-gate ones
+got="$(route_probe all jac/jaclang/compiler/x.jac jac/tests/compiler/t.jac jac/jaclang/byllm/b.jac \
+                       jac/jaclang/runtimelib/y.jac jac-mcp/z.jac \
+                       release_notes/unreleased/jaclang/1.refactor.md | tr '\n' ' ')"
+case "$got" in
+    "byllm compiler runtime ") : ;;
+    *) fail "routing drifted: expected 'byllm compiler runtime ', got '$got'" ;;
+esac
+
+# THE load-bearing case: a byllm-only change must gate byllm and NOT fall through to jac/* -> runtime
+got="$(route_probe byllmonly jac/jaclang/byllm/only.jac | tr '\n' ' ')"
+case "$got" in
+    "byllm ") : ;;
+    *) fail "byllm-only change mis-routed to '$got' -- the jac/* catch-all is winning again" ;;
+esac
+
+# compiler tests must reach the suite that actually collects them, not runtime (which --ignores them)
+got="$(route_probe comptests jac/tests/compiler/only.jac | tr '\n' ' ')"
+case "$got" in
+    "compiler ") : ;;
+    *) fail "jac/tests/compiler routed to '$got' -- runtime --ignores exactly those tests" ;;
+esac
+
+# an mcp-only or fragment-only change must gate NO suite at all
+got="$(route_probe nogate jac-mcp/z.jac release_notes/unreleased/jaclang/2.docs.md | tr '\n' ' ')"
+case "$got" in
+    "") : ;;
+    *) fail "mcp/fragment-only change should gate no suite, got '$got'" ;;
+esac
+echo "routing correct: byllm-only stays byllm, compiler tests reach compiler, mcp/fragments gate nothing"
+
 echo "ALL HARNESS TESTS PASSED"

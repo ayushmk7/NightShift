@@ -20,13 +20,34 @@ argv:
                                           a test that flakes in either run stops reding branches
   sessions <raw.txt>                      print how many runner sessions the capture contains
                                           (0 == the suite never started; see session_count)
+  collected <raw.txt>                     print how many tests the capture collected
+  collection-check <pkg> <raw.txt> <baseline_dir>
+                                          exit 0 if the run collected >= COLLECTION_FLOOR of the
+                                          baseline's count, 1 if materially fewer, 2 if there is
+                                          no baseline count to compare against
   gate   <pkg> <raw.txt> <baseline_dir>   exit 0 if no new failures vs baseline, 1 if new
                                           (prints the new failures), 2 if no baseline recorded
 """
 import sys;
 import json;
 import os;
+import re;
 import from nslib { eprint, parse_obj }
+
+"""Fraction of the baseline's collected-item count a branch run must still reach.
+
+`session_count` catches "the runner never started". This catches the softer sibling: the runner
+STARTS, prints its banner, and then collects far less than it should -- a half-broken suite whose
+unreached tests all score as "not failing", i.e. green. Both of the false-greens this file has had
+to defend against were of that family, so the gate now positively asserts the branch ran about as
+much as the baseline did instead of only checking what failed.
+
+0.75 is deliberately loose, because DELETING tests is a legitimate and common Nightshift outcome
+(vestigial-test sweeps are its bread and butter). The budget caps a theme at 10 files / 600 LOC
+(config/nightshift.toml [budgets]), so even a maximal sweep against the smallest suite -- 10 of
+byllm's 76 test files -- is ~13%, comfortably inside the margin. The failure modes this exists to
+catch lose far more: the measured byllm dependency hole dropped collection 219 -> 105 (-52%)."""
+glob COLLECTION_FLOOR: float = 0.75;
 
 def failing_ids(raw: str) -> list[str] {
     ids: set[str] = set();
@@ -68,6 +89,31 @@ def session_count(raw: str) -> int {
     return n;
 }
 
+"""Total tests COLLECTED across every session in a capture.
+
+Two shapes, because the runner reports collection differently with and without xdist:
+  `18 workers [219 items]`                          (JAC_TEST_JOBS=auto, the normal case)
+  `collected 11 items / 11 deselected / 0 selected` (serial)
+Matched line-anchored rather than by a bare `\\d+ items` sweep of the whole capture, so a test that
+happens to print something like "[5 items]" cannot inflate the number. Summed across sessions
+because a suite may declare several test commands ([jobs.compiler] has two)."""
+def collected_count(raw: str) -> int {
+    total: int = 0;
+    for line in raw.splitlines() {
+        s: str = line.strip();
+        hits: list[str] = [];
+        if s.startswith("collected ") {
+            hits = re.findall(r"^collected\s+(\d+)\s+items?", s);
+        } elif " workers [" in s {
+            hits = re.findall(r"\[(\d+)\s+items?\]", s);
+        }
+        for h in hits {
+            total += int(h);
+        }
+    }
+    return total;
+}
+
 def read_file(path: str) -> str {
     with open(path, "r") as f {
         return f.read();
@@ -97,12 +143,42 @@ operator here -- it would drop every flake back out of the baseline and reintrod
 bug this exists to fix."""
 def record_union(pkg: str, raw1: str, raw2: str, baseline_dir: str) -> int {
     os.makedirs(baseline_dir, exist_ok=True);
-    both: set[str] = set(failing_ids(read_file(raw1))) | set(failing_ids(read_file(raw2)));
+    text1: str = read_file(raw1);
+    text2: str = read_file(raw2);
+    both: set[str] = set(failing_ids(text1)) | set(failing_ids(text2));
     ids: list[str] = sorted(both);
+    # `collected` is the floor a later branch run is measured against (see collection_check). The
+    # MIN of the two runs, not the max or the mean: it is the conservative choice, so ordinary
+    # run-to-run collection jitter can never make a healthy branch look under-collected.
+    c1: int = collected_count(text1);
+    c2: int = collected_count(text2);
     with open(baseline_path(baseline_dir, pkg), "w") as f {
-        f.write(json.dumps({"package": pkg, "failing": ids, "count": len(ids), "runs": 2}, indent=2) + "\n");
+        f.write(json.dumps({
+            "package": pkg, "failing": ids, "count": len(ids), "runs": 2,
+            "collected": min(c1, c2), "collected_runs": [c1, c2]
+        }, indent=2) + "\n");
     }
     return len(ids);
+}
+
+"""Did this branch run collect about as many tests as the baseline run did?
+
+Returns (code, got, want): code 0 = collection intact, 1 = materially under-collected,
+2 = no baseline, or a baseline recorded before `collected` existed (nothing to compare against,
+so it cannot be a gate -- same "no baseline == no gate" semantics `gate` uses for code 2)."""
+def collection_check(pkg: str, raw_path: str, baseline_dir: str) -> (int, int, int) {
+    bp: str = baseline_path(baseline_dir, pkg);
+    if not os.path.exists(bp) {
+        return (2, 0, 0);
+    }
+    baseline: dict = parse_obj(read_file(bp));
+    want: int = int(baseline.get("collected", 0));
+    if want <= 0 {
+        return (2, 0, 0);
+    }
+    got: int = collected_count(read_file(raw_path));
+    floor: int = int(want * COLLECTION_FLOOR);
+    return (1 if got < floor else 0, got, want);
 }
 
 def gate(pkg: str, raw_path: str, baseline_dir: str) -> (int, list[str]) {
@@ -134,6 +210,17 @@ with entry {
         print(record_union(args[2], args[3], args[4], args[5]));
     } elif cmd == "sessions" and len(args) == 3 {
         print(session_count(read_file(args[2])));
+    } elif cmd == "collected" and len(args) == 3 {
+        print(collected_count(read_file(args[2])));
+    } elif cmd == "collection-check" and len(args) == 5 {
+        (ccode, got, want) = collection_check(args[2], args[3], args[4]);
+        if ccode == 1 {
+            eprint("UNDER-COLLECTED: " + args[2] + " collected " + str(got)
+                   + " tests, baseline collected " + str(want)
+                   + " -- the suite did not run to completion, so its unreached tests cannot be "
+                   + "read as passing");
+        }
+        sys.exit(ccode);
     } elif cmd == "gate" and len(args) == 5 {
         (code, new_fails) = gate(args[2], args[3], args[4]);
         if code == 2 {
@@ -147,7 +234,8 @@ with entry {
         eprint("usage: jac run testgate.jac parse <raw.txt>");
         eprint("       jac run testgate.jac record <pkg> <raw.txt> <baseline_dir>");
         eprint("       jac run testgate.jac record-union <pkg> <raw1.txt> <raw2.txt> <baseline_dir>");
-        eprint("       jac run testgate.jac sessions <raw.txt>");
+        eprint("       jac run testgate.jac sessions|collected <raw.txt>");
+        eprint("       jac run testgate.jac collection-check <pkg> <raw.txt> <baseline_dir>");
         eprint("       jac run testgate.jac gate <pkg> <raw.txt> <baseline_dir>");
     }
 }
@@ -175,6 +263,63 @@ test "session_count tells a suite that never started apart from one that ran cle
     assert session_count("==== test session starts ====\n==== no tests ran in 0.30s ====\n") == 1;
     # a multi-command suite ([jobs.compiler] has two) prints one banner per invocation
     assert session_count(ran_clean + ran_clean) == 2;
+}
+
+test "collected_count reads both runner shapes and ignores incidental bracket text" {
+    xdist: str = "created: 18/18 workers\n18 workers [219 items]\n";
+    assert collected_count(xdist) == 219;
+    serial: str = "collected 11 items / 11 deselected / 0 selected\n";
+    assert collected_count(serial) == 11;
+    # a multi-command suite sums its sessions
+    assert collected_count(xdist + "18 workers [180 items]\n") == 399;
+    # a test that merely PRINTS something bracket-shaped must not inflate the count
+    noise: str = xdist + "INFO - batch dispatch=parallel [5 items] tools=['a']\n"
+        + "some log line mentioning 42 items\n";
+    assert collected_count(noise) == 219;
+    # the capture from a suite that never started has no count at all
+    assert collected_count("✖ Error: File not found: 'tests/compiler'\n") == 0;
+}
+
+test "collection-check reds a half-collected run and passes a legitimate test deletion" {
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    # baseline: the REAL measured byllm collection under a warm HOME with deps present
+    r1: str = d + "/r1.txt";
+    with open(r1, "w") as f {
+        f.write("== test session starts ==\n18 workers [219 items]\nFAILED t.jac::known\n");
+    }
+    r2: str = d + "/r2.txt";
+    with open(r2, "w") as f {
+        f.write("== test session starts ==\n18 workers [221 items]\nFAILED t.jac::known\n");
+    }
+    record_union("byllm", r1, r2, d);
+    base: dict = parse_obj(read_file(d + "/byllm.json"));
+    assert base["collected"] == 219;            # the MIN of the two runs, not the max
+    assert base["collected_runs"] == [219, 221];
+    # the REAL measured clean-HOME regression: 105 of 219 -> must be caught
+    bad: str = d + "/bad.txt";
+    with open(bad, "w") as f {
+        f.write("== test session starts ==\n18 workers [105 items]\n");
+    }
+    (c1, got1, want1) = collection_check("byllm", bad, d);
+    assert c1 == 1 and got1 == 105 and want1 == 219;
+    # a vestigial-test sweep at the budget ceiling must NOT red: 10 of byllm's 76 test files is
+    # roughly 29 items, well inside COLLECTION_FLOOR
+    ok: str = d + "/ok.txt";
+    with open(ok, "w") as f {
+        f.write("== test session starts ==\n18 workers [190 items]\n");
+    }
+    (c2, _g2, _w2) = collection_check("byllm", ok, d);
+    assert c2 == 0;
+    # no baseline at all -> no gate, never a red
+    (c3, _g3, _w3) = collection_check("nosuch", ok, d);
+    assert c3 == 2;
+    # a baseline predating the `collected` key is also "cannot gate", not "red"
+    with open(d + "/legacy.json", "w") as f {
+        f.write("{\"package\": \"legacy\", \"failing\": [], \"count\": 0}");
+    }
+    (c4, _g4, _w4) = collection_check("legacy", ok, d);
+    assert c4 == 2;
 }
 
 test "record-union baselines a test that fails in EITHER run" {
