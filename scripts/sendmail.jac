@@ -4,7 +4,10 @@ on every exit path; silence is itself a failure mode (PRD 11).
 argv:  summarize <log_dir> <drafts_dir> <date> <config.toml>
                               assemble the run-summary JSON (TPRD 8.4) from the night's
                               artifacts (drafts, failed.tsv, report-*.json, meta-*.json,
-                              warnings.txt, start_epoch, DISABLED, ERROR_STAGE) → stdout
+                              warnings.txt, start_epoch, DISABLED, ERROR_STAGE, FATAL_REASON,
+                              selection*.json, findings-*.json, reactive-summary.tsv,
+                              reactive-files.txt, prs.jsonl, pr-inventory.jsonl,
+                              deferred.jsonl) → stdout
        send <config.toml>     stdin: run-summary JSON; build + send the digest
        render <config.toml>   same, but print the RFC-2822 message instead of sending (dry-run)
 env:   SMTP_USER, SMTP_PASS (from ~/.nightshift.env; never exported to agent sessions)
@@ -286,6 +289,83 @@ def read_json_files(directory: str, pattern: str) -> list[dict] {
     return out;
 }
 
+"""Both readers return [] for a missing file ON PURPOSE. The digest is the one thing that must
+render when the stage that writes its input never ran, so absence is normal input here, not an
+error. Unparseable LINES are skipped individually for the same reason a bad report-*.json is
+(read_json_files above): one truncated write must not cost the whole digest.
+
+What absence must NOT do is vanish. RECONCILIATION B3: prs.jsonl and pr-inventory.jsonl both exist
+now (Plan 3 shipped them), and a reader that quietly returns [] renders an empty PR table every
+night, forever, with no error -- "did not run scored as passed" in the one unattended channel this
+project has. So `summarize` records which artifacts were PRESENT alongside their rows, and the
+renderer prints "not written tonight" rather than an empty section."""
+def read_jsonl(path: str) -> list[dict] {
+    out: list[dict] = [];
+    for line in read_lines(path) {
+        try {
+            out.append(parse_obj(line));
+        } except Exception {
+            eprint("sendmail: skipping unparseable jsonl line in " + path);
+        }
+    }
+    return out;
+}
+
+def read_tsv(path: str) -> list[list[str]] {
+    return [line.split("\t") for line in read_lines(path)];
+}
+
+"""Per-phase rollup, derived entirely from files S3 already writes -- no new writer anywhere in the
+pipeline. findings-*.json are the audit outputs (one per shard, one per reactive lens);
+selection*.json record what was packed.
+
+The phase comes from the FILENAME here and only here, and only because RECONCILIATION B6 fixes
+those filenames: `selection.json` is the cycle phase (that literal name is what lib/dataset.sh and
+scripts/dataset.jac read) and `selection-<phase>.json` is everything else. ponytail: a derivation,
+not a schema."""
+def task_sections(log_dir: str) -> list[dict] {
+    sections: list[dict] = [];
+    for path in glob_paths(log_dir, "selection*.json") {
+        base: str = os.path.basename(path);
+        phase: str = "cycle";
+        if base != "selection.json" {
+            phase = base[len("selection-"):-len(".json")];
+        }
+        sel: dict = {};
+        with open(path, "r") as f {
+            text: str = str(f.read());
+        }
+        if text.strip() {
+            try {
+                sel = parse_obj(text);
+            } except Exception {
+                eprint("sendmail: unparseable " + path);
+            }
+        }
+        # The audit scopes that fed THIS phase. findings-all.json and findings-reactive.json are
+        # merged outputs, not scopes, and listing them would report the merge as a shard.
+        scopes: list[str] = [];
+        for p in glob_paths(log_dir, "findings-*.json") {
+            nm: str = os.path.basename(p)[len("findings-"):-len(".json")];
+            if nm == "all" or nm == "reactive" {
+                continue;
+            }
+            if nm.startswith("reactive-") == (phase == "reactive") {
+                scopes.append(nm);
+            }
+        }
+        themes: list = as_list(sel.get("themes", []));
+        sections.append({
+            "phase": phase,
+            "scopes": scopes,
+            "selected": len(themes),
+            "deferred": len(as_list(sel.get("dropped", []))),
+            "themes": [as_dict(t) for t in themes],
+        });
+    }
+    return sections;
+}
+
 """Assemble the TPRD 8.4 run summary from the night's on-disk artifacts (see module docstring)."""
 def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
     fork: str = str(as_dict(cfg["repo"])["fork"]);
@@ -332,6 +412,24 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
     }
     error_lines: list[str] = read_lines(os.path.join(log_dir, "ERROR_STAGE"));
     fatal_lines: list[str] = read_lines(os.path.join(log_dir, "FATAL_REASON"));
+
+    # A FAILED lens is carried through VERBATIM, never collapsed to 0: "found nothing" and "did not
+    # run" are the two things this plan refuses to conflate, and the tsv already spells the
+    # difference (lib/reactive.sh writes `FAILED` and `skipped (no coverage evidence)`).
+    lenses: dict = {};
+    for row in read_tsv(os.path.join(log_dir, "reactive-summary.tsv")) {
+        if len(row) >= 2 {
+            lenses[row[0]] = row[1];
+        }
+    }
+    window: int = as_int(as_dict(cfg.get("budgets", {})).get("wallclock_min", 0));
+
+    # RECONCILIATION B3. Which artifacts were actually on disk, so the renderer can say "S5 never
+    # wrote this" instead of drawing an empty table that reads as "nothing to report".
+    artifacts: dict = {};
+    for name in ["prs.jsonl", "pr-inventory.jsonl", "reactive-summary.tsv", "deferred.jsonl"] {
+        artifacts[name] = os.path.exists(os.path.join(log_dir, name));
+    }
     return {
         "date": date_s,
         "verdict": str(len(branches)) + " branch(es) ready · " + str(len(failed)) + " failed",
@@ -347,6 +445,17 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
         # WHY the night died, not just where. ns_die (lib/common.sh) writes the message it was
         # called with; ERROR_STAGE alone is shared by 13 ns_die sites in lib/verify.sh.
         "fatal_reason": " ".join(fatal_lines) if fatal_lines else None,
+        "clock": {"window_min": window, "consumed_min": runtime,
+                  "remaining_min": window - runtime},
+        "tasks": task_sections(log_dir),
+        "reactive": {
+            "files": len(read_lines(os.path.join(log_dir, "reactive-files.txt"))),
+            "lenses": lenses,
+        },
+        "prs": read_jsonl(os.path.join(log_dir, "prs.jsonl")),
+        "inventory": read_jsonl(os.path.join(log_dir, "pr-inventory.jsonl")),
+        "deferred": read_jsonl(os.path.join(log_dir, "deferred.jsonl")),
+        "artifacts": artifacts,
     };
 }
 
@@ -546,4 +655,107 @@ test "body inlines drafts and bug reports" {
     assert "# refactor: kill dead code" in body;
     assert "SUSPECTED BUGS" in body;
     assert "a.jac:10" in body;
+}
+
+test "summarize renders a COMPLETE skeleton from an empty log dir" {
+    # The digest must render on the worst night there is -- one where the stage that writes its
+    # inputs never ran. Every section is present and empty, never absent: an absent key is a
+    # KeyError in html_body, i.e. the digest failing exactly when it matters most.
+    import tempfile;
+    empty: str = tempfile.mkdtemp();
+    cfg: dict = {"repo": {"fork": "me/jaseci"}, "budgets": {"wallclock_min": 480}};
+    s: dict = summarize(empty, tempfile.mkdtemp(), "2026-07-30", cfg);
+    for key in ["date", "verdict", "branches", "failed", "tasks", "reactive", "prs",
+                "inventory", "deferred", "clock", "warnings", "fatal_reason", "error_stage",
+                "artifacts"] {
+        assert key in s;
+    }
+    assert as_list(s["tasks"]) == [];
+    assert as_dict(s["clock"])["window_min"] == 480;
+    assert as_dict(s["reactive"])["files"] == 0;
+    # RECONCILIATION B3: an empty list must not be the ONLY thing an absent artifact produces.
+    # prs.jsonl and pr-inventory.jsonl both exist today, so "no rows" and "the writer never ran"
+    # are different facts and the renderer needs both.
+    for name in ["prs.jsonl", "pr-inventory.jsonl"] {
+        assert as_dict(s["artifacts"])[name] == False;
+    }
+}
+
+test "summarize folds the reactive tally, the PR rows and the inventory" {
+    import tempfile;
+    log_dir: str = tempfile.mkdtemp();
+    with open(os.path.join(log_dir, "reactive-summary.tsv"), "w") as f {
+        f.write("dead-code\t3\nabstraction\t0\nmaintenance\tFAILED\ncoverage\tskipped (no coverage evidence)\n");
+    }
+    with open(os.path.join(log_dir, "reactive-files.txt"), "w") as f {
+        f.write("jac/jaclang/cli/a.jac\njac/jaclang/scale/b.jac\n");
+    }
+    with open(os.path.join(log_dir, "prs.jsonl"), "w") as f {
+        f.write("{\"number\": 7301, \"title\": \"remove dead pipe\", \"task\": \"dead-code\","
+                + " \"url\": \"https://github.com/jaseci-labs/jac/pull/7301\","
+                + " \"mirror\": \"green\", \"ci\": \"pending\", \"attempts\": 0}\n");
+    }
+    with open(os.path.join(log_dir, "pr-inventory.jsonl"), "w") as f {
+        f.write("{\"number\": 7288, \"branch\": \"nightshift/2026-07-29/dead-code-cli\","
+                + " \"action\": \"rebased\", \"note\": \"\"}\n");
+        f.write("{\"number\": 7290, \"branch\": \"nightshift/2026-07-28/coverage-scale\","
+                + " \"action\": \"conflicted\", \"note\": \"jac/jaclang/cli/x.jac\"}\n");
+        f.write("not json at all\n");
+    }
+    with open(os.path.join(log_dir, "deferred.jsonl"), "w") as f {
+        f.write("{\"fingerprint\": \"ab\", \"file\": \"jac/jaclang/scale/z.jac\","
+                + " \"reason\": \"over-night-budget\", \"phase\": \"cycle\"}\n");
+    }
+    cfg: dict = {"repo": {"fork": "me/jaseci"}, "budgets": {"wallclock_min": 480}};
+    s: dict = summarize(log_dir, tempfile.mkdtemp(), "2026-07-30", cfg);
+    react: dict = as_dict(s["reactive"]);
+    assert react["files"] == 2;
+    assert as_dict(react["lenses"])["dead-code"] == "3";
+    # a FAILED lens is preserved verbatim, NOT collapsed to 0 -- "found nothing" and "did not run"
+    # are the two things this whole plan refuses to conflate, and "skipped" is a third
+    assert as_dict(react["lenses"])["maintenance"] == "FAILED";
+    assert as_dict(react["lenses"])["coverage"] == "skipped (no coverage evidence)";
+    assert as_int(as_dict(as_list(s["prs"])[0])["number"]) == 7301;
+    # the unparseable third line is skipped, the two good ones survive: one truncated write must
+    # not cost the whole digest
+    assert len(as_list(s["inventory"])) == 2;
+    assert as_dict(as_list(s["inventory"])[1])["action"] == "conflicted";
+    # Plan 3's extra `branch` key is harmless to a .get()-based reader (RECONCILIATION B3)
+    assert as_dict(as_list(s["inventory"])[0])["branch"] == "nightshift/2026-07-29/dead-code-cli";
+    assert as_dict(as_list(s["deferred"])[0])["reason"] == "over-night-budget";
+    for name in ["prs.jsonl", "pr-inventory.jsonl", "reactive-summary.tsv", "deferred.jsonl"] {
+        assert as_dict(s["artifacts"])[name] == True;
+    }
+}
+
+test "task_sections separates the two phases and never reports a merge as a scope" {
+    # RECONCILIATION B6: the cycle phase keeps the literal names findings.json / selection.json, so
+    # the phase is derived from `selection.json` vs `selection-<phase>.json` -- and findings-all /
+    # findings-reactive are MERGED outputs that must not be listed as audit scopes.
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    with open(os.path.join(d, "selection.json"), "w") as f {
+        f.write("{\"themes\": [{\"name\": \"cli\", \"summary\": \"s\"}], \"dropped\": [1, 2]}");
+    }
+    with open(os.path.join(d, "selection-reactive.json"), "w") as f {
+        f.write("{\"themes\": [], \"dropped\": []}");
+    }
+    for nm in ["findings-cli.json", "findings-scale.json", "findings-reactive-dead-code.json",
+               "findings-all.json", "findings-reactive.json"] {
+        with open(os.path.join(d, nm), "w") as f {
+            f.write("[]");
+        }
+    }
+    sections: list[dict] = task_sections(d);
+    assert len(sections) == 2;
+    by_phase: dict = {};
+    for s in sections {
+        by_phase[str(s["phase"])] = s;
+    }
+    cyc: dict = as_dict(by_phase["cycle"]);
+    assert sorted([str(x) for x in as_list(cyc["scopes"])]) == ["cli", "scale"];
+    assert cyc["selected"] == 1 and cyc["deferred"] == 2;
+    rea: dict = as_dict(by_phase["reactive"]);
+    assert [str(x) for x in as_list(rea["scopes"])] == ["reactive-dead-code"];
+    assert rea["selected"] == 0;
 }
