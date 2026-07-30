@@ -5,6 +5,29 @@ upstream       = "jaseci-labs/jac"          # renamed from jaseci-labs/jaseci
 fork           = "ayushmk7/jaseci"          # <- set at M0
 default_branch = "main"
 
+[shards]                                     # whole-repo audit, LOC-balanced. Measured 2026-07-30:
+# compiler 130920 - scale 86566 - jac0core 46711 - runtimelib 40719 - cli 31630 - byllm 16732 -
+# project 4465 - publish 3022 - langserve 1730 - utils 1486 - lsp 1182. ~365k LOC of Jac total.
+# ponytail: the largest shard is still ~87k LOC, so a night is DEEP, not exhaustive. Full-repo
+#           coverage emerges over many nights. Upgrade path: split scale/compiler further here.
+concurrency = 2                              # bash 3.2 has no `wait -n`; the driver polls jobs -rp
+names = ["compiler-passes", "compiler-core", "scale", "jac0core",
+         "runtimelib", "cli", "byllm", "periphery"]
+
+[shards.paths]
+compiler-passes = ["jac/jaclang/compiler/passes"]
+compiler-core   = ["jac/jaclang/compiler"]
+scale           = ["jac/jaclang/scale"]
+jac0core        = ["jac/jaclang/jac0core"]
+runtimelib      = ["jac/jaclang/runtimelib"]
+cli             = ["jac/jaclang/cli"]
+byllm           = ["jac/jaclang/byllm"]
+periphery       = ["jac/jaclang/langserve", "jac/jaclang/lsp", "jac/jaclang/project",
+                   "jac/jaclang/publish", "jac/jaclang/utils", "jac-mcp"]
+
+[shards.exclude]                             # subtracted from the shard's own paths in the prompt
+compiler-core   = ["jac/jaclang/compiler/passes", "jac/jaclang/compiler/tests"]
+
 [budgets]                                    # PRD 9 guardrails — no step may violate these
 themes_per_night   = 6                       # was 3 -- real data: 85% of real findings were being
                                               # dropped for pure over-night-budget reasons while
