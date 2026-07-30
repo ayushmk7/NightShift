@@ -34,6 +34,29 @@ ns_jac() {
     (cd "$NS_ROOT" && "$NS_PATHS_JAC" run "scripts/$script.jac" "$@")
 }
 
+# The task a branch belongs to, derived from the branch NAME the harness built:
+# nightshift/<date>/<task>-<theme-hint>. NEVER from the theme file -- the theme is assembled from
+# agent-authored findings, and if the gate read the task from there, a dead-code audit could ask
+# for the coverage task's tests/** write exemption and be given it.
+#
+# Prints the task and returns 0, or returns 1 having printed nothing. Callers MUST treat rc=1 as
+# fatal, never as "no task": an unresolved task means no permission set can be applied at all.
+# A failure inside `tasks list` also lands here as rc=1 (the loop iterates zero times), which is
+# the safe direction -- the discarded-reader bug this codebase keeps finding fails CLOSED here.
+#
+# Prefix matching is only unambiguous because no task name is a prefix of another;
+# bin/test-harness.sh section 11 asserts that from outside, over the real config.
+ns_task_of_branch() {
+    local slug task
+    slug="$(basename "$1")"
+    for task in $(ns_jac tasks list "$CONFIG"); do
+        case "$slug" in
+            "$task"-*) printf '%s\n' "$task"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
 # --- logging & night bookkeeping ---
 ns_log()  { printf '%s [%s] %s\n' "$(date '+%H:%M:%S')" "$1" "$2" | tee -a "$LOG_DIR/run.log" >&2; }
 ns_warn() { ns_log WARN "$1"; echo "$1" >> "$LOG_DIR/warnings.txt"; }

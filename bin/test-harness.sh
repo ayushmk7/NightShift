@@ -62,10 +62,26 @@ echo "== 4. scope gate: protected diff must be rejected =="
 # (violations() reads only files / fragment_kind / vestigial_deletions), and a dead key in a
 # fixture reads as a requirement the code no longer has.
 printf '{"files":["pkg/tests/fixtures/weird.jac"]}' > "$T/theme.json"
-if printf 'M\tpkg/tests/fixtures/weird.jac\n' \
-    | jac run scripts/check_scope.jac check "$T/theme.json" config/nightshift.toml >/dev/null; then
-    fail "scope gate let a protected path through"
-fi
+# The 4th argv is the TASK (Plan 2 Task 6 / RECONCILIATION B8): dead-code has no protect_unless, so
+# a protected path stays rejected. Section 12 drives the permission logic itself.
+#
+# The rejection is asserted as rc=1 PLUS the VIOLATION line, not as "nonzero". Measured while
+# implementing Task 6: with the old 4-argv call left in place, this gate falls through to the usage
+# arm and exits 2 -- which an `if <cmd>; then fail` reads as "correctly rejected", so the harness
+# stayed green while every S4 invocation was unparsable. That is this project's signature defect
+# (did-not-run scored as passed) sitting inside the test for it. B8 says updating this call keeps
+# the harness from going red; it does not, and that is worse.
+scope_rc=0
+printf 'M\tpkg/tests/fixtures/weird.jac\n' \
+    | jac run scripts/check_scope.jac check "$T/theme.json" config/nightshift.toml dead-code > "$T/scope4.out" \
+    || scope_rc=$?
+case "$scope_rc" in
+    1) : ;;
+    0) fail "scope gate let a protected path through" ;;
+    *) fail "scope gate answered rc=$scope_rc for a protected path -- it did not run the check at all (argv drift?): $(tr '\n' ' ' < "$T/scope4.out")" ;;
+esac
+grep -q '^VIOLATION pkg/tests/fixtures/weird.jac protected-glob$' "$T/scope4.out" \
+    || fail "scope gate rejected the protected path without saying why: $(tr '\n' ' ' < "$T/scope4.out")"
 # A gate that cannot parse its own arguments must never be the reason a branch passes. lib/verify.sh
 # reads `if ! … | ns_jac check_scope check …`, so an exit 0 from the usage arm reports the diff as
 # CONTAINED. The arm exited 0 until this commit; Plan 2 Task 6 changes this verb's arity, which is
@@ -566,7 +582,75 @@ esac
 rm -rf .jac
 echo "4 tasks, 8 prompt files, no unrendered placeholders"
 
-# Sections 12-18 are RESERVED: docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2
+echo "== 12. protect_unless: a theme cannot grant itself a write exemption =="
+# THE security-critical case in this plan. Driven through the REAL CLI with the REAL config, not
+# through the Jac unit tests alone: what matters is that the argv the gate is called with wins over
+# anything the theme says, and only the CLI path proves the argv is even threaded through.
+rm -rf .jac
+S="$T/scope"; mkdir -p "$S"
+# A hostile theme: it claims to be a coverage theme and carries its own exemption list.
+printf '{"files":["jac/tests/test_x.jac"],"task":"coverage","protect_unless":["**/tests/**"],"fragment_kind":"refactor"}' \
+    > "$S/hostile.json"
+if printf 'M\tjac/tests/test_x.jac\n' \
+    | jac run scripts/check_scope.jac check "$S/hostile.json" config/nightshift.toml dead-code > "$S/hostile.out"; then
+    fail "a dead-code branch was allowed to write tests/** because the THEME claimed to be coverage"
+fi
+# ...and it was rejected for the RIGHT reason. Without this the assertion above is satisfied by any
+# nonzero exit — a typo'd argv (rc=2 from the usage arm), an unreadable theme file, a jac crash.
+# "the gate said no" and "the gate ran and said no" are the distinction this whole project keeps
+# losing.
+grep -q '^VIOLATION jac/tests/test_x.jac protected-glob$' "$S/hostile.out" \
+    || fail "the hostile theme was rejected, but not as protected-glob: $(tr '\n' ' ' < "$S/hostile.out")"
+# ...and the same diff under the coverage task must be ALLOWED, or the assertion above would pass
+# for a gate that simply rejects everything.
+printf '{"files":["jac/tests/test_x.jac"],"fragment_kind":""}' > "$S/cov.json"
+printf 'M\tjac/tests/test_x.jac\n' \
+    | jac run scripts/check_scope.jac check "$S/cov.json" config/nightshift.toml coverage >/dev/null \
+    || fail "the coverage task cannot write tests/** -- protect_unless is not being applied at all"
+# tests-only: a coverage branch touching a source file in its OWN allow-list is still rejected.
+printf '{"files":["jac/jaclang/cli/pipe.jac","jac/tests/test_x.jac"],"fragment_kind":""}' > "$S/cov2.json"
+if printf 'M\tjac/jaclang/cli/pipe.jac\n' \
+    | jac run scripts/check_scope.jac check "$S/cov2.json" config/nightshift.toml coverage > "$S/cov2.out"; then
+    fail "a coverage branch modified a source file; the task is tests-only"
+fi
+grep -q 'task-writes-tests-only' "$S/cov2.out" \
+    || fail "a coverage source write was rejected for the wrong reason: $(tr '\n' ' ' < "$S/cov2.out")"
+# an unknown task must be FATAL, not an empty exemption list. Nonzero alone is not enough: rc=1 is
+# the gate's own "violations found" code, and an implementation that silently gave an unknown task
+# dead-code's (empty) permissions would produce exactly that on this diff. Demand the exception.
+if printf 'M\tjac/tests/test_x.jac\n' \
+    | jac run scripts/check_scope.jac check "$S/cov.json" config/nightshift.toml not-a-task \
+      > "$S/unknown.out" 2> "$S/unknown.err"; then
+    fail "an unknown task was gated anyway; it must fail closed"
+fi
+grep -q 'unknown task: not-a-task' "$S/unknown.err" \
+    || fail "an unknown task did not raise -- it was gated under some default permission set instead: $(tr '\n' ' ' < "$S/unknown.err" | tail -c 200)"
+rm -rf .jac
+
+# ns_task_of_branch drives the whole thing, so mutate it too: the task must come from the BRANCH.
+( . "$NS_ROOT/lib/common.sh"; ns_bootstrap_jac
+  got="$(ns_task_of_branch nightshift/2026-07-30/coverage-cli-error-paths)" || exit 1
+  [ "$got" = coverage ] || { echo "got '$got'" >&2; exit 1; }
+  got="$(ns_task_of_branch nightshift/2026-07-30/dead-code-unused-imports)" || exit 1
+  [ "$got" = dead-code ] || { echo "got '$got'" >&2; exit 1; }
+  if ns_task_of_branch nightshift/2026-07-30/autofix >/dev/null 2>&1; then
+      echo "a tier-1 branch resolved to a task; it has none" >&2; exit 1
+  fi
+  # A bare task name with no theme hint is NOT a nightshift apply branch: the slug the harness
+  # builds is always <task>-<hint>. Accepting it would mean a branch called `coverage` inherited
+  # the coverage write exemption, and `"$task"-*` is one character away from `"$task"*`.
+  if ns_task_of_branch nightshift/2026-07-30/coverage >/dev/null 2>&1; then
+      echo "a bare task name resolved to a task; the slug must be <task>-<hint>" >&2; exit 1
+  fi
+) || fail "ns_task_of_branch does not resolve the task from the branch slug"
+# lib/verify.sh must actually PASS the derived task to the gate. A call site that dropped it would
+# hit check_scope's usage arm (exit 2), which `if ! …` reads as a violation -- every branch red,
+# loudly. But a call site that passed a CONSTANT would be silent, and that is what this pins.
+grep -q 'check_scope check "\$theme" "\$CONFIG" "\$btask"' lib/verify.sh \
+    || fail "lib/verify.sh no longer passes the branch-derived task to check_scope; the gate would apply some other task's write permissions"
+echo "protect_unless is config-keyed by an argv task: a theme cannot grant itself tests/** access"
+
+# Sections 15-18 are RESERVED: docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2
 # (task registry) and 15-18 to Plan 3 (ship path); all four v2 plans independently claimed "section
 # 11". Plan 4 owns 19-23. The gap is deliberate — renumbering later would silently reorder the
 # other two plans' tripwires into someone else's range.

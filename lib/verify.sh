@@ -287,9 +287,13 @@ verify_branch() {
     # 1. scope containment FIRST — reject before spending a second on tests (anti-injection, T1).
     # --name-status (not --name-only): a vestigial test deletion must be a clean delete, never a
     # modification -- the gate needs to see which each changed path actually is.
+    # The TASK comes from the branch name, not the theme: [tasks.<task>].protect_unless decides
+    # whether this branch may write inside a protected glob, and the theme is agent-derived.
     if [ "$theme" != "-" ]; then
+        local btask
+        btask="$(ns_task_of_branch "$branch")" || ns_die "$EX_BUG" "cannot derive a task from branch '$branch': its slug matches no name in [tasks.*]. Refusing to gate it -- with no task there is no permission set to apply, and defaulting to one would either reject every coverage branch or hand every branch the coverage exemption."
         if ! git diff --name-status "$NS_REPO_DEFAULT_BRANCH...HEAD" \
-                | ns_jac check_scope check "$theme" "$CONFIG" > "$LOG_DIR/scope-violations.txt"; then
+                | ns_jac check_scope check "$theme" "$CONFIG" "$btask" > "$LOG_DIR/scope-violations.txt"; then
             verify_red "$branch" "scope violation (possible prompt injection): $(head -3 "$LOG_DIR/scope-violations.txt" | tr '\n' ' ')"
             return 1
         fi
