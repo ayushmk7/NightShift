@@ -66,6 +66,17 @@ if printf 'M\tpkg/tests/fixtures/weird.jac\n' \
     | jac run scripts/check_scope.jac check "$T/theme.json" config/nightshift.toml >/dev/null; then
     fail "scope gate let a protected path through"
 fi
+# A gate that cannot parse its own arguments must never be the reason a branch passes. lib/verify.sh
+# reads `if ! … | ns_jac check_scope check …`, so an exit 0 from the usage arm reports the diff as
+# CONTAINED. The arm exited 0 until this commit; Plan 2 Task 6 changes this verb's arity, which is
+# exactly when that bites. rc=1 is also wrong here -- it is the "violations found" code, so the
+# caller could not tell a rejected diff from an unparsable invocation.
+scope_rc=0
+jac run scripts/check_scope.jac check "$T/theme.json" >/dev/null 2>&1 || scope_rc=$?
+case "$scope_rc" in
+    0) fail "check_scope exited 0 for a malformed argv -- the S4 gate would report an unparsed diff as contained" ;;
+    1) fail "check_scope answered rc=1 (its 'violations found' code) for a malformed argv; the caller cannot tell those apart" ;;
+esac
 
 echo "== 5. ci.yml drift tripwire =="
 CI_YML="$NS_ROOT/work/repo/.github/workflows/ci.yml"

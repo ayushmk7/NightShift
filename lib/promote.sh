@@ -70,14 +70,19 @@ promote_main() {
 
     # 3. rename the release-note fragment 0000 → <PR#> (the PR updates itself on push)
     #
-    # LATENT COUPLING (the third site of the same one; render_draft.jac:frag_for_report already
-    # carries this note): the fragment KIND is hardcoded `refactor` here, and the `%0000.refactor.md`
-    # suffix strip is what makes the rename a no-op for any other kind. render_draft's
-    # frag_for_report hardcodes `refactor` too, but check_scope.jac:23 honours
-    # `theme.get("fragment_kind", "refactor")` — so the S4 scope gate would happily let a
-    # `0000.bugfix.md` through while this line silently fails to renumber it and ships a fragment
-    # still named 0000. Identical today only because nothing emits `fragment_kind`. All three sites
-    # must change together.
+    # LIVE BUG as of Plan 2 Task 5, no longer a latent one. This is the LAST site that hardcodes
+    # the fragment KIND: the `%0000.refactor.md` suffix strip makes the rename a silent no-op for
+    # the other four kinds, so the fragment ships still named 0000 and CI's release-note check
+    # fails the PR. The other two sites are fixed -- render_draft.jac's frag_for_report now takes
+    # the kind, and check_scope.jac allows all five names for an `auto` theme -- and
+    # [tasks.maintenance].fragment = "auto" means something now really does emit a non-refactor
+    # kind, which nothing did when this was written.
+    #
+    # NOT fixed here on purpose: RECONCILIATION.md assigns `ns_renumber_fragment` to Plan 3, whose
+    # version is the superset (shared by ship and promote, handles the empty kind that
+    # [tasks.coverage] produces, and routes the push through ns_git_push so promote is
+    # dry-runnable). Until Plan 3 lands, a maintenance-task PR that reports anything other than
+    # `refactor` will ship an unrenamed fragment.
     fragment="$(ns_jac render_draft meta "$draft" | ns_jac parse_result field release_note)"
     if git -C "$REPO" ls-files --error-unmatch "$fragment" >/dev/null 2>&1; then
         git -C "$REPO" checkout "$branch"

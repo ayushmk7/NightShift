@@ -13,16 +13,28 @@ this theme, that the file is entirely about code the theme is deleting) AND the 
 clean deletion (status "D"), never a modification.
 """
 import sys;
-import from nslib { eprint, read_stdin, parse_obj, as_list, is_protected, load_globs, fragment_path }
+import from nslib {
+    eprint, read_stdin, parse_obj, as_list, is_protected, load_globs, fragment_path,
+    VALID_FRAGMENT_KINDS
+}
 
 def violations(changed: list[tuple[str, str]], theme: dict, globs: list[str]) -> list[str] {
-    allowed: list[str] = [str(f) for f in theme["files"]];
-    # The orchestrator, not the agent, writes the fragment -- but the gate must still allow it
-    # through. Kind comes from the theme; fragment_path clamps an invalid kind to refactor, so a
-    # tampered theme cannot smuggle an arbitrary filename past the regex CI enforces.
-    frag: str = fragment_path(allowed, str(theme.get("fragment_kind", "refactor")));
-    if frag {
-        allowed.append(frag);
+    theme_files: list[str] = [str(f) for f in theme["files"]];
+    allowed: list[str] = list(theme_files);
+    # The ORCHESTRATOR writes the fragment, but the gate must still let it through. `auto`
+    # (the maintenance task) means the AGENT picks the kind and the harness validates it, so all
+    # five legal names are allowed here -- the directory and the 0000 stem are fixed either way,
+    # which is what CI's filename regex actually checks. "" means the task needs no fragment and
+    # therefore may not write one. Any other value allows exactly that one name, and
+    # fragment_path clamps an invalid one to refactor, so a tampered theme cannot smuggle an
+    # arbitrary filename past the regex CI enforces.
+    kind: str = str(theme.get("fragment_kind", "refactor"));
+    kinds: list[str] = VALID_FRAGMENT_KINDS if kind == "auto" else [kind];
+    for k in kinds {
+        frag: str = fragment_path(theme_files, k);
+        if frag and frag not in allowed {
+            allowed.append(frag);
+        }
     }
     vestigial: list[str] = [str(f) for f in as_list(theme.get("vestigial_deletions", []))];
     out: list[str] = [];
@@ -81,6 +93,12 @@ with entry {
     } elif len(args) > 1 and args[1] != "test" {
         eprint("usage: git diff --name-status main...HEAD | jac run check_scope.jac check <theme.json> <config.toml>");
         eprint("       git diff --name-only | jac run check_scope.jac protected <config.toml>");
+        # NONZERO, and deliberately not 1 (which means "violations found"). This arm used to exit
+        # 0, so any future arity drift -- exactly the kind Task 6 is about to introduce when
+        # `check` grows a <task> argv -- would make lib/verify.sh's `if ! ... check_scope`
+        # succeed and report the diff as CONTAINED. A gate that cannot parse its own arguments
+        # must never be the reason a branch passes. (RECONCILIATION B8.)
+        sys.exit(2);
     }
 }
 
@@ -112,6 +130,36 @@ test "vestigial deletion is allowed only as a clean delete, modifying it is stil
     assert ok == [];
     bad: list[str] = violations([("M", "jac/pkg/tests/test_gateway.jac")], theme, globs);
     assert len(bad) == 1 and "must-be-a-clean-delete" in bad[0];
+}
+
+test "an auto-kind theme may write any of the five valid fragment names" {
+    theme: dict = {"files": ["jac/jaclang/cli/pipe.jac"], "fragment_kind": "auto"};
+    globs: list[str] = ["**/tests/**"];
+    for kind in ["feature", "bugfix", "breaking", "refactor", "docs"] {
+        changed: list[tuple[str, str]] = [
+            ("M", "jac/jaclang/cli/pipe.jac"),
+            ("A", "release_notes/unreleased/jaclang/0000." + kind + ".md"),
+        ];
+        assert violations(changed, theme, globs) == [];
+    }
+    # ...but not an invented one: the filename regex is what CI enforces
+    bad: list[tuple[str, str]] = [("A", "release_notes/unreleased/jaclang/0000.chore.md")];
+    assert len(violations(bad, theme, globs)) == 1;
+}
+
+test "a NON-auto theme may write only its own kind's fragment name" {
+    # The half that stops the `auto` widening from becoming an unconditional widening: a
+    # dead-code theme declares `refactor`, so 0000.bugfix.md is out of its allow-list.
+    theme: dict = {"files": ["jac/jaclang/cli/pipe.jac"], "fragment_kind": "refactor"};
+    assert violations([("A", "release_notes/unreleased/jaclang/0000.refactor.md")], theme, []) == [];
+    assert len(violations([("A", "release_notes/unreleased/jaclang/0000.bugfix.md")], theme, [])) == 1;
+}
+
+test "a task with fragment = '' may not write a fragment at all" {
+    theme: dict = {"files": ["jac/jaclang/cli/pipe.jac"], "fragment_kind": ""};
+    found: list[str] = violations(
+        [("A", "release_notes/unreleased/jaclang/0000.refactor.md")], theme, []);
+    assert len(found) == 1;
 }
 
 test "parse_name_status splits STATUS and path, tolerates blank lines" {

@@ -327,7 +327,13 @@ tier2_apply() {
         # Path derives from the theme's own files (via the report the agent returned): only
         # jac/jaclang/** needs a fragment at all, and a theme can now span shards, so there is
         # no package name left to put in the path or the commit subject.
-        local fragment; fragment="$(ns_jac render_draft frag "$LOG_DIR/report-$slug.json")"
+        # The KIND comes from the theme, which selector.jac copied from [tasks.<task>].fragment:
+        # "" (coverage) means no fragment at all, "auto" (maintenance) means the agent picks and
+        # render_draft validates. Passing it is what removes the last of the three sites that
+        # hardcoded `refactor` while the S4 gate already honoured the theme's kind.
+        local frag_kind fragment
+        frag_kind="$(ns_jac parse_result field fragment_kind < "$theme_file")"
+        fragment="$(ns_jac render_draft frag "$LOG_DIR/report-$slug.json" "$frag_kind")"
         if [ -n "$fragment" ]; then
             mkdir -p "$(dirname "$REPO/$fragment")"
             # `fragment`, not `field`: normalizes into bullet form (nslib.normalize_fragment_body)

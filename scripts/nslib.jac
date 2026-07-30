@@ -195,6 +195,12 @@ in fragcheck.is_gated_change; they must stay in lockstep."""
 glob VALID_FRAGMENT_KINDS: list[str] = ["feature", "bugfix", "breaking", "refactor", "docs"];
 
 def fragment_path(paths: list[str], kind: str) -> str {
+    # "" means the TASK declares it needs no fragment ([tasks.coverage].fragment). Checked before
+    # the validity clamp below, which would otherwise turn it into "refactor" and write a release
+    # note for a tests-only change.
+    if kind == "" {
+        return "";
+    }
     safe_kind: str = kind if kind in VALID_FRAGMENT_KINDS else "refactor";
     for p in paths {
         if str(p).startswith("jac/jaclang/") and "/tests/" not in str(p) {
@@ -278,6 +284,19 @@ test "fragment_path maps only jac/jaclang changes, and validates the kind" {
     # an invalid kind falls back to refactor rather than emitting a path CI will reject
     assert fragment_path(["jac/jaclang/cli/b.jac"], "nonsense")
         == "release_notes/unreleased/jaclang/0000.refactor.md";
+}
+
+test "an empty kind means the TASK needs no fragment at all" {
+    # Distinct from "these paths need none": the coverage task sets fragment = "" in config, and
+    # without this branch the empty string would fall through the validity check and be clamped
+    # to `refactor` -- writing a release note for a tests-only change.
+    assert fragment_path(["jac/jaclang/cli/b.jac"], "") == "";
+    # ...and it is the KIND that is empty, not the answer: the same paths at any other kind still
+    # produce a fragment, so an implementation that returned "" unconditionally fails here.
+    assert fragment_path(["jac/jaclang/cli/b.jac"], "auto")
+        == "release_notes/unreleased/jaclang/0000.refactor.md";
+    assert fragment_path(["jac/jaclang/cli/b.jac"], "bugfix")
+        == "release_notes/unreleased/jaclang/0000.bugfix.md";
 }
 
 test "normalize_fragment_body bullets a bare sentence, leaves an already-bulleted one alone" {
