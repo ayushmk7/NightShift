@@ -63,32 +63,33 @@ ci_job = "jac-check"
 # recorded it RED and >1hr (see the now-superseded decision note that followed this file, deleted
 # below) -- but that is the PUSH-event branch, and Nightshift only ever opens PRs, so the branch
 # that actually gates it is the scoped one at ci.yml:421:
-# `jac check $(cat changed-jac.txt) --ignore $IGNORE_ARGS --nowarn`. Measured directly: ~0.45s for
-# one file, and RED on jac/jaclang/byllm/tool_protocol.jac specifically (3 errors, 45 warnings) --
-# one of the 9 files [jobs.fmt_autofix] will reformat on a normal autofix night. Without this
-# entry, tonight's fmt_autofix branch passes the mirror's fmt gate (formatting only) and then
-# fails real CI on a pre-existing type error the fmt pass never touched.
+# `jac check $(cat changed-jac.txt) --ignore $IGNORE_ARGS --nowarn`.
 #
-# NOT a literal transcription of ci.yml:421, though -- code review 2026-07-30 found that CI's own
-# form (`jac check $FILES --ignore $IGNORE_ARGS --nowarn`, IGNORE_ARGS = the 2 static globs plus
-# every non-comment .jacignore line, ~570 total) is SILENTLY BROKEN on this host: `jac check`'s
-# `--ignore` (argparse `nargs='*'`, following a required `nargs='+'` `paths`) reports a clean
-# "0 collected" (exit 0) the moment it receives roughly 100-150 values, regardless of real errors
-# in the files given -- reproduced with a bare `argparse.ArgumentParser` carrying the identical
-# shape, confirming it is a CPython 3.14.5 argparse limitation (this host's Python), not a bug in
-# jac's own CLI registration (jac/jaclang/cli/impl/registry.impl.jac is plain stdlib argparse).
-# Binary-searched: 100 ignore values still worked, 120-150 did not. .jacignore alone is ~570
-# lines, so ci.yml:421's literal form is a hard-broken false-green here -- the exact "gate reports
-# green when it cannot tell" failure mode this review round exists to close, one command further
-# in. Worked around by filtering the (always small, diff-scoped) candidate file list ourselves,
-# in Jac (scripts/cimirror.jac's filter_survivors, a port of
-# jaclang.jac0core.helpers.path_matches_exclude using Python's real fnmatch for semantic parity),
-# THEN calling `jac check <survivors> --nowarn` with NO --ignore at all -- sidestepping the
-# argparse limitation entirely rather than tripping over it more carefully.
-#
-# Same fail-loud merge-base handling as [jobs.fmt] above, for the identical reason.
+# This IS a literal transcription of ci.yml:421 (IGNORE_ARGS built exactly as ci.yml:415, passed
+# unquoted to `--ignore` exactly as CI does). A code-review round on 2026-07-30 briefly replaced
+# this with a Jac-side pre-filter (scripts/cimirror.jac's since-deleted filter_survivors),
+# diagnosing `jac check --ignore`'s ~570-value .jacignore list as silently broken past ~100-150
+# values under this host's Python 3.14.5 argparse. CORRECTED the same day: the diagnosis was
+# wrong. A second reviewer reproduced the identical argparse shape at 10/100/120/150/300/570/2000
+# values -- correct every time -- then ran this exact literal command with the real 573-token
+# IGNORE_ARGS against a throwaway file with a genuine error and got the correct result (rc=1).
+# What the binary search actually found: .jacignore's non-comment entry 116 IS
+# `jac/jaclang/byllm/tool_protocol.jac` (the file used as the test probe) -- feeding the first 100
+# entries left it un-ignored (correctly caught, "worked"); feeding 150 made it ignore-listed
+# ("0 collected" was CI's real, correct behavior for an ignored file, not a bug). The 100-vs-150
+# threshold was an artifact of the probe file's position in .jacignore, not of argv count.
+# Worse, the pre-filter was ACTIVELY WRONG in the other direction: `--ignore` in `jac check` has
+# two consumers, not one -- `_iter_jac_files` (input selection) AND `filter_issues`
+# (analysis.impl.jac:125-133), which drops diagnostics whose OWN i.loc.mod_path is ignore-matched.
+# A base file with an ignored `.impl.jac` annex (e.g. cli/commands/build.jac, whose errors are all
+# attributed to cli/commands/impl/build.impl.jac, .jacignore line 176 -- at least 10 such
+# non-ignored-base/ignored-annex pairs exist) passes real CI (`1 passed`) but would have been
+# reported RED by a file-list-only pre-filter that never re-checked diagnostic provenance. That is
+# the strict-direction failure that would have made this gate reject branches real CI accepts --
+# worse than the false-green it was trying to fix. Reverted in full; kept only the fail-loud
+# merge-base handling below, which was a real, independent fix.
 commands = [
-  '''BASE="$(git merge-base "$NS_REPO_DEFAULT_BRANCH" HEAD 2>&1)" || { echo "ERROR: could not compute merge-base for jac check scoping: $BASE" >&2; exit 70; }; FILES="$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD -- '*.jac')"; if [ -z "$FILES" ]; then echo "No .jac files changed; skipping jac check."; else SURVIVORS="$(printf '%s\n' "$FILES" | "$NS_PATHS_JAC" run "$NS_ROOT/scripts/cimirror.jac" filter-survivors .jacignore)"; if [ -z "$SURVIVORS" ]; then echo "All changed .jac files are ignore-listed; skipping jac check."; else printf '%s\n' "$SURVIVORS" | tr '\n' '\0' | xargs -0 --no-run-if-empty jac check --nowarn; fi; fi''',
+  '''BASE="$(git merge-base "$NS_REPO_DEFAULT_BRANCH" HEAD 2>&1)" || { echo "ERROR: could not compute merge-base for jac check scoping: $BASE" >&2; exit 70; }; FILES="$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD -- '*.jac')"; if [ -z "$FILES" ]; then echo "No .jac files changed; skipping jac check."; else IGNORE_ARGS="tests checker_*.jac *_err.jac $(grep -v '^#' .jacignore | grep -v '^[[:space:]]*$' | tr '\n' ' ')"; jac check $FILES --ignore $IGNORE_ARGS --nowarn; fi''',
 ]
 
 [jobs.fmt_autofix]

@@ -4,14 +4,9 @@ argv:
   jobs <ci-mirror.toml>          print each GATE job name (mirrors a real ci.yml job), file order
   cmds <job> <ci-mirror.toml>    print that job's commands, one per line
   hash <ci-mirror.toml>          print the recorded ci.yml sha256
-  filter-survivors <jacignore>   read candidate paths on stdin, one per line; print only the
-                                 ones [jobs.check] should actually check (see below for why this
-                                 exists instead of just passing everything to `jac check --ignore`)
 """
 import sys;
-import os;
-import from fnmatch { fnmatch }
-import from nslib { eprint, read_stdin, load_config_toml, as_dict, as_list }
+import from nslib { eprint, load_config_toml, as_dict, as_list }
 
 """Every [jobs.*] table name, unfiltered -- includes tier-1's own [jobs.fmt_autofix], which is
 NOT a ci.yml job and must never appear in the gate iteration (see gate_job_names)."""
@@ -42,72 +37,6 @@ def gate_job_names(cfg: dict) -> list[str] {
     return [n for n in job_names(cfg) if not job_ci_job(cfg, n).startswith("none")];
 }
 
-"""[jobs.check]'s exclusion list, without ever handing all ~570 of them to `jac check --ignore`
-as separate argv tokens (see path_matches_ignore for why). The two static globs plus `tests`
-mirror ci.yml:415's literal IGNORE_ARGS prefix; the rest is every non-comment, non-blank line of
-the target repo's own .jacignore -- the exact same source CI's IGNORE_ARGS reads."""
-def load_ignore_patterns(jacignore_path: str) -> list[str] {
-    patterns: list[str] = ["tests", "checker_*.jac", "*_err.jac"];
-    if os.path.exists(jacignore_path) {
-        with open(jacignore_path, "r") as f {
-            for line in f {
-                stripped: str = line.strip();
-                if stripped and not stripped.startswith("#") {
-                    patterns.append(stripped);
-                }
-            }
-        }
-    }
-    return patterns;
-}
-
-"""Port of jaclang.jac0core.helpers.path_matches_exclude (jac/jaclang/jac0core/helpers.jac):
-a slash-free pattern matches if ANY path component matches it (fnmatch, not just the basename);
-a pattern with a slash matches the whole normalized path, or the path with any prefix ending in
-'/' stripped (i.e. as a path suffix). Dropped only the third, rarely-hit variant of the original
-(`fnmatch('_/' + norm, pattern)`, for patterns that themselves already start with '*/') -- none of
-the two static globs or any of .jacignore's ~570 entries start with '*/' (verified 2026-07-30), so
-this is a no-op simplification for this codebase's actual pattern set, not a behavior change.
-
-WHY THIS EXISTS AT ALL, not just `jac check <files> --ignore <everything>`: verified empirically
-that `jac check`'s own `--ignore` flag (argparse `nargs='*'`, following a required `nargs='+'`
-positional) silently breaks once it receives roughly 100-150 values under this host's Python
-3.14.5 -- `paths`/`ignore` still parse, but `jac check` then reports "0 collected" (a clean exit
-0, not an error) regardless of real type errors in the files given. Confirmed via a minimal,
-jac-independent reproduction (bare `argparse.ArgumentParser` with the identical `paths`
-nargs='+' + `--ignore` nargs='*' shape) that this is upstream CPython/argparse behavior, not a
-bug in jac's own CLI registration code (jac/jaclang/cli/impl/registry.impl.jac uses plain
-stdlib argparse). Binary-searched the threshold: 100 values still worked, 120-150 did not.
-.jacignore has 570 non-comment lines, so mirroring ci.yml:415 literally
-(`jac check $FILES --ignore $IGNORE_ARGS --nowarn`) is silently, permanently broken on this host
--- exactly the "gate reports green when it cannot actually tell" failure mode this whole review
-round exists to close, just discovered one command over. Filtering candidate files against the
-ignore list OURSELVES (this function), then calling `jac check <survivors> --nowarn` with NO
---ignore at all, sidesteps the argparse limitation entirely: the diff-scoped file list is always
-small (a PR's own changed files), so filtering it here costs nothing."""
-def path_matches_ignore(file_path: str, patterns: list[str]) -> bool {
-    norm: str = file_path.replace("\\", "/");
-    parts: list[str] = [p for p in norm.split("/") if p];
-    for pattern in patterns {
-        if "/" in pattern {
-            if fnmatch(norm, pattern) or fnmatch(norm, "*/" + pattern) {
-                return True;
-            }
-        } else {
-            for part in parts {
-                if fnmatch(part, pattern) {
-                    return True;
-                }
-            }
-        }
-    }
-    return False;
-}
-
-def filter_survivors(paths: list[str], patterns: list[str]) -> list[str] {
-    return [p for p in paths if p and not path_matches_ignore(p, patterns)];
-}
-
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
@@ -121,18 +50,9 @@ with entry {
         }
     } elif cmd == "hash" and len(args) == 3 {
         print(str(load_config_toml(args[2])["source"]["sha256"]));
-    } elif cmd == "filter-survivors" and len(args) == 3 {
-        patterns: list[str] = load_ignore_patterns(args[2]);
-        candidates: list[str] = [
-            line for line in read_stdin().splitlines() if line.strip()
-        ];
-        for p in filter_survivors(candidates, patterns) {
-            print(p);
-        }
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run cimirror.jac jobs|hash <ci-mirror.toml>");
         eprint("       jac run cimirror.jac cmds <job> <ci-mirror.toml>");
-        eprint("       jac run cimirror.jac filter-survivors <jacignore> < paths.txt");
     }
 }
 
@@ -200,24 +120,12 @@ test "fmt and check both fail loud on a broken merge-base instead of silently sk
     }
 }
 
-test "check does not hand jac check's --ignore hundreds of raw argv tokens" {
+test "check mirrors ci.yml's literal IGNORE_ARGS shape: --ignore present, static globs present" {
     cfg: dict = load_config_toml("config/ci-mirror.toml");
     check: str = job_cmds(cfg, "check")[0];
     assert "jac check" in check;
-    assert "filter-survivors" in check;
-    assert "--ignore" not in check;
-
-    # and filter_survivors itself must actually reproduce path_matches_exclude's semantics
-    patterns: list[str] = ["checker_*.jac", "*_err.jac", "AlertContext.jac", "passes/native/llvm/*"];
-    survivors: list[str] = filter_survivors(
-        [
-            "jac/jaclang/byllm/tool_protocol.jac",
-            "jac/jaclang/byllm/tests/checker_foo.jac",
-            "jac/jaclang/byllm/tests/fixtures/model_pool_err.jac",
-            "jac/some/AlertContext.jac",
-            "jac/jaclang/compiler/passes/native/llvm/binding/dylib.jac",
-        ],
-        patterns
-    );
-    assert survivors == ["jac/jaclang/byllm/tool_protocol.jac"];
+    assert "--ignore" in check;
+    assert "IGNORE_ARGS" in check;
+    assert "checker_*.jac" in check;
+    assert "*_err.jac" in check;
 }

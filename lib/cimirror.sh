@@ -38,9 +38,11 @@ cimirror_fmt_autofix_cmd() {
 # so six gate jobs with a fresh HOME each would cost ~4.5min and ~600MB of throwaway cache EVERY
 # mirror run -- CI itself avoids exactly this cost with its own "Warm up compiler cache" step
 # (ci.yml:326-327) and a HOME it reuses across a job's own steps. Still isolated from the real
-# $HOME (a human's actual jac cache/config is never touched), just not re-paid per job. Lives
-# under logs/, which is already gitignored and already whatever a human does with old log
-# directories -- no separate retention policy invented here.
+# $HOME (a human's actual jac cache/config is never touched), just not re-paid per job. Lives at
+# logs/<date>/mirror-home -- already gitignored, but nothing in this codebase prunes it: each
+# night's ~100MB cache is paid once and then kept forever (code review 2026-07-30, Minor). If that
+# ever needs bounding, it's whatever a human already does with old logs/<date>/ directories; no
+# separate retention policy invented here.
 #
 # Reader failures must never look like success (code review 2026-07-30, Critical): `cimirror_cmds`
 # is materialized into a variable and its exit status AND non-emptiness are both checked before
@@ -91,6 +93,12 @@ cimirror_job() {
 
 # Run every mirrored job in config order, stopping at the first failure.
 # Fail-fast on purpose: a formatting failure makes the ~40min test jobs pointless.
+#
+# $LOG_DIR/mirror-failed-job.txt normally holds a real job NAME (e.g. "fmt", "check") for whatever
+# consumes it (Task 7's verify.sh/status reporting). On a reader failure it instead holds one of
+# two sentinels, "(job-list-read-failure)" or "(empty-job-list)" -- code review 2026-07-30, Minor:
+# no consumer exists yet, but whoever writes one should branch on these two literal strings rather
+# than assume the file always names a real [jobs.*] entry.
 #
 # Same reader-failure-must-not-look-like-success fix as cimirror_job, one level up: the job LIST
 # itself is materialized and checked before the loop, instead of `for job in $(ns_jac cimirror
