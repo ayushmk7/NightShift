@@ -78,6 +78,16 @@ ns_timebox() {
     gtimeout "${min}m" "$@"
 }
 
+# Block until fewer than <max> of THIS shell's background jobs are still running.
+# bash 3.2 (macOS stock, confirmed 3.2.57) has no `wait -n`, so poll instead of blocking on one job.
+# ponytail: 5s poll, not a job-control state machine. Audit sessions run for minutes.
+ns_jobs_wait() {
+    local max=$1
+    while [ "$(jobs -rp | wc -l | tr -d ' ')" -ge "$max" ]; do
+        sleep 5
+    done
+}
+
 ns_remaining_min() {
     local start now elapsed
     start="$(cat "$LOG_DIR/start_epoch")"; now="$(date +%s)"

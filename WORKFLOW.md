@@ -60,9 +60,9 @@ flowchart TD
 
     subgraph S3["S3 · Tier 2 · agentic clean"]
         direction TB
-        ROT["rotate · pick tonight's package · jac / jac-byllm / jac-mcp / jac-scale"]
-        AUDIT["claude -p AUDIT · read-only · dontAsk · ponytail-audit scoped to pkg"]
-        PJSON{"parse_result · valid findings JSON?"}
+        ROT["shards list · 8 LOC-balanced shards of the whole repo · concurrency 2"]
+        AUDIT["per shard · claude -p AUDIT · read-only · dontAsk · ponytail-audit scoped to the shard"]
+        PJSON{"parse_result merge · any shard produced valid findings JSON?"}
         SEL["select.jac · drop ledger-known / protected / twice-failed · score loc*conf/risk · pack <=3 themes <=10 files <=300 LOC · fit clock"]
         APPLY["per theme · fresh branch + fresh claude -p APPLY · acceptEdits · scoped tools · NO push/gh/network · validate_jac before commit"]
         RJSON{"report JSON ok and diff non-empty?"}

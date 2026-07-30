@@ -29,6 +29,12 @@ jac run scripts/selector.jac select config/nightshift.toml /nonexistent /nonexis
     < "$T/f.json" > "$T/s2.json"
 cmp -s "$T/s1.json" "$T/s2.json" || fail "selector output not deterministic"
 
+echo "== 3b. findings merge: dedupe on (file, rule), stable order =="
+cp "$T/f.json" "$T/f2.json"
+jac run scripts/parse_result.jac merge "$T/f.json" "$T/f2.json" > "$T/m.json"
+[ "$(jac run scripts/parse_result.jac len < "$T/m.json")" = "1" ] \
+    || fail "merge failed to dedupe an identical findings array"
+
 echo "== 4. scope gate: protected diff must be rejected =="
 printf '{"package":"pkg","files":["pkg/tests/fixtures/weird.jac"]}' > "$T/theme.json"
 if printf 'M\tpkg/tests/fixtures/weird.jac\n' \

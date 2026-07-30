@@ -192,6 +192,16 @@ test "render then split roundtrips the frontmatter" {
     assert "Consciously deferred" in body;
 }
 
+test "frag returns a jaclang path for core changes and empty for jac-mcp only" {
+    # what `frag <report.json>` computes: the fragment path is a pure function of the report's
+    # files, with kind pinned to "refactor" until per-task fragment kinds exist.
+    core: dict = {"files": ["jac/jaclang/cli/a.jac"], "fragment_kind": "refactor"};
+    assert fragment_path([str(f) for f in as_list(core["files"])], str(core["fragment_kind"]))
+        == "release_notes/unreleased/jaclang/0000.refactor.md";
+    mcp: dict = {"files": ["jac-mcp/server.jac"]};
+    assert fragment_path([str(f) for f in as_list(mcp["files"])], "refactor") == "";
+}
+
 test "render leaves release_note empty when no file touches jac/jaclang/" {
     d: dict = {
         "branch": "nightshift/2026-07-10/dead-code-jac-mcp", "package": "jac-mcp",

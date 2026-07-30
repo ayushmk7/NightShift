@@ -9,7 +9,11 @@ DATASET_DIR="$NS_ROOT/dataset"
 # Dry-runs record nothing: rehearsal nights are sandbox data, same reason backfill skips
 # suffixed log dirs.
 dataset_record_night() {
-    local pkg=$1
+    # The audit is whole-repo (sharded) now, so a night has no single package. "repo" keeps
+    # record-audit's argv arity and its (date, package) idempotency key intact; backfill still
+    # passes a real package for historical nights that had rotation. `local pkg=$1` would abort
+    # under `set -u` here.
+    local pkg="${1:-repo}"
     [ -n "${NS_DRY_RUN:-}" ] && return 0
     [ -f "$LOG_DIR/findings.json" ] || return 0
     mkdir -p "$DATASET_DIR"

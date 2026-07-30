@@ -32,7 +32,7 @@ If a finding turns out to be wrong or too risky, SKIP it and record why in the f
 If you believe you found a real BUG, do NOT fix it — record it in `suspected_bugs`; bug fixes
 need intent and context, not janitorial judgment.
 
-Commit message: `refactor({pkg}): <theme-name> (nightshift)`
+Commit message: `refactor: <theme-name> (nightshift)`
 
 Finish with ONLY a fenced ```json object — no prose after it. Be VERY DETAILED in `summary`: a
 reviewer who has not read the diff should understand exactly what changed, why it's behavior-
