@@ -57,6 +57,35 @@ ns_task_of_branch() {
     return 1
 }
 
+# Which theme file re-gates this branch, for any night, not just tonight.
+#
+# Since tier-1 was retired (2026-07-30) EVERY branch is agent-written, so there is no legitimate
+# theme-less branch and no "-" arm here: verify_branch SKIPS scope containment (lib/verify.sh
+# stage 1) whenever theme is "-", so resolving an absent theme to "-" would re-gate the one class
+# of branch an LLM wrote with the anti-injection check switched off. Absence is fatal, never "-".
+#
+# The reason absence happens at all is that $LOG_DIR is DATE-KEYED, so a later night simply does
+# not look where the theme was written. lib/ship.sh therefore copies each theme to the drafts
+# branch beside its draft .md, and this resolver reads tonight's logs first and there second. That
+# is what retires the `NS_DATE=<night> nightshift.sh promote` workaround lib/promote.sh used to
+# prescribe, and what lets S1.6 re-gate a PR opened on an arbitrary earlier night.
+#
+# `if`, never `[ -f x ] && echo x`: this is called from promote_main, which bin/nightshift.sh
+# invokes BARE with errexit live and no EXIT trap.
+ns_theme_for_branch() {
+    local branch=$1 slug
+    slug="$(basename "$branch")"
+    if [ -f "$LOG_DIR/theme-$slug.json" ]; then
+        echo "$LOG_DIR/theme-$slug.json"
+        return 0
+    fi
+    if [ -f "$DRAFTS/themes/$slug.json" ]; then
+        echo "$DRAFTS/themes/$slug.json"
+        return 0
+    fi
+    ns_die "$EX_BUG" "no theme file for the agent-written branch $branch (looked in $LOG_DIR/theme-$slug.json and $DRAFTS/themes/$slug.json). Re-gating it with theme '-' would skip verify_branch's scope-containment/anti-injection check — refusing. If the theme exists under some other night's logs/<date>/, copy it to $DRAFTS/themes/$slug.json so every later night can find it."
+}
+
 # --- logging & night bookkeeping ---
 ns_log()  { printf '%s [%s] %s\n' "$(date '+%H:%M:%S')" "$1" "$2" | tee -a "$LOG_DIR/run.log" >&2; }
 ns_warn() { ns_log WARN "$1"; echo "$1" >> "$LOG_DIR/warnings.txt"; }

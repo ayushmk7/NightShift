@@ -25,6 +25,7 @@ argv:
   gate   <checks.json> <baseline.json>  exit 0 / 1 / 2 as above
   prs    <prefix>                       stdin: gh pr list --json number,headRefName,url,title
                                         stdout: number<TAB>branch<TAB>url<TAB>title per matching PR
+  row    k=v ...                        stdout: ONE prs.jsonl line (see PR_ROW_KEYS)
 """
 import sys;
 import json;
@@ -154,6 +155,52 @@ def pr_rows(raw: str, prefix: str) -> list[str] {
     return rows;
 }
 
+"""The exact schema of one $LOG_DIR/prs.jsonl line, and which of its keys are numeric.
+
+RECONCILIATION B3: this artifact is JSONL, not TSV, because Plan 4's digest reads prs.jsonl and its
+reader returns [] for a file it cannot parse -- so a wrong shape here renders an EMPTY PR table
+every night, forever, with no error anywhere. That is the "did not run scored as passed" class in
+the one unattended channel this project has.
+
+Which is also why every key is REQUIRED and no unknown key is tolerated: bash composing this by
+hand is exactly how a key gets dropped or misspelled, and the digest cannot tell a missing key from
+a PR that had nothing to say."""
+glob PR_ROW_KEYS: list[str] = ["number", "title", "task", "url", "mirror", "ci", "attempts"];
+glob PR_ROW_INT_KEYS: list[str] = ["number", "attempts"];
+
+"""Project `k=v` argv into one prs.jsonl line. bash never composes JSON (global constraint).
+
+`number` and `attempts` are parsed with int(), which RAISES on anything non-numeric rather than
+defaulting to 0: a silent 0 would render in the digest as a real PR #0 with zero attempts."""
+def pr_json(kvs: list[str]) -> str {
+    row: dict = {};
+    for kv in kvs {
+        if "=" not in kv {
+            raise ValueError("cigate row: '" + kv + "' is not key=value");
+        }
+        parts: list[str] = kv.split("=", 1);
+        row[parts[0]] = parts[1];
+    }
+    missing: list[str] = [k for k in PR_ROW_KEYS if k not in row];
+    if missing {
+        raise ValueError("cigate row: missing required key(s): " + ",".join(missing)
+                         + ". The digest reads all of " + ",".join(PR_ROW_KEYS)
+                         + " and renders nothing for a row it cannot read.");
+    }
+    # str(k), not k: `row` is dict[any] here (it came from argv), so the comprehension is
+    # list[<any>] and `extra: list[str] = ...` fails jac check with E1001.
+    extra: list[str] = [str(k) for k in row.keys() if str(k) not in PR_ROW_KEYS];
+    if extra {
+        raise ValueError("cigate row: unknown key(s): " + ",".join(sorted(extra))
+                         + ". Add it to PR_ROW_KEYS and to Plan 4's digest together, or the value"
+                         + " is written every night and read by nothing.");
+    }
+    for k in PR_ROW_INT_KEYS {
+        row[k] = int(str(row[k]));
+    }
+    return json.dumps(row);
+}
+
 with entry:__main__ {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
@@ -178,11 +225,14 @@ with entry:__main__ {
         for row in pr_rows(read_stdin(), args[2]) {
             print(row);
         }
+    } elif cmd == "row" and len(args) > 2 {
+        print(pr_json(args[2:]));
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run cigate.jac parse|ran <checks.json>");
         eprint("       jac run cigate.jac record <checks.json> <baseline.json>");
         eprint("       jac run cigate.jac gate   <checks.json> <baseline.json>");
         eprint("       jac run cigate.jac prs <branch-prefix>   (gh pr list --json ... on stdin)");
+        eprint("       jac run cigate.jac row number=.. title=.. task=.. url=.. mirror=.. ci=.. attempts=..");
         sys.exit(2);
     }
 }
@@ -328,6 +378,50 @@ test "a truncated capture is refused, not silently under-gated" {
         assert "truncated" in str(e);
     }
     assert caught;
+}
+
+test "a prs.jsonl row is one typed JSON line, and every schema slip raises" {
+    line: str = pr_json(["number=7301", "title=remove dead pipe", "task=dead-code",
+                         "url=https://github.com/jaseci-labs/jac/pull/7301",
+                         "mirror=green", "ci=pending", "attempts=0"]);
+    assert "\n" not in line;                          # JSONL: one object, one line
+    got: dict = parse_obj(line);
+    # number/attempts are INTS, not the strings bash handed over
+    assert got["number"] == 7301 and got["attempts"] == 0;
+    assert got["task"] == "dead-code" and got["ci"] == "pending";
+    # a title carrying a tab or a newline must not break the line discipline
+    multi: str = pr_json(["number=1", "title=a\tb\nc", "task=t", "url=u", "mirror=green",
+                          "ci=pending", "attempts=0"]);
+    assert "\n" not in multi;
+    assert parse_obj(multi)["title"] == "a\tb\nc";
+    # a MISSING key must raise: the digest cannot tell it from a PR that had nothing to say
+    missing: bool = False;
+    try {
+        pr_json(["number=1", "title=t", "task=t", "url=u", "mirror=green", "ci=pending"]);
+    } except ValueError as e {
+        missing = True;
+        assert "attempts" in str(e);
+    }
+    assert missing;
+    # an UNKNOWN key must raise too, or bash writes a field nothing ever reads
+    unknown: bool = False;
+    try {
+        pr_json(["number=1", "title=t", "task=t", "url=u", "mirror=green", "ci=pending",
+                 "attempts=0", "state=open"]);
+    } except ValueError as e {
+        unknown = True;
+        assert "state" in str(e);
+    }
+    assert unknown;
+    # a non-numeric number must RAISE, never default to 0 -- a silent 0 renders as a real PR #0
+    nonnum: bool = False;
+    try {
+        pr_json(["number=-", "title=t", "task=t", "url=u", "mirror=green", "ci=pending",
+                 "attempts=0"]);
+    } except ValueError {
+        nonnum = True;
+    }
+    assert nonnum;
 }
 
 test "prs keeps only nightshift heads and survives a tab in a title" {

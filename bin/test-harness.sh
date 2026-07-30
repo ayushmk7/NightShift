@@ -886,6 +886,142 @@ push_seam "short refspec main" 70 origin "refs/heads/nightshift/a/b:main"
 push_seam "bare main"          70 origin main
 echo "gh seam correct: reads live, writes stubbed, merge/ready/force/main all refused"
 
+echo "== 16. ship path: the PR URL is asserted BEHAVIOURALLY, the fragment rename is kind-agnostic =="
+# RECONCILIATION: the planned version of this section was a source grep for the URL pattern, which
+# an implementation with that pattern in a `case` arm lacking a rejecting `*)` satisfies while
+# still recording an empty URL. So ship_open_pr is DRIVEN, with ns_gh_write stubbed three ways.
+rm -rf .jac
+P="$T/ship"; mkdir -p "$P/drafts"
+cat > "$P/report.json" <<'EOF'
+{"summary": "remove the dead render-path duplication",
+ "files": ["jac/jaclang/cli/pipe.jac"],
+ "risk": "low",
+ "title": "refactor(cli): remove dead render-path duplication",
+ "release_note": "release_notes/unreleased/jaclang/0000.refactor.md",
+ "tests": "mirror fmt ✓; jac test compiler ✓",
+ "loc_before": 40, "loc_after": 3,
+ "branch": "nightshift/2026-07-30/dead-code-pipe",
+ "package": "repo", "date": "2026-07-30"}
+EOF
+jac run scripts/render_draft.jac render "$P/report.json" > "$P/drafts/d.md" \
+    || fail "could not render the probe draft -- section 16 would be vacuous"
+grep -q '^title: ' "$P/drafts/d.md" || fail "the probe draft carries no title; the assertions below would test the wrong arm"
+
+# ship_probe <label> <want-rc> <stub-stdout> <stub-rc>
+# Drives the REAL ship_open_pr. ns_gh_write and ns_renumber_fragment are the only stubs: the first
+# IS the thing whose output must be distrusted, the second would need a git repo (driven for real
+# further down). Nothing here touches GitHub or work/repo.
+ship_probe() {
+    local label=$1 want=$2 out=$3 stub_rc=$4 got=0
+    rm -f "$P/prs.jsonl" "$P/failed.tsv" "$P/renumber.log"
+    (
+        . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/ship.sh"
+        ns_load_config
+        LOG_DIR="$P"; LEDGER="$P/ledger.jsonl"; : > "$LEDGER"
+        ns_gh_write() { printf '%s' "$out"; return "$stub_rc"; }
+        ns_renumber_fragment() { printf '%s\n' "$*" >> "$P/renumber.log"; }
+        ship_open_pr nightshift/2026-07-30/dead-code-pipe "$P/drafts/d.md" dead-code-pipe
+    ) >/dev/null 2>&1 || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "ship_open_pr '$label': expected rc=$want, got rc=$got" ;;
+    esac
+}
+
+# THE case this section exists for: gh exits 0 and prints NOTHING. rc alone says success.
+ship_probe "gh exits 0 printing nothing" 1 "" 0
+grep -q 'no PR URL' "$P/failed.tsv" \
+    || fail "an empty 'gh pr create' result was not recorded as a failure: $(cat "$P/failed.tsv" 2>/dev/null)"
+[ -s "$P/prs.jsonl" ] || fail "a failed PR open wrote no prs.jsonl row at all; the digest would show nothing happened"
+grep -q '"ci": "pr-create-failed"' "$P/prs.jsonl" \
+    || fail "the failed PR open was not marked pr-create-failed in prs.jsonl: $(cat "$P/prs.jsonl")"
+[ -f "$P/renumber.log" ] \
+    && fail "ship_open_pr renumbered the release-note fragment for a PR that was never opened"
+# ...and a non-URL string that is merely NON-EMPTY must be rejected too, or the assertion above is
+# satisfied by any implementation that only checks for the empty string.
+ship_probe "gh prints a warning, not a URL" 1 "Warning: 3 uncommitted changes" 0
+grep -q 'no PR URL' "$P/failed.tsv" || fail "a non-URL stdout was accepted as a PR URL"
+# ...and a URL-shaped result from a NONZERO gh must not be trusted into the ledger either.
+ship_probe "gh fails after printing a URL" 1 "https://github.com/o/r/pull/9" 3
+grep -q 'no PR URL' "$P/failed.tsv" \
+    || fail "a nonzero 'gh pr create' was accepted because its stdout happened to look like a URL"
+
+# POSITIVE CONTROL. Without this, every assertion above is satisfied by a ship_open_pr that always
+# fails.
+ship_probe "gh returns a real URL" 0 "https://github.com/jaseci-labs/jac/pull/7301" 0
+[ -f "$P/failed.tsv" ] && fail "ship_open_pr recorded a failure for a PR that opened cleanly"
+grep -q '"number": 7301' "$P/prs.jsonl" || fail "prs.jsonl lost the PR number: $(cat "$P/prs.jsonl")"
+grep -q '"url": "https://github.com/jaseci-labs/jac/pull/7301"' "$P/prs.jsonl" \
+    || fail "prs.jsonl lost the PR url: $(cat "$P/prs.jsonl")"
+# the task label comes from the BRANCH slug, not from the theme or the draft
+grep -q '"task": "dead-code"' "$P/prs.jsonl" \
+    || fail "prs.jsonl does not carry the branch-derived task; the digest cannot group PRs: $(cat "$P/prs.jsonl")"
+grep -q '"ci": "pending"' "$P/prs.jsonl" \
+    || fail "a freshly opened PR must be recorded ci=pending, never green -- its checks are seconds old"
+[ "$(wc -l < "$P/prs.jsonl" | tr -d ' ')" = "1" ] \
+    || fail "prs.jsonl is not one JSON object per line: $(cat "$P/prs.jsonl")"
+grep -q '^nightshift/2026-07-30/dead-code-pipe 7301 ' "$P/renumber.log" \
+    || fail "ship_open_pr did not hand the PR NUMBER to the fragment rename: $(cat "$P/renumber.log" 2>/dev/null)"
+
+# --- the fragment rename, driven for real against a scratch git repo -----------------------------
+# The literal '0000.refactor.md' is what made the old rename a no-op for four of five kinds. Pin
+# both: that the literal is gone from the rename path, and that a NON-refactor kind really is
+# renamed. The grep alone would pass for an implementation that simply stopped renaming anything.
+# Comments stripped first (same shape as sections 9b and 14): both files explain in prose WHY the
+# literal was wrong, and matching that explanation would fail this check forever.
+for frf in lib/ship.sh lib/promote.sh; do
+    case "$(grep -vE '^[[:space:]]*#' "$frf" | grep -c '0000\.refactor\.md' || true)" in
+        0) : ;;
+        *) fail "a hardcoded 0000.refactor.md is back in $frf's rename path; it silently no-ops for feature/bugfix/breaking/docs" ;;
+    esac
+done
+FR="$T/frag"
+mkdir -p "$FR/release_notes/unreleased/jaclang"
+(
+    cd "$FR" && git init -q . && git config user.email t@t && git config user.name t \
+      && echo base > README && git add -A && git commit -qm base && git branch -M main \
+      && git checkout -qb nightshift/2026-07-30/maintenance-x \
+      && echo "a note" > release_notes/unreleased/jaclang/0000.bugfix.md \
+      && git add -A && git commit -qm frag
+) >/dev/null 2>&1 || fail "could not build the fragment scratch repo -- the rename assertions would be vacuous"
+frag_rc=0
+( . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/ship.sh"
+  LOG_DIR="$T"; REPO="$FR"; NS_DRY_RUN=1; NS_REPO_DEFAULT_BRANCH=main
+  ns_renumber_fragment nightshift/2026-07-30/maintenance-x 4321 \
+      release_notes/unreleased/jaclang/0000.bugfix.md ) >/dev/null 2>&1 || frag_rc=$?
+case "$frag_rc" in
+    0) : ;;
+    *) fail "ns_renumber_fragment exited $frag_rc on a tracked bugfix fragment" ;;
+esac
+[ -f "$FR/release_notes/unreleased/jaclang/4321.bugfix.md" ] \
+    || fail "ns_renumber_fragment did not rename a NON-refactor kind: $(ls "$FR/release_notes/unreleased/jaclang")"
+[ -f "$FR/release_notes/unreleased/jaclang/0000.bugfix.md" ] \
+    && fail "ns_renumber_fragment left the 0000 placeholder behind; upstream's check-release-notes.sh reds the PR"
+( cd "$FR" && git diff --quiet && git diff --cached --quiet ) \
+    || fail "ns_renumber_fragment left the rename uncommitted, so the PR would never carry it"
+# the empty fragment ([tasks.coverage].fragment = "") must be a clean no-op, NOT an error and NOT a
+# rename of the empty path
+empty_rc=0
+( . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/ship.sh"
+  LOG_DIR="$T"; REPO="$FR"; NS_DRY_RUN=1; NS_REPO_DEFAULT_BRANCH=main
+  ns_renumber_fragment nightshift/2026-07-30/coverage-x 99 "" ) >/dev/null 2>&1 || empty_rc=$?
+case "$empty_rc" in
+    0) : ;;
+    *) fail "ns_renumber_fragment exited $empty_rc for the empty fragment the coverage task produces; every coverage PR would report a failure" ;;
+esac
+# a fragment that does not carry the 0000 placeholder is a BUG, not something to rename by guesswork
+bad_rc=0
+( . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/ship.sh"
+  LOG_DIR="$T"; REPO="$FR"; NS_DRY_RUN=1; NS_REPO_DEFAULT_BRANCH=main
+  ns_renumber_fragment nightshift/2026-07-30/maintenance-x 7 \
+      release_notes/unreleased/jaclang/1234.bugfix.md ) >/dev/null 2>&1 || bad_rc=$?
+case "$bad_rc" in
+    70) : ;;
+    *) fail "ns_renumber_fragment answered rc=$bad_rc for a fragment with no 0000 placeholder; it must ns_die (70)" ;;
+esac
+rm -rf .jac
+echo "ship path: an empty/garbled/failed gh result never becomes a shipped PR; the rename is kind-agnostic"
+
 # Sections 17-18 are RESERVED for Plan 3's remaining tasks (S1.6 inventory).
 # docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2 (task registry) and 15-18 to
 # Plan 3 (ship path); all four v2 plans independently claimed "section 11". Plan 4 owns 19-23. The

@@ -70,26 +70,14 @@ promote_main() {
 
     # 3. rename the release-note fragment 0000 → <PR#> (the PR updates itself on push)
     #
-    # LIVE BUG as of Plan 2 Task 5, no longer a latent one. This is the LAST site that hardcodes
-    # the fragment KIND: the `%0000.refactor.md` suffix strip makes the rename a silent no-op for
-    # the other four kinds, so the fragment ships still named 0000 and CI's release-note check
-    # fails the PR. The other two sites are fixed -- render_draft.jac's frag_for_report now takes
-    # the kind, and check_scope.jac allows all five names for an `auto` theme -- and
-    # [tasks.maintenance].fragment = "auto" means something now really does emit a non-refactor
-    # kind, which nothing did when this was written.
-    #
-    # NOT fixed here on purpose: RECONCILIATION.md assigns `ns_renumber_fragment` to Plan 3, whose
-    # version is the superset (shared by ship and promote, handles the empty kind that
-    # [tasks.coverage] produces, and routes the push through ns_git_push so promote is
-    # dry-runnable). Until Plan 3 lands, a maintenance-task PR that reports anything other than
-    # `refactor` will ship an unrenamed fragment.
+    # The hardcoded `%0000.refactor.md` suffix strip that used to live here was a LIVE bug, not a
+    # latent one: it made the rename a silent no-op for the other four kinds, so the fragment
+    # shipped still named 0000 and CI's release-note check failed the PR --
+    # [tasks.maintenance].fragment = "auto" means a non-refactor kind really is emitted now.
+    # ns_renumber_fragment (lib/ship.sh) is kind-agnostic, handles the empty fragment
+    # [tasks.coverage] produces, and pushes through ns_git_push so this path is dry-runnable.
     fragment="$(ns_jac render_draft meta "$draft" | ns_jac parse_result field release_note)"
-    if git -C "$REPO" ls-files --error-unmatch "$fragment" >/dev/null 2>&1; then
-        git -C "$REPO" checkout "$branch"
-        git -C "$REPO" mv "$fragment" "${fragment%0000.refactor.md}$pr_num.refactor.md"
-        git -C "$REPO" commit -m "docs($pkg): release note fragment for #$pr_num"
-        git -C "$REPO" push origin "refs/heads/$branch:refs/heads/$branch"
-    fi
+    ns_renumber_fragment "$branch" "$pr_num" "$fragment"
 
     # 4. ledger → shipped; the draft file disappears = "this PR is opened" (PRD 1)
     ns_jac ledger by-branch "$branch" "$LEDGER" | while IFS= read -r fp; do
