@@ -7,18 +7,27 @@ tier1_main() {
     git checkout -B "$branch" "$NS_REPO_DEFAULT_BRANCH"
 
     rm -rf "$REPO/.jac"                                # `jac clean --cache` prompts [y/N] non-interactively -> aborts
-    # `jac format`/`jac lint` were removed (CLI cleanup #7255); `jac fmt --lintfix` does both in one
-    # pass, respects .jacignore.
+
+    # CI's EXACT tool/flags/exclusion-regex (config/ci-mirror.toml [jobs.fmt]), with `--check`
+    # stripped (tier-1 APPLIES the fix; the mirror VERIFIES it) and the `git ls-files` PATHSPEC
+    # narrowed from the whole repo to jac/jaclang/byllm. `jac format .` / `jac lint --fix` are
+    # NOT the same tool invocation, and a fork PR gets no autofix rescue (ci.yml:303 is
+    # same-repo only), so anything left unformatted in scope becomes a hard CI failure at
+    # ci.yml:342 -- hence deriving from CI's exact command instead of a hand-rolled one.
     #
-    # Scoped to jac/jaclang/byllm, NOT repo-wide (`.`), for reasons found the hard way on the first
-    # real night: a repo-wide pass (a) maps via gated_pkgs_from_diff to the "jac" core package,
-    # triggering its ~95min test suite on EVERY autofix night — the nightly wall-clock budget can't
-    # absorb that; (b) touches hundreds of files already listed in .jacignore for known, pre-existing
-    # type-check gaps, where a blind auto-fix is genuinely risky, not "near-zero risk" as S2 is meant
-    # to be; (c) jac-mcp/ is an empty placeholder (nothing to format) and jac/jaclang/scale has no
-    # test gate yet (needs k8s). byllm is the one subtree with a proven, fast, baseline-diff-gated
-    # test suite (see lib/verify.sh) — same scope tier2's agentic apply already trusts.
-    "$NS_PATHS_JAC_REPO" fmt jac/jaclang/byllm --lintfix || true
+    # NOT the unscoped cimirror_fmt_cmd, though: CI's own fmt CHECK, when it actually runs on a
+    # PR, is scoped by DIFF (changed-jac.txt), not by directory -- ci.yml has no "byllm" scope to
+    # copy. `[jobs.fmt]`'s registered command is CI's PUSH-event branch (whole-repo git ls-files),
+    # which is what the *mirror* should verify against (stricter than a real PR check is a safe
+    # direction to err in). Running that same whole-repo command as tier-1's AUTOFIX would
+    # `--lintfix` all ~260 currently-unformatted files repo-wide every night -- exactly the
+    # "genuinely risky" repo-wide autofix this stage was scoped away from originally: it drags
+    # the ~95min "jac" core test suite into every autofix night via gated_pkgs_from_diff, and
+    # rewrites files with known pre-existing .jacignore type-check gaps. So only the PATHSPEC is
+    # substituted here (byllm/*.jac for *.jac); the tool, flags, and exclusion regex still come
+    # from the one canonical string, so they cannot drift from what the mirror verifies.
+    ( cd "$REPO" && export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH" \
+        && eval "$(cimirror_fmt_cmd | sed "s/ --check//; s#'\\*\\.jac'#'jac/jaclang/byllm/*.jac'#")" ) || true
 
     # Backstop even though the formatter is scoped now: protected paths must never ship edited (PRD 9).
     local protected

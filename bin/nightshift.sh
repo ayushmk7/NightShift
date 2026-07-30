@@ -20,6 +20,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 . "$NS_ROOT/lib/email.sh"
 . "$NS_ROOT/lib/promote.sh"
 . "$NS_ROOT/lib/dataset.sh"
+. "$NS_ROOT/lib/cimirror.sh"
 
 ns_on_exit() {
     local code=$?
