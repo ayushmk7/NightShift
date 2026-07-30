@@ -11,13 +11,15 @@ env:   SMTP_USER, SMTP_PASS (from ~/.nightshift.env; never exported to agent ses
 """
 import sys;
 import os;
+import io;
 import json;
 import time;
 import smtplib;
+import from contextlib { redirect_stderr }
 import from pathlib { Path }
 import from email.mime.text { MIMEText }
 import from email.mime.multipart { MIMEMultipart }
-import from nslib { eprint, read_stdin, parse_obj, as_dict, as_list, as_int, load_config_toml }
+import from nslib { eprint, read_stdin, parse_obj, as_dict, as_list, as_int, load_config_toml, today }
 import from render_draft { split_draft }
 
 """Subject grammar (TPRD S6): Nightshift <date> · <n> ready · −<loc> LOC · <m> failed[ · DISABLED| ERROR S<k>]."""
@@ -93,7 +95,10 @@ def build_message(summary: dict, cfg: dict) -> any {
     email_cfg: dict = as_dict(cfg["email"]);
     msg: any = MIMEMultipart("alternative");
     msg["Subject"] = subject(summary);
-    msg["From"] = str(email_cfg["from"]);
+    # From is the AUTHENTICATED user, never config: Gmail rewrites any other value to exactly
+    # this, so a [email].from knob could only ever be right by accident or wrong by drift.
+    # ponytail: deletion over addition -- the knob is gone from config/nightshift.toml.
+    msg["From"] = str(os.environ.get("SMTP_USER", "nightshift"));
     msg["To"] = str(email_cfg["to"]);
     text: str = plain_body(summary);
     msg.attach(MIMEText(text, "plain"));
@@ -101,19 +106,138 @@ def build_message(summary: dict, cfg: dict) -> any {
     return msg;
 }
 
-def send(summary: dict, cfg: dict) {
+"""Explicit socket timeout. Without one smtplib inherits the global default (None) and a night
+with no network blocks inside connect() until the 8h watchdog kills the process -- meaning the
+EXIT trap that exists to mail the autopsy is itself the thing that hangs. That is not
+hypothetical: 2026-07-15 died at socket.getaddrinfo with `[Errno 8] nodename nor servname
+provided` on a night whose S0 log also says `gh not authenticated`, i.e. the host was offline.
+ponytail: a constant, not a config knob. 30s is longer than any healthy Gmail handshake and
+shorter than every stage budget; nothing has ever wanted a different value. If one day something
+does, it becomes [email].smtp_timeout_sec -- one line, in the file that already holds the port."""
+glob SMTP_TIMEOUT_SEC: int = 30;
+
+"""SMTP verbs whose full line is safe to keep in a saved transcript. Everything else a client
+SENDS is either a base64 credential (the AUTH LOGIN challenge-response carries the password on a
+bare line with no verb on it) or the message payload itself, and neither belongs in a log file."""
+glob SMTP_SAFE_VERBS: list[str] = ["ehlo", "helo", "mail", "rcpt", "data", "quit",
+                                   "rset", "noop", "starttls", "auth"];
+
+"""smtplib prints each sent line through repr(), so the trailing CRLF arrives as the four
+LITERAL characters \\r\\n rather than a newline. Stripping it is what makes `AUTH LOGIN\\r\\n`
+scrub to `AUTH LOGIN ***` instead of `AUTH LOGIN\\R\\N ***`."""
+def smtp_payload(send_line: str) -> str {
+    payload: str = send_line.strip()[5:].strip().lstrip("b").strip("'\"").lower();
+    if payload.endswith("\\r\\n") {
+        payload = payload[:-4];
+    }
+    return payload.strip();
+}
+
+"""smtplib at debuglevel 1 prints every byte it sends, which for a Gmail session includes
+`send: 'AUTH PLAIN <base64 of user\\0user\\0password>'`. That transcript is written to
+$LOG_DIR/smtp-debug.txt and quoted in failure reports, so the credential must be gone before it
+is ever written. ALLOW-LIST, not deny-list: a `send:` line is kept only when its payload starts
+with a known verb, and AUTH additionally loses its argument. Anything unrecognised -- including
+the message body and any future auth mechanism -- becomes `send: ***`. Server `reply:` lines are
+kept whole; the server never echoes the credential back."""
+def scrub_smtp_debug(text: str) -> str {
+    out: list[str] = [];
+    for line in text.splitlines() {
+        stripped: str = line.strip();
+        if not stripped.startswith("send:") {
+            out.append(line);
+            continue;
+        }
+        payload: str = smtp_payload(stripped);
+        words: list[str] = payload.split(" ");
+        verb: str = words[0].strip();
+        if verb == "auth" {
+            # keep the mechanism name, drop its argument: "AUTH PLAIN <secret>" -> "AUTH PLAIN ***"
+            out.append("send: 'AUTH " + words[1].upper() + " ***'" if len(words) > 1
+                       else "send: 'AUTH ***'");
+        } elif verb in SMTP_SAFE_VERBS {
+            out.append(line);
+        } else {
+            out.append("send: ***");
+        }
+    }
+    return "\n".join(out);
+}
+
+"""The POSITIVE assertion that the message was accepted. smtplib.send_message() returns {} both
+when every recipient was accepted and when nothing was actually transmitted, so "no exception
+plus an empty dict" is an assertion that cannot fail -- the exact defect class this plan is
+written against. The server's own 250 reply to the DATA PAYLOAD carries a queue id
+(Gmail: `2.0.0 OK  1753900000 a1sm42 - gsmtp`) that no non-send can manufacture.
+
+Requires the DATA verb to have been sent first: a 250 for RCPT means the envelope was accepted
+and proves nothing about the message."""
+def receipt_from_debug(text: str) -> str {
+    data_sent: bool = False;
+    receipt: str = "";
+    for line in text.splitlines() {
+        stripped: str = line.strip();
+        if stripped.startswith("send:") and smtp_payload(stripped) == "data" {
+            data_sent = True;
+            continue;
+        }
+        if data_sent and stripped.startswith("reply: retcode (250); Msg: ") {
+            msg: str = stripped.split("Msg: ", 1)[1].strip();
+            receipt = msg.lstrip("b").strip("'\"");
+        }
+    }
+    return receipt;
+}
+
+"""Connect, authenticate, transmit, and RETURN THE RECEIPT. Raises on anything else.
+
+set_debuglevel is called after the constructor has already connected, so the TCP/TLS handshake
+itself is not in the transcript -- that failure mode raises with a perfectly clear errno of its
+own (see the 07-15 traceback) and adding a bare SMTP_SSL()+connect() dance to capture it would
+buy nothing. Everything from EHLO onwards, which is where the ambiguous failures live, IS
+captured -- INCLUDING on the raising path, which is the only path anyone will ever want to read
+it on: the except arm emits what was captured before re-raising, so `see smtp-debug.txt` in
+lib/email.sh's failure message points at a protocol transcript and not at a bare traceback."""
+def smtp_send(msg: any, host: str, port: int, user: str, password: str) -> tuple[str, str] {
+    buf: any = io.StringIO();
+    try {
+        with redirect_stderr(buf) {
+            with smtplib.SMTP_SSL(host, port, timeout=SMTP_TIMEOUT_SEC) as server {
+                smtp: any = server;
+                smtp.set_debuglevel(1);
+                smtp.login(user, password);
+                refused: dict = as_dict(smtp.send_message(msg));
+                if refused {
+                    raise ValueError("SMTP refused recipients: " + str(sorted(refused.keys())));
+                }
+            }
+        }
+    } except Exception {
+        eprint(scrub_smtp_debug(str(buf.getvalue())));
+        raise;
+    }
+    transcript: str = scrub_smtp_debug(str(buf.getvalue()));
+    receipt: str = receipt_from_debug(transcript);
+    if not receipt {
+        eprint(transcript);
+        raise ValueError("no 250 acceptance of the DATA payload in the SMTP transcript — "
+                         + "the message was NOT queued, whatever send_message returned");
+    }
+    return (receipt, transcript);
+}
+
+"""Live credential check BEFORE opening a socket: a missing env file is a config error the
+operator can fix in seconds, and it should not look like a network failure (2026-07-12 spent a
+whole night's autopsy on exactly that confusion)."""
+def send(summary: dict, cfg: dict) -> tuple[str, str] {
     email_cfg: dict = as_dict(cfg["email"]);
     user: str | None = os.environ.get("SMTP_USER");
     password: str | None = os.environ.get("SMTP_PASS");
-    if user is None or password is None {
-        raise ValueError("SMTP_USER/SMTP_PASS not set (source ~/.nightshift.env)");
+    if user is None or password is None or user == "" or password == "" {
+        raise ValueError("SMTP_USER/SMTP_PASS not set or empty (source ~/.nightshift.env)");
     }
-    msg: any = build_message(summary, cfg);
-    with smtplib.SMTP_SSL(str(email_cfg["smtp_host"]), as_int(email_cfg["smtp_port"])) as server {
-        smtp: any = server;
-        smtp.login(user, password);
-        smtp.send_message(msg);
-    }
+    return smtp_send(build_message(summary, cfg), str(email_cfg["smtp_host"]),
+                     as_int(email_cfg["smtp_port"]), str(user), str(password));
 }
 
 def read_lines(path: str) -> list[str] {
@@ -211,22 +335,42 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
     };
 }
 
+"""One real send, smallest possible payload, printing the receipt. This is the command that
+answers "does the pipe carry a byte", separately from "does the digest look right"."""
+def doctor(cfg: dict) -> int {
+    probe: dict = {
+        "date": today(), "verdict": "SMTP doctor probe — not a real night.",
+        "branches": [], "failed": [], "suspected_bugs": [], "warnings": [],
+        "runtime_min": 0, "turns": 0, "cost_usd": 0, "error_stage": None,
+    };
+    (receipt, transcript) = send(probe, cfg);
+    eprint(transcript);
+    print(receipt);
+    return 0;
+}
+
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "summarize" and len(args) == 6 {
         print(json.dumps(summarize(args[2], args[3], args[4], load_config_toml(args[5]))));
+    } elif cmd == "doctor" and len(args) == 3 {
+        doctor(load_config_toml(args[2]));
     } elif cmd in ["send", "render"] and len(args) == 3 {
         summary: dict = parse_obj(read_stdin());
         cfg: dict = load_config_toml(args[2]);
         if cmd == "render" {
             print(str(build_message(summary, cfg)));
         } else {
-            send(summary, cfg);
+            (receipt, transcript) = send(summary, cfg);
+            eprint(transcript);
+            print(receipt);
         }
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run sendmail.jac summarize <log_dir> <drafts_dir> <date> <config.toml>");
         eprint("       jac run sendmail.jac send|render <config.toml>   (run-summary JSON on stdin)");
+        eprint("       jac run sendmail.jac doctor <config.toml>        (one live probe send)");
+        sys.exit(2);
     }
 }
 
@@ -269,6 +413,75 @@ test "summarize assembles branches, failures and bugs from disk conventions" {
     assert len(as_list(summary["suspected_bugs"])) == 1;
     assert summary["turns"] == 41;
     assert subject(summary) == "Nightshift 2026-07-10 · 1 ready · +40 -100 · 1 failed";
+}
+
+test "receipt_from_debug returns the 250 acceptance of the DATA payload" {
+    ok: str = "send: 'ehlo [127.0.0.1]\\r\\n'\n"
+        + "reply: b'250-smtp.gmail.com at your service\\r\\n'\n"
+        + "reply: retcode (250); Msg: b'smtp.gmail.com at your service'\n"
+        + "send: 'AUTH PLAIN AGZha2UAc2VjcmV0\\r\\n'\n"
+        + "reply: retcode (235); Msg: b'2.7.0 Accepted'\n"
+        + "send: 'mail FROM:<a@b.c> size=900\\r\\n'\n"
+        + "reply: retcode (250); Msg: b'2.1.0 OK'\n"
+        + "send: 'rcpt TO:<d@e.f>\\r\\n'\n"
+        + "reply: retcode (250); Msg: b'2.1.5 OK'\n"
+        + "send: 'data\\r\\n'\n"
+        + "reply: retcode (354); Msg: b'Go ahead'\n"
+        + "reply: retcode (250); Msg: b'2.0.0 OK  1753900000 a1sm42 - gsmtp'\n";
+    assert receipt_from_debug(ok) == "2.0.0 OK  1753900000 a1sm42 - gsmtp";
+}
+
+test "receipt_from_debug refuses a transcript that never got its payload accepted" {
+    # The server said "go ahead" and the connection then died. send_message would raise here --
+    # but this is also EXACTLY the shape a stubbed/short-circuited send leaves behind, and the
+    # whole point of the receipt is that it cannot be produced without a real acceptance.
+    truncated: str = "send: 'data\\r\\n'\nreply: retcode (354); Msg: b'Go ahead'\n";
+    assert receipt_from_debug(truncated) == "";
+    # A 250 for RCPT is not a receipt: no DATA was ever sent.
+    no_data: str = "send: 'rcpt TO:<d@e.f>\\r\\n'\nreply: retcode (250); Msg: b'2.1.5 OK'\n";
+    assert receipt_from_debug(no_data) == "";
+    assert receipt_from_debug("") == "";
+}
+
+test "scrub_smtp_debug removes every credential payload, keeps the protocol" {
+    # AUTH PLAIN carries base64(user \0 user \0 password) as its ARGUMENT.
+    # AUTH LOGIN carries them as bare base64 lines AFTER a 334 challenge, with no verb at all --
+    # an AUTH-argument-only rule would leak the password on any server that negotiates LOGIN.
+    # The `data` line is present because scrubbing must not destroy the receipt: the transcript
+    # written to $LOG_DIR/smtp-debug.txt is the scrubbed one, and lib/email.sh reads the receipt
+    # out of the SAME text it stores. (The plan's fixture omitted it, so its own last assertion
+    # could never have held.)
+    raw: str = "send: 'AUTH PLAIN AGZha2UAc3VwZXJzZWNyZXQ=\\r\\n'\n"
+        + "send: 'AUTH LOGIN\\r\\n'\n"
+        + "reply: retcode (334); Msg: b'VXNlcm5hbWU6'\n"
+        + "send: 'c3VwZXJzZWNyZXQ=\\r\\n'\n"
+        + "send: 'ehlo [127.0.0.1]\\r\\n'\n"
+        + "send: 'data\\r\\n'\n"
+        + "reply: retcode (354); Msg: b'Go ahead'\n"
+        + "reply: retcode (250); Msg: b'2.0.0 OK  1753900000 a1sm42 - gsmtp'\n";
+    scrubbed: str = scrub_smtp_debug(raw);
+    assert "c3VwZXJzZWNyZXQ=" not in scrubbed;
+    assert "AGZha2UAc3VwZXJzZWNyZXQ=" not in scrubbed;
+    assert "AUTH PLAIN ***" in scrubbed;
+    assert "AUTH LOGIN ***" in scrubbed;
+    assert "send: ***" in scrubbed;
+    # the diagnosable parts survive: verbs, reply codes, and the receipt itself
+    assert "ehlo [127.0.0.1]" in scrubbed;
+    assert "retcode (334)" in scrubbed;
+    assert receipt_from_debug(scrubbed) == "2.0.0 OK  1753900000 a1sm42 - gsmtp";
+}
+
+test "the message body itself is scrubbed, receipt survives" {
+    # smtplib debuglevel 1 prints the whole DATA payload as `send:` lines too. None of it is a
+    # known verb, so all of it collapses to `send: ***` -- the transcript is a PROTOCOL log, not
+    # a copy of the mail.
+    raw: str = "send: 'data\\r\\n'\n"
+        + "reply: retcode (354); Msg: b'Go ahead'\n"
+        + "send: 'Subject: Nightshift 2026-07-30\\r\\nsecret-body-text\\r\\n.\\r\\n'\n"
+        + "reply: retcode (250); Msg: b'2.0.0 OK  1 q1 - gsmtp'\n";
+    scrubbed: str = scrub_smtp_debug(raw);
+    assert "secret-body-text" not in scrubbed;
+    assert receipt_from_debug(scrubbed) == "2.0.0 OK  1 q1 - gsmtp";
 }
 
 test "body inlines drafts and bug reports" {

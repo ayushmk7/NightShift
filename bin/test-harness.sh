@@ -448,4 +448,40 @@ guard_raw "reader failure" 70 70 ""
 rm -rf .jac
 echo "did-not-run guards behave: collected-0 and session-mismatch are fatal, a healthy capture is not"
 
+# Sections 11-18 are RESERVED: docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2
+# (task registry) and 15-18 to Plan 3 (ship path); all four v2 plans independently claimed "section
+# 11". Plan 4 owns 19-23. The gap is deliberate — renumbering later would silently reorder the
+# other two plans' tripwires into someone else's range.
+
+echo "== 19. the digest's transport guards: receipt required, credentials scrubbed =="
+# scripts/sendmail.jac's own tests cover the two pure functions (section 1 runs them). What is NOT
+# covered there is that lib/email.sh actually CONSUMES the receipt rather than the exit code --
+# the exact shape of the bug this task exists to remove. Driven, not grepped for.
+rm -rf .jac
+E="$T/email"; mkdir -p "$E"
+# A stub `ns_jac sendmail send` that exits 0 and prints NOTHING is a send that did not happen.
+(
+    . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/email.sh"
+    LOG_DIR="$E"; NS_DATE=2026-01-02; NS_EMAIL_TO=t@t; NS_EMAIL_SMTP_HOST=h
+    ns_jac() { case "$2" in summarize) echo '{"date":"2026-01-02"}' ;; send) return 0 ;; esac; }
+    osascript() { return 0; }
+    email_main
+) > /dev/null 2>&1
+[ -f "$E/EMAIL_FAILED" ] \
+    || fail "email_main reported success for a send that produced NO receipt -- 'exited 0' is not 'delivered'"
+[ -f "$E/SMTP_RECEIPT" ] && fail "email_main recorded an SMTP_RECEIPT for a send that produced none"
+rm -f "$E/EMAIL_FAILED"
+# ...and a stub that prints a receipt must be believed, and must record it.
+(
+    . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/email.sh"
+    LOG_DIR="$E"; NS_DATE=2026-01-02; NS_EMAIL_TO=t@t; NS_EMAIL_SMTP_HOST=h
+    ns_jac() { case "$2" in summarize) echo '{"date":"2026-01-02"}' ;; send) echo "2.0.0 OK q1 - gsmtp" ;; esac; }
+    email_main
+) > /dev/null 2>&1
+[ -f "$E/SMTP_RECEIPT" ] || fail "email_main did not record the server receipt it was handed"
+grep -q "2.0.0 OK q1 - gsmtp" "$E/SMTP_RECEIPT" \
+    || fail "SMTP_RECEIPT does not contain the receipt the server issued"
+[ -f "$E/EMAIL_FAILED" ] && fail "email_main flagged a receipted send as failed"
+echo "transport guards behave: no receipt means not delivered"
+
 echo "ALL HARNESS TESTS PASSED"

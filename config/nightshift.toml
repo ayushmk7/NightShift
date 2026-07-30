@@ -74,7 +74,9 @@ globs = [
 
 [email]
 to        = "contactayushmadhav@gmail.com"
-from      = "nightshift@localhost"
+# `from` deleted 2026-07-30: Gmail rewrites any From that is not the authenticated user, so
+# sendmail.jac uses $SMTP_USER directly. A knob that can only ever hold one correct value is
+# not a knob.
 smtp_host = "smtp.gmail.com"
 smtp_port = 465                              # SSL; creds live in ~/.nightshift.env, never here
 

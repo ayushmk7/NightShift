@@ -108,6 +108,7 @@ usage: nightshift.sh run                        # the nightly pipeline (launchd 
        nightshift.sh status                     # last run summary + ledger tallies
        nightshift.sh baseline                   # record the test baseline on main (slow; M0)
        nightshift.sh mirror [branch]            # run the whole CI mirror against a branch (slow)
+       nightshift.sh smtp-doctor                # one live probe email; prints the server receipt
        nightshift.sh dataset-backfill           # rebuild dataset/*.jsonl from past real nights
 EOF
     exit 2
@@ -174,6 +175,17 @@ case "$cmd" in
                     echo "mirror: rc=$rc but no failing job was recorded — see $LOG_DIR/mirror-manual.txt" >&2
                 fi
                 tail -40 "$LOG_DIR/mirror-manual.txt"
+                exit "$rc" ;;
+    # "Does the pipe carry a byte", asked separately from "does the digest look right". Prints the
+    # server's own 250 acceptance of the DATA payload; exit 0 is only reachable WITH one.
+    smtp-doctor) mkdir -p "$LOG_DIR"; ns_load_env
+                # Deliberately NOT gated on NS_DRY_RUN: this command exists to send for real.
+                rc=0; ns_jac sendmail doctor "$CONFIG" > "$LOG_DIR/SMTP_RECEIPT" 2> "$LOG_DIR/smtp-debug.txt" || rc=$?
+                case "$rc" in
+                    0) echo "receipt: $(cat "$LOG_DIR/SMTP_RECEIPT")" ;;
+                    *) echo "smtp-doctor FAILED (rc=$rc); scrubbed transcript:" >&2
+                       tail -30 "$LOG_DIR/smtp-debug.txt" >&2 ;;
+                esac
                 exit "$rc" ;;
     dataset-backfill) mkdir -p "$LOG_DIR"; dataset_backfill ;;
     *)          usage ;;
