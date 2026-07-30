@@ -10,8 +10,21 @@ rm -rf .jac
 for f in scripts/*.jac; do
     jac check "$f" >/dev/null 2>&1 || fail "jac check $f"
 done
-for f in nslib config ledger check_scope parse_result selector render_draft sendmail testgate checkgate dataset shards fragcheck cimirror; do
-    jac test "scripts/$f.jac" >/dev/null 2>&1 || fail "jac test $f"
+# DERIVED from scripts/*.jac, never hand-listed. The old hand-maintained list was the project's own
+# "did not run scored as passed" defect wearing a different hat: a new helper got `jac check`ed by
+# the loop above, was simply absent from the list below, and its `test` blocks never ran -- with the
+# harness still printing ALL TESTS PASSED. Four new helpers arrive across Plans 2-5.
+#
+# `Ran 0 tests` is a FAILURE here, not a pass. `jac test` on a file with no test blocks prints
+# "NO TESTS RAN" and exits 0 (measured), so trusting its exit code alone would re-open the same hole
+# from the other side: a helper whose tests were deleted, or never written, would sail through.
+# This project's rule is that non-trivial logic leaves one runnable check behind; this enforces it.
+for f in scripts/*.jac; do
+    out="$(jac test "$f" 2>&1)" || fail "jac test $f"
+    case "$out" in
+        *"NO TESTS RAN"*|*"Ran 0 tests"*)
+            fail "$f has no test blocks -- every scripts/*.jac must leave at least one runnable check behind (jac test exits 0 on an empty file, so this is checked on the output, not the status)" ;;
+    esac
 done
 rm -rf .jac
 

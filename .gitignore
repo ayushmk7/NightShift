@@ -8,3 +8,5 @@ state/
 # vestigial pytest cache + built paper artifact
 .pytest_cache/
 *.pdf
+# subagent scratch reports (implementation notes, not part of the harness)
+.superpowers/
