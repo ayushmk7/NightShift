@@ -9,6 +9,15 @@
 CI_MIRROR_CONFIG="$NS_ROOT/config/ci-mirror.toml"
 EX_MIRROR_READ=70   # matches lib/common.sh's EX_BUG: the harness's own reader is broken, not the
                      # candidate branch -- must never look like a clean pass or a clean skip.
+EX_MIRROR_SETUP=71  # a job's non-test SETUP command failed (e.g. [jobs.byllm]'s `jac install`).
+                     # Same "the harness is broken, not the branch" class as EX_MIRROR_READ, and
+                     # kept distinct only so the operator gets a message naming the real cause.
+
+# The command that produced cimirror_job's first_rc, or "" when the job was green. Lets a caller
+# tell a SETUP command's failure (night-wide: the install failed, so every branch touching this
+# suite is about to look broken) from a TEST command's failure (expected -- baseline failures are
+# normal, and testgate.jac decides on NEW failures only). Set on every cimirror_job call.
+CIMIRROR_FAILED_CMD=""
 
 # Print the commands of one [jobs.<name>] table, one per line.
 cimirror_cmds() {
@@ -55,6 +64,7 @@ cimirror_fmt_autofix_cmd() {
 # process substitution means there is no subshell losing an exit code in the first place.
 cimirror_job() {
     local job=$1 out=$2 cmd rc=0 first_rc=0 H cmds read_rc=0
+    CIMIRROR_FAILED_CMD=""
     H="$LOG_DIR/mirror-home"
     mkdir -p "$H"
     ns_log MIRROR "job $job"
@@ -84,6 +94,12 @@ cimirror_job() {
             && eval "$cmd" ) >> "$out" 2>&1 || rc=$?
         if [ "$rc" -ne 0 ] && [ "$first_rc" -eq 0 ]; then
             first_rc=$rc
+            # Recorded, not just logged: "which command failed" is the difference between an
+            # expected baseline test failure and a broken setup step, and only the caller knows
+            # which of those matters to it. The `while` loop runs in THIS shell (here-string, not a
+            # pipe), so this assignment survives the loop -- the eval subshell above cannot set it,
+            # which is exactly why it is set out here.
+            CIMIRROR_FAILED_CMD="$cmd"
             ns_log MIRROR "job $job: command failed (rc=$rc): $cmd"
         fi
         rc=0

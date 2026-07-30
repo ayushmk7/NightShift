@@ -41,9 +41,24 @@ suite_test_raw() {
     # is itself a nonzero return, which aborts an errexit caller (e.g. baseline_main) on the
     # SUCCESS path. Project rule; this file's callers include one that runs with errexit live.
     case "$rc" in
+        0)                 return 0 ;;
         "$EX_MIRROR_READ") return "$EX_MIRROR_READ" ;;
     esac
-    return 0
+    # Some command in the job failed. "Ignore the runner's exit code" means ignore a TEST command's
+    # -- baseline failures are expected and testgate.jac decides on NEW failures only. It does NOT
+    # mean ignore a SETUP command's. [jobs.byllm] leads with ci.yml's `jac install --global`, and a
+    # failed or skipped install (offline night, upstream index outage) is night-wide by
+    # construction: every byllm branch then collects 105 instead of 219 and reds IDENTICALLY on the
+    # collection floor, incrementing attempts each time. Two such nights auto-reject every byllm
+    # finding in the ledger -- and byllm is the directory [jobs.fmt_autofix] rewrites unattended
+    # every night. So a setup failure is harness-fatal, exactly like a reader failure, and is the
+    # counterexample to treating "the suite ran and under-collected" as always branch-attributable.
+    # An empty CIMIRROR_FAILED_CMD alongside a nonzero rc should be impossible; treat it as fatal
+    # too rather than guessing (fail closed).
+    case "$CIMIRROR_FAILED_CMD" in
+        *"jac test"*) return 0 ;;
+    esac
+    return "$EX_MIRROR_SETUP"
 }
 
 # Map changed paths to the mirrored TEST suites that cover them, and emit the unique set.
@@ -109,13 +124,25 @@ gated_suites_from_diff() {
 # how [jobs.compiler]'s cross-backend equivalence half (the suite this whole task exists to start
 # gating) could silently not run while a plausible-looking baseline was written from the other half.
 assert_suite_ran() {
-    local suite=$1 raw=$2 rc=$3 where=$4 sessions want
+    local suite=$1 raw=$2 rc=$3 where=$4 sessions want collected sub_rc=0
     case "$rc" in
         0) : ;;
-        *) ns_die "$EX_BUG" "$where $suite: cimirror could not read [jobs.$suite] from config/ci-mirror.toml (rc=$rc) -- the gate is broken, not the branch." ;;
+        "$EX_MIRROR_READ")
+            ns_die "$EX_BUG" "$where $suite: cimirror could not read [jobs.$suite] from config/ci-mirror.toml (rc=$rc) -- the gate is broken, not the branch." ;;
+        "$EX_MIRROR_SETUP")
+            ns_die "$EX_BUG" "$where $suite: a SETUP command in [jobs.$suite] failed, so the suite ran in a broken environment: $CIMIRROR_FAILED_CMD -- this is night-wide, not this branch's fault; fix the environment rather than letting every branch red on the collection floor." ;;
+        *)  ns_die "$EX_BUG" "$where $suite: suite_test_raw returned an unexpected rc=$rc -- refusing to interpret the capture." ;;
     esac
-    sessions="$(ns_jac testgate sessions "$raw")"
-    want="$(ns_jac cimirror testcmds "$suite" "$CI_MIRROR_CONFIG")"
+    # `|| sub_rc=$?` on every substitution: baseline_main runs with errexit LIVE, where a bare
+    # `x="$(cmd)"` that fails exits the shell instantly with no [FATAL] line -- safe direction, but
+    # the autopsy email then loses the reason. Same rule this file states for baseline_main.
+    sessions="$(ns_jac testgate sessions "$raw")" || sub_rc=$?
+    want="$(ns_jac cimirror testcmds "$suite" "$CI_MIRROR_CONFIG")" || sub_rc=$?
+    collected="$(ns_jac testgate collected "$raw")" || sub_rc=$?
+    case "$sub_rc" in
+        0) : ;;
+        *) ns_die "$EX_BUG" "$where $suite: could not read back the capture's own counters (rc=$sub_rc) -- see $(basename "$raw")." ;;
+    esac
     # Numeric-validate BOTH sides before comparing. Matching only the literal string `0` was a real
     # hole (code review, Minor): the cold-cache "Setting up Jac for first use..." banner that
     # lib/cimirror.sh's own header documents can land on stdout, and a non-numeric session count
@@ -130,6 +157,32 @@ assert_suite_ran() {
         "$want") : ;;
         *) ns_die "$EX_BUG" "$where $suite: expected $want test-runner session(s), one per test command in [jobs.$suite], but $(basename "$raw") has $sessions. Refusing to score a suite that did not run as a pass -- check that job's command paths and cwd in config/ci-mirror.toml." ;;
     esac
+    # A session banner is not proof the run COLLECTED anything: a collection-error run prints
+    # `collected 0 items / 1 error` under a perfectly normal banner. Left unchecked on the baseline
+    # path that writes `collected: 0`, and collection_check answers 2 ("cannot gate") for a zero
+    # count -- silently and permanently disabling the very backstop it belongs to. Verified: with
+    # `"collected": 0` recorded, a branch collecting 3 of 200 went GREEN and published
+    # "tests (no new failures vs baseline) ✓". Enforced HERE rather than in baseline_main so it
+    # also covers the branch path, where a run that collects nothing is equally meaningless.
+    case "$collected" in
+        ''|*[!0-9]*|0) ns_die "$EX_BUG" "$where $suite: the runner started but collected $collected tests (see $(basename "$raw")). A baseline recorded from this could never gate anything, and a branch run this empty cannot be read as passing." ;;
+    esac
+}
+
+# Assert `jac check` actually ran before its (empty) output is read as "clean". Sibling of
+# assert_suite_ran, for the type-check stage; see the call sites for the full reasoning. A broken
+# checker is a harness problem, night-wide and not this branch's fault, so it aborts rather than
+# reding -- same judgement as a cimirror reader failure.
+assert_check_ran() {
+    local branch=$1 raw=$2 side=$3 ran sub_rc=0
+    ran="$(ns_jac checkgate ran "$raw")" || sub_rc=$?
+    case "$sub_rc" in
+        0) : ;;
+        *) ns_die "$EX_BUG" "jac check ($side side, $branch): could not read back the capture's run count (rc=$sub_rc) -- see $(basename "$raw")." ;;
+    esac
+    case "$ran" in
+        ''|*[!0-9]*|0) ns_die "$EX_BUG" "jac check ($side side, $branch): the checker never ran -- $(basename "$raw") has no run summary (got '$ran'). Refusing to read an empty capture as a clean type-check; check \$NS_PATHS_JAC_REPO." ;;
+    esac
 }
 
 # Record the per-suite baseline of already-failing tests on main, as the UNION of TWO runs so a
@@ -142,7 +195,7 @@ assert_suite_ran() {
 baseline_main() {
     mkdir -p "$BASELINE_DIR"
     cd "$REPO"; git checkout "$NS_REPO_DEFAULT_BRANCH"
-    local suite raw1 raw2 n rc
+    local suite raw1 raw2 n rc ncoll
     for suite in compiler runtime byllm; do
         raw1="$LOG_DIR/baseline-raw-$suite-1.txt"
         raw2="$LOG_DIR/baseline-raw-$suite-2.txt"
@@ -152,8 +205,14 @@ baseline_main() {
         ns_log BASELINE "recording $suite, run 2 of 2 (slow)..."
         rc=0; suite_test_raw "$suite" "$raw2" || rc=$?
         assert_suite_ran "$suite" "$raw2" "$rc" baseline
-        n="$(ns_jac testgate record-union "$suite" "$raw1" "$raw2" "$BASELINE_DIR")"
-        ns_log BASELINE "$suite: $n known-failing tests recorded (union of 2 runs), $(ns_jac testgate collected "$raw1") tests collected"
+        rc=0
+        n="$(ns_jac testgate record-union "$suite" "$raw1" "$raw2" "$BASELINE_DIR")" || rc=$?
+        ncoll="$(ns_jac testgate collected "$raw1")" || rc=$?
+        case "$rc" in
+            0) : ;;
+            *) ns_die "$EX_BUG" "baseline $suite: failed to record the baseline (rc=$rc) -- state/test-baseline/$suite.json may be missing or partial." ;;
+        esac
+        ns_log BASELINE "$suite: $n known-failing tests recorded (union of 2 runs), $ncoll tests collected"
     done
 }
 
@@ -236,6 +295,17 @@ verify_branch() {
         else
             : > "$mr"
         fi
+        # Same did-not-run hole as the test gate, on this stage. Both `jac check` invocations above
+        # end in `|| true` -- legitimately, since the checker exits 1 whenever the file has any
+        # error -- which discards the difference between "ran, exit 1, found errors" and "never
+        # ran at all" (missing/unexecutable $NS_PATHS_JAC_REPO, an exec arg-list blowup, a crash).
+        # checkgate's identities() returns empty for both, gate() then finds no NEW identity,
+        # returns 0, and this function publishes "jac check ✓". Measured: a real run always prints
+        # an `N passed|failed in Xs` summary, a missing binary exits 127 and prints none.
+        # The main side is asserted only when it actually ran: `$mr` is deliberately left EMPTY
+        # when no changed file exists on main (every branch error is then correctly new).
+        assert_check_ran "$branch" "$br" "branch"
+        case "$main_jac" in "") : ;; *) assert_check_ran "$branch" "$mr" "main" ;; esac
         if ! ns_jac checkgate gate "$mr" "$br"; then
             verify_red "$branch" "jac check: new type errors vs main (see $(basename "$br"))"
             return 1
@@ -315,9 +385,26 @@ verify_branch() {
         # IS branch-attributable -- a broken import in a changed file drops its whole test module
         # out of collection -- so it reds the branch rather than aborting the night.
         ns_jac testgate collection-check "$suite" "$raw" "$BASELINE_DIR"; rc=$?
+        # rc=2 means the baseline carries no usable collected count, so the floor cannot be
+        # enforced for this suite. assert_suite_ran now refuses to WRITE such a baseline, so this
+        # should only ever be a pre-`collected` legacy file -- but say so out loud rather than
+        # letting a silently-unenforced backstop look identical to a passing one.
+        case "$rc" in
+            2) ns_warn "$suite: baseline records no collected count — the collection floor is NOT enforced for this suite; re-run nightshift.sh baseline" ;;
+        esac
         if [ "$rc" -eq 1 ]; then
-            verify_red "$branch" "$suite: collected far fewer tests than the baseline — the suite did not run to completion, so its unreached tests cannot be read as passing (check the branch for an import error, or the environment for missing suite dependencies; see $(basename "$raw"))"
-            return 1
+            # Same single retry the failure gate gets: collection can dip on a genuinely flaky
+            # run (a worker dying takes its share of the items with it), and burning the branch's
+            # attempt counter on one bad sample would be the same over-reaction the flake guard
+            # exists to prevent.
+            ns_log S4 "$suite: under-collected on run 1 — retrying once (flaky-collection guard)"
+            srr=0; suite_test_raw "$suite" "$raw" || srr=$?
+            assert_suite_ran "$suite" "$raw" "$srr" "collection retry"
+            ns_jac testgate collection-check "$suite" "$raw" "$BASELINE_DIR"; rc=$?
+            if [ "$rc" -eq 1 ]; then
+                verify_red "$branch" "$suite: collected far fewer tests than the baseline on 2 runs — the suite did not run to completion, so its unreached tests cannot be read as passing (check the branch for an import error, or the environment for missing suite dependencies; see $(basename "$raw"))"
+                return 1
+            fi
         fi
         gated="$gated $suite"
     done

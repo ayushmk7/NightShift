@@ -107,7 +107,13 @@ mkdir -p "$R"
       && echo x > README && git add -A && git commit -qm base && git branch -M main
 ) >/dev/null 2>&1 || fail "could not build the routing scratch repo"
 
-route_probe() {        # route_probe <branch> <path>... -> prints the suites, one per line
+# route_probe <branch> <path>... -> prints the suites, one per line. Every caller MUST capture the
+# status separately from the output: `got="$(route_probe … | tr …)"` loses the return through the
+# pipe, and the last assertion below EXPECTS the empty string -- so a scratch repo that failed to
+# build would have made "mcp/fragment-only must gate nothing" pass vacuously. That is the same
+# discarded-reader bug this file's section exists to guard against, inside the guard itself
+# (code review 2026-07-30). Hence probe(): run, check, THEN compare.
+route_probe() {
     local br=$1; shift
     (
         cd "$R" && git checkout -q main && git checkout -qb "$br" \
@@ -117,31 +123,43 @@ route_probe() {        # route_probe <branch> <path>... -> prints the suites, on
     ( . "$NS_ROOT/lib/verify.sh"; REPO="$R"; NS_REPO_DEFAULT_BRANCH=main; gated_suites_from_diff )
 }
 
+probe() {              # probe <label> <branch> <path>... -> sets $got, fails loudly on any error
+    local label=$1; shift
+    local raw probe_rc=0
+    raw="$(route_probe "$@")" || probe_rc=$?
+    case "$probe_rc" in
+        0) : ;;
+        *) fail "routing probe '$label' could not run (rc=$probe_rc) -- the assertion below would have been vacuous" ;;
+    esac
+    got="$(printf '%s' "$raw" | tr '\n' ' ')"
+}
+
 # every routed class at once: compiler src, compiler tests, byllm, runtime, and the two no-gate ones
-got="$(route_probe all jac/jaclang/compiler/x.jac jac/tests/compiler/t.jac jac/jaclang/byllm/b.jac \
-                       jac/jaclang/runtimelib/y.jac jac-mcp/z.jac \
-                       release_notes/unreleased/jaclang/1.refactor.md | tr '\n' ' ')"
+probe "all classes" all jac/jaclang/compiler/x.jac jac/tests/compiler/t.jac jac/jaclang/byllm/b.jac \
+                        jac/jaclang/runtimelib/y.jac jac-mcp/z.jac \
+                        release_notes/unreleased/jaclang/1.refactor.md
 case "$got" in
-    "byllm compiler runtime ") : ;;
-    *) fail "routing drifted: expected 'byllm compiler runtime ', got '$got'" ;;
+    "byllm compiler runtime") : ;;
+    *) fail "routing drifted: expected 'byllm compiler runtime', got '$got'" ;;
 esac
 
 # THE load-bearing case: a byllm-only change must gate byllm and NOT fall through to jac/* -> runtime
-got="$(route_probe byllmonly jac/jaclang/byllm/only.jac | tr '\n' ' ')"
+probe "byllm-only" byllmonly jac/jaclang/byllm/only.jac
 case "$got" in
-    "byllm ") : ;;
+    "byllm") : ;;
     *) fail "byllm-only change mis-routed to '$got' -- the jac/* catch-all is winning again" ;;
 esac
 
 # compiler tests must reach the suite that actually collects them, not runtime (which --ignores them)
-got="$(route_probe comptests jac/tests/compiler/only.jac | tr '\n' ' ')"
+probe "compiler-tests" comptests jac/tests/compiler/only.jac
 case "$got" in
-    "compiler ") : ;;
+    "compiler") : ;;
     *) fail "jac/tests/compiler routed to '$got' -- runtime --ignores exactly those tests" ;;
 esac
 
-# an mcp-only or fragment-only change must gate NO suite at all
-got="$(route_probe nogate jac-mcp/z.jac release_notes/unreleased/jaclang/2.docs.md | tr '\n' ' ')"
+# an mcp-only or fragment-only change must gate NO suite at all. This is the assertion whose
+# expected value IS the empty string, so probe()'s status check above is what keeps it honest.
+probe "mcp+fragment" nogate jac-mcp/z.jac release_notes/unreleased/jaclang/2.docs.md
 case "$got" in
     "") : ;;
     *) fail "mcp/fragment-only change should gate no suite, got '$got'" ;;

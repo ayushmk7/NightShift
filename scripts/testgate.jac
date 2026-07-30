@@ -42,11 +42,44 @@ unreached tests all score as "not failing", i.e. green. Both of the false-greens
 to defend against were of that family, so the gate now positively asserts the branch ran about as
 much as the baseline did instead of only checking what failed.
 
-0.75 is deliberately loose, because DELETING tests is a legitimate and common Nightshift outcome
-(vestigial-test sweeps are its bread and butter). The budget caps a theme at 10 files / 600 LOC
-(config/nightshift.toml [budgets]), so even a maximal sweep against the smallest suite -- 10 of
-byllm's 76 test files -- is ~13%, comfortably inside the margin. The failure modes this exists to
-catch lose far more: the measured byllm dependency hole dropped collection 219 -> 105 (-52%)."""
+0.75 is deliberately loose, because DELETING tests is a legitimate and common Nightshift outcome --
+vestigial-test sweeps are its bread and butter, and they legitimately shrink collection.
+
+The margin needs care, and an earlier version of this comment justified it with two claims that are
+both FALSE (corrected after review, 2026-07-30; the NUMBER survived the correction, the reasoning
+did not):
+  - "[budgets] caps a theme at 10 files, so a sweep is bounded." It does not. selector.jac:172
+    applies files_per_theme/loc_per_theme to FINDINGS only; vestigial_test_files is called at :199,
+    AFTER packing, and its result is appended to the theme with no budget check at all.
+  - "10 of byllm's 76 test files is ~13%." byllm has TEN test-bearing files; the other 66 are
+    fixtures/. Ten files IS the whole suite. And the item distribution is severely skewed --
+    measured 100 / 42 / 29 / 14 / 13 / 13 / 11 / 5 / 5 / 1, so test_byllm.jac ALONE is 100 of 219
+    items (46%), which on its own would blow through any floor above 0.55.
+
+The real ceiling is incidental, which is the thing to keep an eye on: is_vestigial's import
+allowlist (selector.jac:24-30) fails closed on any import that is neither stdlib-ish nor one of the
+theme's own file stems. Measured against byllm's ten files, that permanently disqualifies seven of
+them on imports no theme can ever delete (io, shutil, uuid, ast, contextlib, contextvars, jaclang,
+fixtures, enum_with_semstr). Only validate_schema (13 items), test_multimodal_tool_results (5) and
+test_truncated_tool_calls (1) can qualify today = 19 items = 8.7% of the suite. So the live margin
+is 8.7% against a 25% floor -- comfortable, but held up by an unrelated function's tuning rather
+than by anything structural. Adding io/shutil/uuid/contextlib/ast to that allowlist, a small and
+entirely benign-looking change, makes test_byllm.jac (46%) eligible and would turn one legitimate
+theme into two reds and a permanent failed_verify auto-reject.
+
+UPGRADE PATH when that margin gets uncomfortable: stop guessing and subtract. verify_branch already
+has the theme, and check_scope.jac:27 already reads its vestigial_deletions, so the deleted test
+files are known by name -- count the `test ` declarations in each one's MAIN-branch content, add
+that to `got`, and keep 0.75 as the residual backstop for everything else. Not done yet because
+today's 8.7% worst case does not need it, and the plumbing is not free.
+
+The other two suites are not exposed: compiler collects 2792 items and runtime ~1852, so no
+single-file deletion moves them measurably. The failure modes this exists to catch lose far more
+than any of this: the measured byllm dependency hole dropped collection 219 -> 105 (-52%).
+
+NOTE, deliberately not handled: there is no absolute floor, only a proportional one. Harmless today
+(the smallest baseline is 219 items) but a future suite of, say, 12 tests would red on a 3-item
+loss. Add a minimum-items clause if such a suite is ever registered."""
 glob COLLECTION_FLOOR: float = 0.75;
 
 def failing_ids(raw: str) -> list[str] {
