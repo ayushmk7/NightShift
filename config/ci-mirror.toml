@@ -34,9 +34,8 @@ ci_job = "jac-check"
 # `_syntax_err.jac` filename also ends in `_err.jac`, so `_err\.jac$` alone matches it too. Preserves
 # CI's exact "no formattable files changed -> skip cleanly, exit 0" behavior (ci.yml:333-343),
 # collapsed into one check since an empty diff and an all-excluded diff both reduce to the same
-# empty $FILES here. See [jobs.fmt_autofix] just below: SAME tool/flags/exclusion-regex, only the
-# path SELECTION differs (diff-scoped here vs. tier-1's own jac/jaclang/byllm scope there) --
-# bin/test-harness.sh's drift guard asserts the two regexes stay byte-identical.
+# empty $FILES here. This is now the ONLY fmt entry: tier-1's apply counterpart was retired with the
+# stage, so nothing here can rewrite the branch it is judging (pinned by test-harness.sh section 6).
 #
 # CORRECTED AGAIN 2026-07-30 (code review): `BASE="$(git merge-base ...)" | ... || true` used to
 # wrap the WHOLE pipeline, INCLUDING the merge-base computation, in one `|| true`. That made a
@@ -92,24 +91,11 @@ commands = [
   '''BASE="$(git merge-base "$NS_REPO_DEFAULT_BRANCH" HEAD 2>&1)" || { echo "ERROR: could not compute merge-base for jac check scoping: $BASE" >&2; exit 70; }; FILES="$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD -- '*.jac')"; if [ -z "$FILES" ]; then echo "No .jac files changed; skipping jac check."; else IGNORE_ARGS="tests checker_*.jac *_err.jac $(grep -v '^#' .jacignore | grep -v '^[[:space:]]*$' | tr '\n' ' ')"; jac check $FILES --ignore $IGNORE_ARGS --nowarn; fi''',
 ]
 
-[jobs.fmt_autofix]
-# NOT a ci.yml job -- there is no upstream CI step this mirrors. This is tier-1's OWN apply step
-# (lib/tier1.sh S2): the nightly "clean up drift, near-zero risk" autofix, deliberately scoped to
-# jac/jaclang/byllm rather than the whole repo (repo-wide `--lintfix` would touch ~260 files
-# nightly, drag the ~95min "jac" core test suite into every autofix night via
-# gated_suites_from_diff (renamed from gated_pkgs_from_diff in Task 6), and rewrite files with
-# known pre-existing .jacignore type-check gaps --
-# see lib/tier1.sh's own comment). [jobs.fmt] and this entry MUST use the identical tool, flags
-# (minus --check -- tier-1 APPLIES the fix, [jobs.fmt] only VERIFIES it), and exclusion regex;
-# only the path SELECTION (git-ls-files pathspec here vs. git-diff-scoped there) differs. Kept as
-# its own registry entry, not derived from [jobs.fmt] by string surgery: once [jobs.fmt] became
-# diff-scoped it no longer contains a `git ls-files '*.jac'` pathspec to substitute, so a `sed`
-# derivation has nothing to anchor on. bin/test-harness.sh's drift guard is the no-drift
-# replacement for that substitution.
-ci_job = "none -- tier-1's own apply step, not a ci.yml job"
-commands = [
-  "git ls-files -z 'jac/jaclang/byllm/*.jac' | grep -zv -E '(/fixtures/|^scripts/|/passes/native/llvm/|_err\\.jac$)' | xargs -0 --no-run-if-empty jac fmt --lintfix",
-]
+# [jobs.fmt_autofix] was deleted 2026-07-30 with tier-1 (the S2 deterministic autofix stage). It was
+# the only APPLY entry in this file -- everything here now VERIFIES and never mutates the tree, which
+# is why bin/test-harness.sh can assert that no gate job carries `jac fmt --lintfix` without --check.
+# Formatting is now each theme's own responsibility: the apply session has Bash(jac fmt *) and
+# [jobs.fmt] gates the result diff-scoped, exactly as CI does on a PR.
 
 [jobs.jir]
 ci_job = "jac-check"
@@ -145,9 +131,8 @@ ci_job = "test-packages-and-docs"
 # ids, never an error.
 #
 # Why this could not be deferred as "registry breadth": gated_suites_from_diff routes a byllm
-# change to the byllm suite ONLY, so nothing backstops it -- and [jobs.fmt_autofix] scopes tier-1's
-# nightly unattended autofix to jac/jaclang/byllm/*. The one directory Nightshift rewrites by
-# itself every night was the one whose gate ran at ~48% coverage. Paid once per night's
+# change to the byllm suite ONLY, so nothing backstops it. (It was more urgent still when tier-1
+# existed, since its nightly unattended autofix was scoped to exactly this directory.) Paid once per night's
 # mirror-home, not per job or per branch.
 #
 # Two things from the same ci.yml job are deliberately NOT transcribed, both checked rather than

@@ -47,8 +47,7 @@ ship_branch() {
 
     # Real added/removed line counts from git itself, not the agent's self-reported loc_before/after
     # (which is a FILE line count, not a diff stat, and was off by a few lines on a real run: agent
-    # said +11 net, actual diff was +90/-77). Overrides render()'s loc_before/loc_after args below --
-    # same convention render_draft.jac's git_report() already uses for tier-1's own reports.
+    # said +11 net, actual diff was +90/-77). Overrides render()'s loc_before/loc_after args below.
     local added removed
     read -r added removed < <(ns_diff_numstat "$REPO" "$NS_REPO_DEFAULT_BRANCH...$branch")
 

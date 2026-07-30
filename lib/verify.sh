@@ -50,8 +50,7 @@ suite_test_raw() {
     # failed or skipped install (offline night, upstream index outage) is night-wide by
     # construction: every byllm branch then collects 105 instead of 219 and reds IDENTICALLY on the
     # collection floor, incrementing attempts each time. Two such nights auto-reject every byllm
-    # finding in the ledger -- and byllm is the directory [jobs.fmt_autofix] rewrites unattended
-    # every night. So a setup failure is harness-fatal, exactly like a reader failure, and is the
+    # finding in the ledger. So a setup failure is harness-fatal, exactly like a reader failure, and is the
     # counterexample to treating "the suite ran and under-collected" as always branch-attributable.
     # An empty CIMIRROR_FAILED_CMD alongside a nonzero rc should be impossible; treat it as fatal
     # too rather than guessing (fail closed).
@@ -397,9 +396,9 @@ verify_branch() {
     #    because the response is the same: both fail identically for EVERY queued branch, so reding
     #    would burn every finding's attempt counter and auto-reject the whole ledger after two nights
     #    over one config typo. Same judgement assert_suite_ran already applies to the test suites.
-    #    (fmt_autofix is NOT in this list and must never be: it is `jac fmt --lintfix` with no
-    #    --check, i.e. it MUTATES the branch. gate_job_names in scripts/cimirror.jac keeps it out of
-    #    the mirror's own iteration for the same reason.)
+    #    (No mirror job may MUTATE the branch it is judging. Since tier-1's apply step was retired
+    #    the whole registry is read-only, and bin/test-harness.sh section 6 pins that by inspecting
+    #    the commands themselves rather than trusting a label.)
     local mrr fastjob fast_rc
     mrr="$LOG_DIR/mirror-fast-$(basename "$branch").txt"
     : > "$mrr"

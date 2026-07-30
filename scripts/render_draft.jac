@@ -6,14 +6,12 @@ argv:
                                    composes JSON; stdout: full draft (frontmatter + body)
   frag <report.json>              stdout: release-note fragment path for this report's files
                                    ("" if none of them touch jac/jaclang/)
-  git-report <repo_dir> <summary>  synthesize a report JSON from the branch's git diff
                                    (used for the tier-1 autofix branch, which has no agent report)
   meta <draft.md>                  stdout: frontmatter as JSON (machine side of the draft)
   body <draft.md>                  stdout: body only (verbatim `gh pr create --body-file` payload)
 """
 import sys;
 import json;
-import subprocess;
 import from nslib { eprint, read_stdin, parse_obj, as_list, as_int, fragment_path }
 
 """Frontmatter values are JSON literals, so `meta` can parse every value with json.loads."""
@@ -120,39 +118,11 @@ def split_draft(text: str) -> (dict, str) {
     return (meta, "---\n".join(parts[2:]).lstrip("\n"));
 }
 
-"""Report for a branch with no agent session (tier-1 autofix): files + LOC from git itself.
-loc_before/after here are diff-relative (removed vs added lines), which is what the digest shows."""
-def git_report(repo_dir: str, summary: str) -> dict {
-    files_out: str = subprocess.run(
-        ["git", "-C", repo_dir, "diff", "--name-only", "main...HEAD"],
-        capture_output=True, text=True, check=True).stdout;
-    numstat: str = subprocess.run(
-        ["git", "-C", repo_dir, "diff", "--numstat", "main...HEAD"],
-        capture_output=True, text=True, check=True).stdout;
-    added: int = 0;
-    removed: int = 0;
-    for line in numstat.splitlines() {
-        parts: list[str] = line.split("\t");
-        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit() {
-            added += int(parts[0]);
-            removed += int(parts[1]);
-        }
-    }
-    return {
-        "summary": summary,
-        "files": [l.strip() for l in files_out.splitlines() if l.strip()],
-        "loc_before": removed, "loc_after": added,
-        "risk": "low", "release_note_md": summary, "skipped": [], "suspected_bugs": [],
-    };
-}
-
 with entry:__main__ {   # only dispatch the CLI on direct `jac run`; sendmail.jac imports split_draft
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "frag" and len(args) == 3 {
         print(frag_for_report(args[2]));
-    } elif cmd == "git-report" and len(args) == 4 {
-        print(json.dumps(git_report(args[2], args[3])));
     } elif cmd == "render" and len(args) >= 3 {
         with open(args[2], "r") as f {
             d: dict = parse_obj(f.read());
@@ -175,7 +145,6 @@ with entry:__main__ {   # only dispatch the CLI on direct `jac run`; sendmail.ja
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run render_draft.jac render <report.json> [branch=... package=... date=... tests=... url=...]");
         eprint("       jac run render_draft.jac frag <report.json>");
-        eprint("       jac run render_draft.jac git-report <repo_dir> <summary>");
         eprint("       jac run render_draft.jac meta <draft.md>");
         eprint("       jac run render_draft.jac body <draft.md>");
     }

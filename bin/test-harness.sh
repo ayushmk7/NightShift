@@ -63,40 +63,35 @@ else
     echo "SKIP: no work/repo clone present"
 fi
 
-echo "== 6. fmt/fmt_autofix drift guard: check and apply must share one exclusion regex =="
+echo "== 6. no mirror job may MUTATE the tree: every command verifies, none applies =="
+# Tier-1 (and with it [jobs.fmt_autofix], the only apply entry) was retired 2026-07-30, so this file
+# is now uniformly read-only. That is a property worth pinning: a gate that rewrites the branch it is
+# judging would silently make its own verdict true. Every `jac fmt` in the registry must carry
+# --check; `--lintfix` without --check is an apply step and must never reappear here.
 rm -rf .jac
-fmt_cmd="$(jac run scripts/cimirror.jac cmds fmt config/ci-mirror.toml | head -1)"
-autofix_cmd="$(jac run scripts/cimirror.jac cmds fmt_autofix config/ci-mirror.toml | head -1)"
+all_cmds="$(jac run scripts/cimirror.jac jobs config/ci-mirror.toml | while read -r j; do
+    jac run scripts/cimirror.jac cmds "$j" config/ci-mirror.toml
+done)"
 rm -rf .jac
-# `|| true`: a genuinely absent regex must reach the empty-string check below as a clean FAIL,
-# not silently kill this script via set -e + pipefail (grep's rc=1-on-no-match is the rightmost
-# nonzero in the pipeline, which pipefail would otherwise propagate to the assignment itself).
+case "$all_cmds" in "") fail "could not read any mirror commands -- the checks below would be vacuous" ;; esac
+printf '%s\n' "$all_cmds" | while IFS= read -r c; do
+    case "$c" in
+        *'jac fmt'*'--check'*) : ;;
+        *'jac fmt'*) echo "MUTATING: $c" ;;
+    esac
+done | grep -q . && fail "a mirror job runs 'jac fmt' without --check -- the gate would rewrite the branch it is judging"
+case "$all_cmds" in
+    *'jac format'*) fail "mirror regressed to 'jac format' (removed by CLI cleanup #7255)" ;;
+esac
+case "$all_cmds" in
+    *'jac lint --fix'*) fail "mirror regressed to 'jac lint --fix' (removed by CLI cleanup #7255)" ;;
+esac
+# `|| true`: an absent regex must reach the empty-string check as a clean FAIL, not kill this script
+# via set -e + pipefail (grep's rc=1-on-no-match is the rightmost nonzero in the pipeline).
+fmt_cmd="$(printf '%s\n' "$all_cmds" | grep -- '--check --lintfix' | head -1 || true)"
 fmt_regex="$(printf '%s' "$fmt_cmd" | grep -oE -- '\(/fixtures/[^)]*\)' | head -1 || true)"
-autofix_regex="$(printf '%s' "$autofix_cmd" | grep -oE -- '\(/fixtures/[^)]*\)' | head -1 || true)"
 case "$fmt_regex" in "") fail "could not extract an exclusion regex from [jobs.fmt]" ;; esac
-case "$autofix_regex" in "") fail "could not extract an exclusion regex from [jobs.fmt_autofix]" ;; esac
-case "$autofix_regex" in
-    "$fmt_regex") : ;;
-    *) fail "fmt and fmt_autofix exclusion regexes have drifted apart: '$fmt_regex' vs '$autofix_regex'" ;;
-esac
-case "$fmt_cmd$autofix_cmd" in
-    *'jac format'*) fail "fmt/fmt_autofix regressed to 'jac format' (removed by CLI cleanup #7255)" ;;
-esac
-case "$fmt_cmd$autofix_cmd" in
-    *'jac lint --fix'*) fail "fmt/fmt_autofix regressed to 'jac lint --fix' (removed by CLI cleanup #7255)" ;;
-esac
-# The regex/tool/flag checks above would all still pass if [jobs.fmt] quietly lost its `--check`
-# flag -- the mirror's own VERIFY step would then silently start APPLYING formatting fixes
-# instead of just checking them (confirmed: a copy of this file with `--check` stripped passes
-# every check above). Pin both sides explicitly so the two guards don't depend on each other.
-case "$fmt_cmd" in
-    *'--check'*) : ;;
-    *) fail "[jobs.fmt] lost --check -- it must VERIFY formatting, not apply it" ;;
-esac
-case "$autofix_cmd" in
-    *'--check'*) fail "[jobs.fmt_autofix] gained --check -- it must APPLY formatting (tier-1's job), not just verify it" ;;
-esac
-echo "fmt and fmt_autofix share one exclusion regex ($fmt_regex), no jac format / jac lint --fix"
+echo "every mirror job verifies, none applies; [jobs.fmt] keeps --check and its exclusion regex ($fmt_regex)"
 
 echo "== 7. test-gate routing: case ORDER, and the two path classes that must gate nothing =="
 # lib/*.sh gets `bash -n` only, so nothing else in this file executes gated_suites_from_diff --
@@ -237,51 +232,31 @@ for j in byllm compiler runtime; do
         *" $j"*) fail "suite job '$j' was added to the 'fast' pre-suite loop; it takes tens of minutes: $fast_list" ;;
     esac
 done
-# fmt_autofix APPLIES formatting (`jac fmt --lintfix`, no --check). Running it inside a read-only
-# gate would silently rewrite the candidate branch while deciding whether to ship it.
-case "$fast_list" in
-    *fmt_autofix*) fail "fmt_autofix is a MUTATING apply step and must never run inside the S4 gate" ;;
-esac
 echo "gate order correct (fast mirror jobs $fast_ln < suites $suite_ln < contribution $contrib_ln)"
 
-echo "== 9a. S7 theme resolution: tier-1 by NAME, tier-2 by FILE, absence is never 'no theme' =="
+echo "== 9a. S7 theme resolution: a missing theme file is ALWAYS fatal, never 'no theme' =="
 # lib/promote.sh used to do `[ -f "$LOG_DIR/theme-….json" ] && theme=…`, which under promote_main's
 # live errexit (it is called bare from bin/nightshift.sh, and ns_run_inner's EXIT trap does not
 # exist on that path) aborted `nightshift.sh promote` with a bare status 1 whenever the file was
-# absent -- i.e. for EVERY tier-1 branch, and for every tier-2 branch promoted on a different
-# calendar day than its date-keyed $LOG_DIR. The naive fix is worse than the bug: a theme of "-"
-# makes verify_branch skip scope containment, so an aged-out tier-2 theme would silently re-gate an
-# LLM-written branch with the anti-injection check off. Hence: tier-1 recognised POSITIVELY by slug,
-# everything else must produce its file or ns_die.
+# absent -- the normal case, since $LOG_DIR is date-keyed and a human promotes on a later day. The
+# naive fix is worse than the bug: a theme of "-" makes verify_branch skip scope containment, so an
+# aged-out theme would silently re-gate an LLM-written branch with the anti-injection check off.
+# Since tier-1 was retired (2026-07-30) EVERY branch is agent-written, so absence is unambiguously
+# fatal and no positive tier-1 recognition is needed any more.
 case "$(grep -c '^[[:space:]]*\[ -f .*\] &&[[:space:]]*theme=' lib/promote.sh || true)" in
     0) : ;;
     *) fail "lib/promote.sh resolves the theme with a '[ -f … ] && theme=…' list again -- a false && list is a nonzero return, and promote_main runs with errexit live and no EXIT trap" ;;
 esac
-grep -q 'ns_is_tier1_branch "\$branch"' lib/promote.sh \
-    || fail "lib/promote.sh no longer identifies the tier-1 branch positively by slug; absence of a theme file must never be read as 'no theme'"
 grep -q 'ns_die "\$EX_BUG" "no theme file for' lib/promote.sh \
-    || fail "lib/promote.sh no longer dies on a missing tier-2 theme file -- it would re-gate an agent-written branch without scope containment"
-grep -q 'local branch="nightshift/\$NS_DATE/\$NS_TIER1_SLUG"' lib/tier1.sh \
-    || fail "lib/tier1.sh no longer builds its branch from \$NS_TIER1_SLUG; a rename here would make every tier-1 promote die on the tier-2 guard"
-
-# The lockstep itself, driven rather than grepped: rebuild tier-1's branch name from lib/tier1.sh's
-# OWN expression and ask lib/common.sh's predicate about it. If either side is renamed alone, this
-# fails. `if … then exit 1; fi`, never `pred && exit 1`: under set -e a false && list would exit the
-# subshell 1 by itself and manufacture the very failure it is testing for.
-tier1_expr="$(sed -n 's/.*local branch="\(nightshift[^"]*\)".*/\1/p' lib/tier1.sh | head -1)"
-case "$tier1_expr" in
-    "") fail "could not extract lib/tier1.sh's branch expression -- the lockstep check below would have been vacuous" ;;
+    || fail "lib/promote.sh no longer dies on a missing theme file -- it would re-gate an agent-written branch without scope containment"
+# The retirement must stay retired: a resurrected theme-less branch class would re-open the hole.
+case "$(git ls-files lib/tier1.sh | wc -l | tr -d ' ')" in
+    0) : ;;
+    *) fail "lib/tier1.sh is back -- it queues a theme-less branch, so lib/promote.sh's unconditional ns_die would reject it; reinstate the positive tier-1 recognition if you revive the stage" ;;
 esac
-(
-    . "$NS_ROOT/lib/common.sh"
-    NS_DATE=2026-01-02
-    eval "b=\"$tier1_expr\""
-    ns_is_tier1_branch "$b" || { echo "tier-1 branch '$b' not recognised as tier-1" >&2; exit 1; }
-    if ns_is_tier1_branch "nightshift/2026-01-02/unused-imports"; then
-        echo "a tier-2 slug was misidentified as tier-1 -- it would re-gate with no theme" >&2; exit 1
-    fi
-) || fail "lib/tier1.sh's branch name and lib/common.sh's ns_is_tier1_branch have drifted apart"
-echo "theme resolution explicit: tier-1 '$tier1_expr' matches \$NS_TIER1_SLUG, tier-2 absence is fatal"
+grep -q 'ns_is_tier1_branch\|NS_TIER1_SLUG' lib/promote.sh lib/common.sh 2>/dev/null \
+    && fail "tier-1 recognition helpers are back without lib/tier1.sh -- dead code guarding a branch class that no longer exists"
+echo "theme resolution explicit: absence is fatal for every branch, tier-1 stays retired"
 
 echo "== 9b. mirror skip-detection must track the strings the mirror actually prints =="
 # [jobs.fmt] and [jobs.check] both EXIT 0 after printing a skip line when the branch changed no

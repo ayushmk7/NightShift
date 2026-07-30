@@ -30,14 +30,6 @@ cimirror_fmt_cmd() {
     cimirror_cmds fmt | head -1
 }
 
-# tier-1's fmt-APPLY invocation: [jobs.fmt_autofix], NOT a ci.yml job. Same tool/flags (minus
-# --check)/exclusion-regex as cimirror_fmt_cmd, scoped to jac/jaclang/byllm instead of by diff --
-# see config/ci-mirror.toml's [jobs.fmt_autofix] comment for why tier-1 can't reuse the diff-scoped
-# check command directly (there is no diff yet when tier-1 runs; it runs before any other stage).
-cimirror_fmt_autofix_cmd() {
-    cimirror_cmds fmt_autofix | head -1
-}
-
 # Run one mirrored job. Repo dev binary first on PATH so `jac` means the target repo's jac.
 #
 # HOME is set to $LOG_DIR/mirror-home (created once, reused by every job/call in the SAME

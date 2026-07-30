@@ -7,8 +7,12 @@ argv:
 import sys;
 import from nslib { eprint, load_config_toml, as_dict, as_list }
 
-"""Every [jobs.*] table name, unfiltered -- includes tier-1's own [jobs.fmt_autofix], which is
-NOT a ci.yml job and must never appear in the gate iteration (see gate_job_names)."""
+"""Every [jobs.*] table name. Since tier-1 and its [jobs.fmt_autofix] apply step were retired
+(2026-07-30) every entry here is a read-only gate job, so this list IS the gate list.
+ponytail: no local-only/gate filter, because there is nothing to filter -- reintroduce one only if
+a genuinely local, MUTATING step ever earns a place in this file. The real invariant (no command
+applies formatting) is pinned by bin/test-harness.sh section 6, which checks the commands
+themselves rather than trusting a `ci_job` label to be set correctly."""
 def job_names(cfg: dict) -> list[str] {
     jobs: dict = as_dict(cfg["jobs"]);
     return [str(k) for k in jobs.keys()];
@@ -37,21 +41,11 @@ def test_cmd_count(cfg: dict, job: str) -> int {
     return len([c for c in job_cmds(cfg, job) if "jac test" in c]);
 }
 
-"""The job names cimirror_all / `nightshift.sh mirror` (Task 7) should actually iterate as a
-gate: every entry whose `ci_job` names a real ci.yml job. A `ci_job` starting with "none" marks a
-LOCAL-ONLY step (currently just fmt_autofix, tier-1's own apply command) that must be reachable by
-name via `cmds <job>` but must NEVER run inside a read-only verification pass -- fmt_autofix's
-command is `jac fmt --lintfix` with no --check, i.e. it MUTATES files; running it as part of a
-gate would silently rewrite a candidate branch's content while deciding whether to ship it."""
-def gate_job_names(cfg: dict) -> list[str] {
-    return [n for n in job_names(cfg) if not job_ci_job(cfg, n).startswith("none")];
-}
-
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "jobs" and len(args) == 3 {
-        for n in gate_job_names(load_config_toml(args[2])) {
+        for n in job_names(load_config_toml(args[2])) {
             print(n);
         }
     } elif cmd == "testcmds" and len(args) == 4 {
@@ -66,29 +60,19 @@ with entry {
     }
 }
 
-test "every declared job (gate jobs and tier-1's local-only step alike) has at least one command" {
+test "every declared job is a real ci.yml gate job with at least one command" {
     cfg: dict = load_config_toml("config/ci-mirror.toml");
     names: list[str] = job_names(cfg);
     expected: list[str] = [
-        "fmt", "fmt_autofix", "check", "jir", "byllm", "compiler", "runtime", "contribution"
+        "fmt", "check", "jir", "byllm", "compiler", "runtime", "contribution"
     ];
     assert sorted(names) == sorted(expected);
     for n in names {
         assert len(job_cmds(cfg, n)) >= 1;
-    }
-}
-
-test "the gate job list mirrors only real ci.yml jobs, excluding tier-1's own autofix step" {
-    cfg: dict = load_config_toml("config/ci-mirror.toml");
-    gate: list[str] = gate_job_names(cfg);
-    expected_gate: list[str] = ["fmt", "check", "jir", "byllm", "compiler", "runtime", "contribution"];
-    assert sorted(gate) == sorted(expected_gate);
-    assert "fmt_autofix" not in gate;
-    # every gate job's ci_job must NOT look like a local-only marker
-    for n in gate {
+        # No entry may reintroduce a local-only marker without also reintroducing the gate filter
+        # this file deleted with tier-1: an unfiltered "none" job would run inside the S4 gate.
         assert not job_ci_job(cfg, n).startswith("none");
     }
-    assert job_ci_job(cfg, "fmt_autofix").startswith("none");
 }
 
 test "the fmt command is CI's exact PR-scoped invocation, not jac format" {
@@ -105,17 +89,19 @@ test "the fmt command is CI's exact PR-scoped invocation, not jac format" {
     assert "No formattable .jac files changed" in fmt;
 }
 
-test "fmt (check) and fmt_autofix (apply) share one exclusion regex, differing only in scope" {
+test "no job applies formatting: every jac fmt in the registry carries --check" {
+    # Tier-1 was the only APPLY step and is retired, so this file must stay uniformly read-only --
+    # a gate that rewrites the branch it is judging would silently make its own verdict true.
     cfg: dict = load_config_toml("config/ci-mirror.toml");
-    fmt: str = job_cmds(cfg, "fmt")[0];
-    autofix: str = job_cmds(cfg, "fmt_autofix")[0];
-    regex: str = "(/fixtures/|^scripts/|/passes/native/llvm/|_err\\.jac$)";
-    assert regex in fmt;
-    assert regex in autofix;
-    assert "--check" in fmt;
-    assert "--check" not in autofix;
-    assert "jac/jaclang/byllm" in autofix;
-    assert "jac/jaclang/byllm" not in fmt;
+    for n in job_names(cfg) {
+        for c in job_cmds(cfg, n) {
+            if "jac fmt" in c {
+                assert "--check" in c;
+            }
+            assert "jac format" not in c;
+            assert "jac lint --fix" not in c;
+        }
+    }
 }
 
 test "fmt and check both fail loud on a broken merge-base instead of silently skipping" {

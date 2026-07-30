@@ -44,22 +44,12 @@ flowchart TD
         CONF -->|"yes · exit 44"| EXIT
         CONF -->|"no"| WT --> PRUNE --> PULL
     end
-    PULL --> S2
+    PULL --> S3
 
-    subgraph S2["S2 · Tier 1 · deterministic clean · no LLM"]
-        direction TB
-        BR1["branch nightshift/DATE/autofix from main"]
-        FMT["jac clean cache · jac format . · jac lint --fix"]
-        REVERT["revert any edits on protected globs"]
-        PC1["pre-commit x2 · first may self-mutate"]
-        D1{"diff empty?"}
-        C1["commit style autofix · git-report to queue.tsv"]
-        BR1 --> FMT --> REVERT --> PC1 --> D1
-        D1 -->|"yes"| DROP1["delete branch"]
-        D1 -->|"no"| C1
-    end
-    C1 --> S3
-    DROP1 --> S3
+    %% S2 (tier-1 deterministic autofix) was RETIRED 2026-07-30. A byllm-only formatting PR was
+    %% noise and a repo-wide one unmergeable (~259 pre-existing violations on main), and upstream
+    %% only checks formatting repo-wide on push. Themes now format their own edits; [jobs.fmt]
+    %% gates that diff-scoped, exactly as CI does on a PR.
 
     subgraph S3["S3 · Tier 2 · agentic clean"]
         direction TB
@@ -71,7 +61,7 @@ flowchart TD
         RJSON{"report JSON ok and diff non-empty?"}
         FRAG["orchestrator writes release-note fragment · dir mapped jac to jaclang etc · ledger upsert-theme · queue.tsv"]
         ROT --> AUDIT --> PJSON
-        PJSON -->|"no · exit 50 · tier1 still ships"| S4
+        PJSON -->|"no · exit 50 · nothing ships tonight"| S4
         PJSON -->|"yes"| SEL --> APPLY --> RJSON
         RJSON -->|"no"| DROP3["delete branch · ledger failed_verify"]
         RJSON -->|"yes"| FRAG
@@ -201,7 +191,6 @@ flowchart LR
         CM["common.sh"]
         PF["preflight.sh"]
         SY["sync.sh"]
-        T1["tier1.sh"]
         T2["tier2.sh"]
         VF["verify.sh"]
         SH["ship.sh"]

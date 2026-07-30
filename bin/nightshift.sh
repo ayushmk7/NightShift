@@ -13,7 +13,6 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PAT
 . "$NS_ROOT/lib/common.sh"
 . "$NS_ROOT/lib/preflight.sh"
 . "$NS_ROOT/lib/sync.sh"
-. "$NS_ROOT/lib/tier1.sh"
 . "$NS_ROOT/lib/tier2.sh"
 . "$NS_ROOT/lib/verify.sh"
 . "$NS_ROOT/lib/ship.sh"
@@ -91,7 +90,9 @@ ns_run_inner() {
 
     ns_stage S0 preflight_main
     ns_stage S1 sync_main
-    ns_stage S2 tier1_main
+    # S2 (tier-1 deterministic autofix) was retired 2026-07-30: a byllm-only formatting PR is noise,
+    # a repo-wide one is unmergeable (~259 pre-existing violations on main), and upstream only checks
+    # formatting repo-wide on push. Themes now format their own edits; [jobs.fmt] gates that.
     ns_stage S3 tier2_main
     ns_stage S4 verify_main
     ns_stage S5 ship_main
