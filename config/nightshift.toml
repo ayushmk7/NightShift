@@ -34,6 +34,55 @@ periphery       = ["jac/jaclang/langserve", "jac/jaclang/lsp", "jac/jaclang/proj
 [shards.exclude]                             # subtracted from the shard's own paths in the prompt
 compiler-core   = ["jac/jaclang/compiler/passes", "jac/jaclang/compiler/tests"]
 
+[tasks]                                      # ONE task per night, cycling in the order these
+# tables appear below. scripts/tasks.jac reads that order straight from the file (tomllib
+# preserves it) and bin/test-harness.sh section 11 pins the sequence, so there is deliberately
+# no `order = N` key: two sources of truth for one ordering is a drift bug waiting to happen.
+#
+# The order IS the design. Delete first (every later task then audits a smaller surface), then
+# simplify what survives, then fix drift in what remains, then write tests against the settled
+# shape. Writing coverage first means testing code that is about to be deleted.
+#
+# There is deliberately no per-task `model` either: the audit is always Opus and the apply
+# session routes on the finding's own `complexity` tag ([agent] below). Upgrade path: add
+# `model = ...` here the day one task genuinely needs a different one.
+
+[tasks.dead-code]
+ponytail = "full"
+scoring  = "loc_saved"
+fragment = "refactor"
+
+[tasks.abstraction]
+ponytail = "full"
+scoring  = "loc_saved"
+fragment = "refactor"
+
+[tasks.maintenance]
+ponytail = "full"
+scoring  = "loc_saved"
+fragment = "auto"        # the agent returns the kind; fragment_path clamps an invalid one
+
+[tasks.coverage]
+ponytail = "lite"        # so it actually writes a test instead of YAGNI-ing it away
+scoring  = "risk_weighted"
+fragment = ""            # tests-only changes need no release-note fragment
+# The ONLY task permitted to write inside a protected glob, and the permission lives HERE --
+# in the config file, keyed by task name -- never in a theme. See scripts/check_scope.jac.
+# Presence of this key ALSO means "this task may write nothing else": every changed path on a
+# coverage branch must match one of these globs.
+#
+# WHAT KEEPS THIS OUT OF THE AGENT'S REACH, stated precisely because the obvious version of this
+# sentence is wrong: it is NOT that the value never leaves this file. scripts/config.jac:15-26
+# flattens every [section].key pair into a flat NS_* assignment, and a sub-table becomes one
+# JSON-valued assignment -- so `NS_TASKS_COVERAGE='{"ponytail": "lite", ..., "protect_unless":
+# [...]}'` really is produced on every run. What holds the property is that lib/common.sh's
+# ns_load_config `eval`s those lines BARE: no `export`, no `set -a`. They are shell variables of
+# the orchestrator process only, so no child -- and in particular no `claude` session -- ever
+# inherits them. Adding `set -a` around that eval would silently put this list in the agent's
+# environment. scripts/tasks.jac's `env` verb separately refuses to emit it, so neither route
+# leaks it.
+protect_unless = ["**/tests/**", "**/*.test.jac"]
+
 [budgets]                                    # PRD 9 guardrails — no step may violate these
 themes_per_night   = 6                       # was 3 -- real data: 85% of real findings were being
                                               # dropped for pure over-night-budget reasons while
@@ -56,11 +105,17 @@ max_turns          = 80                      # apply session cap; the real cost 
 max_budget_usd     = 5                       # inert on subscription; belt if ever on an API key
 
 [agent]
-model         = "sonnet"                     # empty = account default, which silently drifts with
-                                              # whatever the interactive session's default is at
-                                              # 2am -- confirmed live, unnoticed model change between
-                                              # two real runs. Pin explicitly; change here, not in code.
-ponytail_mode = "full"                       # PRD 14-Q5
+# Two models, both pinned. An empty value means "account default", which silently drifts with
+# whatever the interactive session default is at 2am -- confirmed live, an unnoticed model change
+# between two real runs.
+model        = "opus"                        # the audit is always judgement work (spec 13), and
+                                              # it is also the escalation target for a failed
+                                              # apply. Costs more per night than the old sonnet
+                                              # default; that is the deliberate trade.
+model_simple = "sonnet"                       # apply sessions for `trivial`/`mechanical` findings,
+                                              # plus every mechanical re-prompt
+# [agent].ponytail_mode is GONE: every task now sets its own `ponytail` (coverage needs "lite" or
+# it YAGNIs its own test away), so a global default would only ever be the value nobody uses.
 
 [protect]                                    # glob deny-list; enforced twice (prompt + S4 gate)
 # release_notes/ is NOT listed: fragments live outside docs/ since the restructure, so they need

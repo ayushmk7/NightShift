@@ -35,7 +35,7 @@ tier2_audit_shard() {
     scope="$(ns_jac shards scope "$shard" "$CONFIG")"
     prompt="$(render_prompt "$NS_ROOT/prompts/audit.md" \
         "shard=$shard" "scope=$scope" \
-        "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
+        "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=full")"
 
     # empty NS_AGENT_MODEL (config: [agent].model) means "account default" -- that's the exact
     # silent-drift footgun the config comment warns about, so the default ships pinned to "sonnet";
@@ -220,7 +220,7 @@ tier2_apply() {
         fi
 
         prompt="$(render_prompt "$NS_ROOT/prompts/apply.md" \
-            "theme=$(cat "$theme_file")" "ponytail_mode=$NS_AGENT_PONYTAIL_MODE")"
+            "theme=$(cat "$theme_file")" "ponytail_mode=full")"
 
         # Up to 2 attempts, each on a FRESH branch: a transient API error mid-session (same class
         # tier2_audit already retries) shouldn't burn the whole theme for the night.
