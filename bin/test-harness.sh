@@ -283,7 +283,7 @@ for j in byllm compiler runtime; do
 done
 echo "gate order correct (fast mirror jobs $fast_ln < suites $suite_ln < contribution $contrib_ln)"
 
-echo "== 9a. S7 theme resolution: a missing theme file is ALWAYS fatal, never 'no theme' =="
+echo "== 9a. S7 kill path: theme resolution, no duplicate PR, close before delete =="
 # lib/promote.sh used to do `[ -f "$LOG_DIR/theme-….json" ] && theme=…`, which under promote_main's
 # live errexit (it is called bare from bin/nightshift.sh, and ns_run_inner's EXIT trap does not
 # exist on that path) aborted `nightshift.sh promote` with a bare status 1 whenever the file was
@@ -291,21 +291,178 @@ echo "== 9a. S7 theme resolution: a missing theme file is ALWAYS fatal, never 'n
 # naive fix is worse than the bug: a theme of "-" makes verify_branch skip scope containment, so an
 # aged-out theme would silently re-gate an LLM-written branch with the anti-injection check off.
 # Since tier-1 was retired (2026-07-30) EVERY branch is agent-written, so absence is unambiguously
-# fatal and no positive tier-1 recognition is needed any more.
-case "$(grep -c '^[[:space:]]*\[ -f .*\] &&[[:space:]]*theme=' lib/promote.sh || true)" in
-    0) : ;;
-    *) fail "lib/promote.sh resolves the theme with a '[ -f … ] && theme=…' list again -- a false && list is a nonzero return, and promote_main runs with errexit live and no EXIT trap" ;;
-esac
-grep -q 'ns_die "\$EX_BUG" "no theme file for' lib/promote.sh \
-    || fail "lib/promote.sh no longer dies on a missing theme file -- it would re-gate an agent-written branch without scope containment"
+# fatal and no positive tier-1 recognition is needed any more. The resolution now lives in
+# ns_theme_for_branch (lib/common.sh) because S1.6 re-gates PRs from arbitrary earlier nights.
+for tf in lib/promote.sh lib/common.sh; do
+    case "$(grep -c '^[[:space:]]*\[ -f .*\] &&[[:space:]]*theme=' "$tf" || true)" in
+        0) : ;;
+        *) fail "$tf resolves the theme with a '[ -f … ] && theme=…' list again -- a false && list is a nonzero return, and promote_main runs with errexit live and no EXIT trap" ;;
+    esac
+done
+grep -q 'ns_die "\$EX_BUG" "no theme file for' lib/common.sh \
+    || fail "ns_theme_for_branch no longer dies on a missing theme file -- it would re-gate an agent-written branch without scope containment"
+grep -q 'ns_theme_for_branch' lib/promote.sh \
+    || fail "lib/promote.sh resolves the theme by hand again instead of through ns_theme_for_branch"
 # The retirement must stay retired: a resurrected theme-less branch class would re-open the hole.
 case "$(git ls-files lib/tier1.sh | wc -l | tr -d ' ')" in
     0) : ;;
-    *) fail "lib/tier1.sh is back -- it queues a theme-less branch, so lib/promote.sh's unconditional ns_die would reject it; reinstate the positive tier-1 recognition if you revive the stage" ;;
+    *) fail "lib/tier1.sh is back -- it queues a theme-less branch, so ns_theme_for_branch's unconditional ns_die would reject it; reinstate the positive tier-1 recognition if you revive the stage" ;;
 esac
 grep -q 'ns_is_tier1_branch\|NS_TIER1_SLUG' lib/promote.sh lib/common.sh 2>/dev/null \
     && fail "tier-1 recognition helpers are back without lib/tier1.sh -- dead code guarding a branch class that no longer exists"
-echo "theme resolution explicit: absence is fatal for every branch, tier-1 stays retired"
+# ...and behaviourally, in all three directions. The greps above cannot tell a resolver that reads
+# the drafts branch from one that merely mentions it.
+TH="$T/theme"; mkdir -p "$TH/logs" "$TH/drafts/themes"
+theme_probe() {        # theme_probe <label> <want-rc> <branch> -> sets $theme_got
+    local label=$1 want=$2 br=$3 got=0
+    theme_got="$( . "$NS_ROOT/lib/common.sh" 2>/dev/null; LOG_DIR="$TH/logs"; DRAFTS="$TH/drafts"
+                  ns_theme_for_branch "$br" 2>/dev/null )" || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "ns_theme_for_branch '$label': expected rc=$want, got rc=$got" ;;
+    esac
+}
+# neither place has it -> FATAL, never "-" (which makes verify_branch skip scope containment)
+theme_probe "no theme anywhere" 70 nightshift/2026-07-01/dead-code-gone
+case "$theme_got" in
+    -|"-") fail "ns_theme_for_branch returned '-' for a branch with no theme; verify_branch would re-gate an LLM-written branch with the anti-injection check off" ;;
+esac
+# only on the drafts branch -> resolves. THE case S1.6 hits on every PR from an earlier night.
+echo '{}' > "$TH/drafts/themes/dead-code-old.json"
+theme_probe "drafts branch only" 0 nightshift/2026-07-01/dead-code-old
+[ "$theme_got" = "$TH/drafts/themes/dead-code-old.json" ] \
+    || fail "ns_theme_for_branch does not fall back to the drafts branch (got '$theme_got'); every S1.6 re-gate of an older PR would die"
+# tonight's logs win over the drafts copy: the drafts copy is a snapshot, the logs one is current
+echo '{}' > "$TH/logs/theme-dead-code-old.json"
+theme_probe "logs beat drafts" 0 nightshift/2026-07-01/dead-code-old
+[ "$theme_got" = "$TH/logs/theme-dead-code-old.json" ] \
+    || fail "ns_theme_for_branch prefers the drafts snapshot over tonight's logs (got '$theme_got')"
+
+# --- ns_pr_for_branch: a FAILED query must never read as "there is no PR" ------------------------
+# This is the lookup both promote's duplicate refusal and discard's close-before-delete are built
+# on, and an unchecked `gh pr list` prints nothing when the token expires -- indistinguishable from
+# a clean "no PR exists", which is the answer that makes discard delete the branch and leave the PR
+# dangling. Driven against a stub gh, three ways.
+PB="$T/prfor"; mkdir -p "$PB"
+printf '#!/bin/sh\nexit 4\n' > "$PB/gh-fails"; chmod +x "$PB/gh-fails"
+printf '%s\n' '#!/bin/sh' 'cat <<JSON' \
+  '[{"number": 812, "headRefName": "nightshift/2026-07-01/dead-code-x", "url": "u", "title": "t"}]' \
+  'JSON' > "$PB/gh-ok"; chmod +x "$PB/gh-ok"
+printf '%s\n' '#!/bin/sh' 'cat <<JSON' \
+  '[{"number": 99, "headRefName": "someones-manual-branch", "url": "u", "title": "t"}]' \
+  'JSON' > "$PB/gh-foreign"; chmod +x "$PB/gh-foreign"
+pr_for() {             # pr_for <label> <want-rc> <stub> -> sets $pr_for_out
+    local label=$1 want=$2 stub=$3 got=0
+    pr_for_out="$( . "$NS_ROOT/lib/common.sh" 2>/dev/null; . "$NS_ROOT/lib/promote.sh"
+                   LOG_DIR="$PB"; NS_PATHS_GH="$PB/$stub"; NS_REPO_UPSTREAM=o/r; ns_bootstrap_jac
+                   ns_pr_for_branch nightshift/2026-07-01/dead-code-x 2>/dev/null )" || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "ns_pr_for_branch '$label': expected rc=$want, got rc=$got (out '$pr_for_out')" ;;
+    esac
+}
+pr_for "gh fails" 70 gh-fails
+case "$pr_for_out" in
+    "") : ;;
+    *) fail "ns_pr_for_branch returned '$pr_for_out' for a FAILED gh call; it must die, not answer" ;;
+esac
+pr_for "gh answers" 0 gh-ok
+[ "$pr_for_out" = "812" ] || fail "ns_pr_for_branch did not extract the PR number (got '$pr_for_out')"
+# the nightshift/ prefix filter is a SAFETY invariant: everything downstream force-pushes what it
+# is handed, and `--head` alone would match a PR opened by hand from an unrelated branch.
+pr_for "foreign head" 0 gh-foreign
+case "$pr_for_out" in
+    "") : ;;
+    *) fail "ns_pr_for_branch returned #$pr_for_out for a PR whose head is not under nightshift/" ;;
+esac
+
+# --- promote must refuse a branch that already has a PR -----------------------------------------
+# S5 opens PRs now, so promote is only the manual fallback. A second PR for the same branch is
+# noise upstream, and the ledger would record whichever URL was written last.
+PM="$T/promote"; mkdir -p "$PM/drafts"
+# A REAL draft, so find_draft succeeds and the run actually reaches sync_main. With no draft the
+# "sync_main must not have run" assertion below is vacuous -- promote would die at the draft lookup
+# either way, which is the shape of decorative assertion this project keeps shipping.
+cat > "$PM/report.json" <<'EOF'
+{"summary": "probe", "files": ["jac/jaclang/cli/pipe.jac"], "risk": "low",
+ "release_note": "release_notes/unreleased/jaclang/0000.refactor.md",
+ "tests": "t", "loc_before": 1, "loc_after": 0,
+ "branch": "nightshift/2026-07-01/dead-code-x", "package": "repo", "date": "2026-07-01"}
+EOF
+jac run scripts/render_draft.jac render "$PM/report.json" > "$PM/drafts/2026-07-01--dead-code-x.md" \
+    || fail "could not render the promote probe draft -- the assertions below would be vacuous"
+promote_probe() {      # promote_probe <label> <existing-pr> -> sets $promote_reason
+    # NS_PROBE_PR, not a `local existing`: promote_main declares its OWN `local existing`, and bash
+    # is dynamically scoped -- the stub would read the callee's empty variable, answer "", and the
+    # probe would silently test the wrong arm. (Observed while writing this section.)
+    local label=$1 NS_PROBE_PR=$2
+    rm -f "$PM/FATAL_REASON" "$PM/order.log"
+    (
+        . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/ship.sh"; . "$NS_ROOT/lib/promote.sh"
+        ns_bootstrap_jac
+        LOG_DIR="$PM"; DRAFTS="$PM"; REPO="$PM/norepo"; NS_REPO_UPSTREAM=o/r
+        ns_pr_for_branch() { printf '%s' "$NS_PROBE_PR"; }
+        sync_main() { echo "SYNC-RAN" >> "$PM/order.log"; }
+        promote_main nightshift/2026-07-01/dead-code-x
+    ) >/dev/null 2>&1 || true
+    promote_reason="$(cat "$PM/FATAL_REASON" 2>/dev/null || true)"
+}
+promote_probe "existing PR" 9999
+case "$promote_reason" in
+    *"already has open PR #9999"*) : ;;
+    *) fail "promote did not refuse a branch that already has an open PR (reason: '$promote_reason')" ;;
+esac
+[ -f "$PM/order.log" ] \
+    && fail "promote ran sync_main before refusing a duplicate PR -- the refusal must precede the re-sync/rebase/re-gate it does not depend on"
+# POSITIVE CONTROL: with no existing PR the SAME run must get past the refusal and reach sync_main.
+# Without this, a promote_main that died on its first line satisfies both assertions above.
+promote_probe "no existing PR" ""
+grep -q SYNC-RAN "$PM/order.log" 2>/dev/null \
+    || fail "promote with no existing PR never reached sync_main (reason: '$promote_reason'); the duplicate check is rejecting everything and the assertion above is vacuous"
+
+# --- discard must close the PR BEFORE it deletes the branch --------------------------------------
+DC="$T/discard"; mkdir -p "$DC/drafts"
+(
+    cd "$DC" && git init -q . && git config user.email t@t && git config user.name t \
+      && : > led.jsonl && touch drafts/.keep && git add -A && git commit -qm init
+) >/dev/null 2>&1 || fail "could not build the discard scratch repo -- the ordering assertions would be vacuous"
+discard_probe() {      # discard_probe <label> <want-rc> <pr-num> <close-rc>
+    local label=$1 want=$2 NS_PROBE_PR=$3 NS_PROBE_CLOSE_RC=$4 got=0
+    : > "$DC/order.log"
+    (
+        . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/ship.sh"; . "$NS_ROOT/lib/promote.sh"
+        LOG_DIR="$DC"; DRAFTS="$DC"; LEDGER="$DC/led.jsonl"; REPO="$DC/norepo"
+        NS_REPO_UPSTREAM=o/r; NS_REPO_DEFAULT_BRANCH=main
+        ns_pr_for_branch() { printf '%s' "$NS_PROBE_PR"; }
+        ns_gh_write() { echo "CLOSE $*" >> "$DC/order.log"; return "$NS_PROBE_CLOSE_RC"; }
+        ns_git_push() { echo "PUSH $*" >> "$DC/order.log"; }
+        ns_jac() { :; }
+        dataset_record_review() { :; }
+        discard_main nightshift/2026-07-01/dead-code-x "harness rehearsal"
+    ) >/dev/null 2>&1 || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "discard_main '$label': expected rc=$want, got rc=$got" ;;
+    esac
+}
+discard_probe "open PR, close succeeds" 0 4242 0
+case "$(head -1 "$DC/order.log")" in
+    "CLOSE pr close 4242 "*) : ;;
+    *) fail "discard's FIRST upstream action is not closing the PR: $(tr '\n' '|' < "$DC/order.log")" ;;
+esac
+grep -q '^PUSH .*--delete' "$DC/order.log" \
+    || fail "discard did not delete the branch after closing the PR: $(tr '\n' '|' < "$DC/order.log")"
+# a FAILED close must abort before the branch is deleted, or the PR is left dangling with its head
+# branch gone and no explanation on someone else's repo
+discard_probe "open PR, close fails" 70 4242 1
+grep -q '^PUSH .*--delete' "$DC/order.log" \
+    && fail "discard deleted the branch after FAILING to close the PR -- the open PR is now dangling upstream"
+# ...and with no PR at all it must still discard cleanly (positive control for the arm above)
+discard_probe "no open PR" 0 "" 0
+grep -q '^CLOSE' "$DC/order.log" && fail "discard tried to close a PR that does not exist"
+grep -q '^PUSH .*--delete' "$DC/order.log" \
+    || fail "discard did not delete the branch when there was no PR to close"
+echo "kill path: theme resolves logs->drafts->fatal, promote refuses a duplicate, discard closes before deleting"
 
 echo "== 9b. mirror skip-detection must track the strings the mirror actually prints =="
 # [jobs.fmt] and [jobs.check] both EXIT 0 after printing a skip line when the branch changed no
