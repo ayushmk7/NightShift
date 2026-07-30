@@ -650,6 +650,89 @@ grep -q 'check_scope check "\$theme" "\$CONFIG" "\$btask"' lib/verify.sh \
     || fail "lib/verify.sh no longer passes the branch-derived task to check_scope; the gate would apply some other task's write permissions"
 echo "protect_unless is config-keyed by an argv task: a theme cannot grant itself tests/** access"
 
+echo "== 13. test-weakening guard: both dimensions, driven through the real CLI =="
+rm -rf .jac
+W="$T/weaken"; mkdir -p "$W"
+cat > "$W/old.jac" <<'EOF'
+test "a" {
+    assert x == 1;
+    assert y == 2;
+}
+test "b" {
+    assert z;
+}
+EOF
+cat > "$W/fewer-asserts.jac" <<'EOF'
+test "a" {
+    assert x == 1;
+}
+test "b" {
+    assert z;
+}
+EOF
+cat > "$W/fewer-tests.jac" <<'EOF'
+test "a" {
+    assert x == 1;
+    assert y == 2;
+    assert z;
+}
+EOF
+cat > "$W/stronger.jac" <<'EOF'
+test "a" {
+    assert x == 1;
+    assert y == 2;
+}
+test "b" {
+    assert z;
+    assert z2;
+}
+test "c" {
+    assert w;
+}
+EOF
+printf 'def f(x: int) -> int {\n    return x;\n}\n' > "$W/notatest.jac"
+# Each dimension INDEPENDENTLY: an implementation that only counts asserts passes the first case
+# and fails the second, and vice versa. An always-reject implementation fails the fourth.
+#
+# Each rejection is asserted on its REASON, not merely on a nonzero exit. `if <cmd>; then fail` is
+# satisfied by ANY nonzero -- including check_scope's usage arm (exit 2) after an arity change, and
+# including a crash on an unreadable file. Section 4 shipped exactly that hole until Task 6.
+if jac run scripts/check_scope.jac weakened t.jac "$W/old.jac" "$W/fewer-asserts.jac" > "$W/fa.txt"; then
+    fail "guard accepted a diff that deleted an assert"
+fi
+grep -q '^VIOLATION t.jac assert-count-reduced-3-to-2$' "$W/fa.txt" \
+    || fail "the deleted assert was not reported as an assert-count reduction: $(tr '\n' ' ' < "$W/fa.txt")"
+if jac run scripts/check_scope.jac weakened t.jac "$W/old.jac" "$W/fewer-tests.jac" > "$W/ft.txt"; then
+    fail "guard accepted a diff that deleted a whole test block while keeping the assert count"
+fi
+grep -q '^VIOLATION t.jac test-count-reduced-2-to-1$' "$W/ft.txt" \
+    || fail "the deleted test block was not reported as a test-count reduction: $(tr '\n' ' ' < "$W/ft.txt")"
+# ...and the deleted-test case must NOT also claim an assert reduction: the fixture keeps all three
+# asserts, so a guard reporting both dimensions on every rejection would be indistinguishable from
+# one that watches only a single counter and labels it twice.
+grep -q 'assert-count-reduced' "$W/ft.txt" \
+    && fail "the guard reported an assert-count reduction for a diff that kept every assert"
+jac run scripts/check_scope.jac weakened t.jac "$W/old.jac" "$W/stronger.jac" >/dev/null \
+    || fail "guard rejected a diff that STRENGTHENED the tests; the coverage task could never ship"
+jac run scripts/check_scope.jac weakened f.jac "$W/notatest.jac" "$W/notatest.jac" > "$W/out.txt" \
+    || fail "guard rejected a non-test file"
+# ...and it must say WHICH of the two it did, so a night's log can never claim a comparison that
+# did not happen. This is the positive assertion, not the absence of a VIOLATION line.
+grep -q '^SKIP f.jac' "$W/out.txt" || fail "guard did not report that it skipped a non-test file"
+jac run scripts/check_scope.jac weakened t.jac "$W/old.jac" "$W/stronger.jac" > "$W/out2.txt"
+grep -q '^OK t.jac 3 asserts / 2 tests preserved' "$W/out2.txt" \
+    || fail "guard did not report the strength it actually compared: $(cat "$W/out2.txt")"
+rm -rf .jac
+# The CLI being correct is worthless if S4 never calls it. Source-level, and said plainly: this is
+# a grep, not a behavioural test -- verify_branch cannot be driven here without a checkout, a jac
+# check and the CI mirror. Plan 2 Task 7 Step 7 exercises the real stage against a real branch once,
+# by hand; this only stops the whole stage from being deleted while section 13 stays green.
+grep -q 'ns_jac check_scope weakened' lib/verify.sh \
+    || fail "lib/verify.sh no longer runs the test-weakening guard; section 13 would keep testing a CLI nothing calls"
+grep -q 'test-weakening guard: compared' lib/verify.sh \
+    || fail "lib/verify.sh no longer logs how many files the test-weakening guard compared; a stage that silently compared zero is the failure this guard exists to prevent"
+echo "test-weakening guard fires on assert count and test count independently"
+
 # Sections 15-18 are RESERVED: docs/superpowers/plans/RECONCILIATION.md allocates 11-14 to Plan 2
 # (task registry) and 15-18 to Plan 3 (ship path); all four v2 plans independently claimed "section
 # 11". Plan 4 owns 19-23. The gap is deliberate — renumbering later would silently reorder the

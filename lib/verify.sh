@@ -297,6 +297,32 @@ verify_branch() {
             verify_red "$branch" "scope violation (possible prompt injection): $(head -3 "$LOG_DIR/scope-violations.txt" | tr '\n' ' ')"
             return 1
         fi
+
+        # 1b. TEST-WEAKENING guard. The coverage task may modify an existing test file; weakening
+        #     one is how this task fails while gating green, so it is checked before anything
+        #     expensive. Applied to EVERY task, not just coverage: the cheapest way for any theme
+        #     to turn a red suite green is to delete the assertion.
+        local tw_files tw_rc=0 tw_checked=0 tw_f tw_old
+        tw_files="$(git diff --name-status "$NS_REPO_DEFAULT_BRANCH...HEAD" | awk '$1 == "M" { print $2 }')" || tw_rc=$?
+        case "$tw_rc" in
+            0) : ;;
+            *) ns_die "$EX_BUG" "could not list modified files for the test-weakening guard (rc=$tw_rc). An empty list here is indistinguishable from 'this branch modified nothing', which is exactly how a weakened test would sail through." ;;
+        esac
+        : > "$LOG_DIR/test-weakening.txt"
+        # word-split is deliberate; repo paths contain no spaces (same assumption as the shard
+        # findings list in lib/tier2.sh, and a violation of it fails loudly on the git show below)
+        for tw_f in $tw_files; do
+            git -C "$REPO" cat-file -e "$NS_REPO_DEFAULT_BRANCH:$tw_f" 2>/dev/null || continue
+            tw_old="$LOG_DIR/tw-old-$(printf '%s' "$tw_f" | tr / _)"
+            git -C "$REPO" show "$NS_REPO_DEFAULT_BRANCH:$tw_f" > "$tw_old" \
+                || ns_die "$EX_BUG" "git show $NS_REPO_DEFAULT_BRANCH:$tw_f failed; the test-weakening guard cannot compare what it cannot read, and skipping it silently is how a weakened test ships."
+            if ! ns_jac check_scope weakened "$tw_f" "$tw_old" "$REPO/$tw_f" >> "$LOG_DIR/test-weakening.txt"; then
+                verify_red "$branch" "test weakened: $(grep VIOLATION "$LOG_DIR/test-weakening.txt" | head -2 | tr '\n' ' ')"
+                return 1
+            fi
+            tw_checked=$((tw_checked + 1))
+        done
+        ns_log S4 "test-weakening guard: compared $tw_checked modified file(s) against $NS_REPO_DEFAULT_BRANCH"
     fi
 
     # 2. type-check changed .jac files, BASELINE-DIFF style. The repo is not clean under

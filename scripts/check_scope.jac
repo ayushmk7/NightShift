@@ -6,6 +6,10 @@ argv:  check <theme.json> <config.toml> <task>  theme-scoped gate (apply branche
                                               name lib/common.sh's ns_task_of_branch derived from
                                               the BRANCH, and it -- not the theme -- decides
                                               whether this diff may write inside a protected glob.
+       weakened <path> <old_file> <new_file>  reject a diff that REMOVES asserts or test blocks
+                                              from an existing test file (exit 1), else print what
+                                              was compared (OK ...) or that there was nothing to
+                                              compare (SKIP ...)
        protected <config.toml>                print the stdin paths that hit a protected glob
                                               (tier-1 uses this to revert formatter overreach)
 Exit 0 = diff contained; exit 1 = violation(s), one `VIOLATION <path> <reason>` line each.
@@ -16,6 +20,7 @@ this theme, that the file is entirely about code the theme is deleting) AND the 
 clean deletion (status "D"), never a modification.
 """
 import sys;
+import re;
 import from nslib {
     eprint, read_stdin, parse_obj, as_dict, as_list, is_protected, load_globs, fragment_path,
     load_config_toml, VALID_FRAGMENT_KINDS
@@ -89,6 +94,40 @@ def violations(changed: list[tuple[str, str]], theme: dict, globs: list[str],
     return out;
 }
 
+"""Assert count and test-block count for one file's contents.
+
+ponytail: token counting, not semantics. "Is this test weaker" is a semantic question, and the
+failure mode actually being defended against -- delete the assertion that fails, keep the suite
+green -- moves both counters. The word boundary keeps `assertion` in a comment from counting; a
+string literal containing the word still would, and that false POSITIVE is the safe direction.
+Upgrade path: compare `jac test` collected item ids before and after, which also catches a test
+renamed out of existence while the counts stay equal."""
+def test_strength(text: str) -> (int, int) {
+    asserts: int = len(re.findall("(?:^|[^\\w])assert(?![\\w])", text));
+    tests: int = len(re.findall("(?m)^\\s*test\\s", text));
+    return (asserts, tests);
+}
+
+"""The coverage task MAY modify an existing test file. It may never weaken one. Returns one
+VIOLATION per reduced dimension. A file with no test blocks on the default branch has no strength
+to lose, so it returns nothing -- correct rather than vacuous, since the caller only ever hands
+this MODIFIED files and logs how many it compared."""
+def weakened(path: str, old_text: str, new_text: str) -> list[str] {
+    (old_a, old_t) = test_strength(old_text);
+    if old_t == 0 {
+        return [];
+    }
+    (new_a, new_t) = test_strength(new_text);
+    out: list[str] = [];
+    if new_a < old_a {
+        out.append("VIOLATION " + path + " assert-count-reduced-" + str(old_a) + "-to-" + str(new_a));
+    }
+    if new_t < old_t {
+        out.append("VIOLATION " + path + " test-count-reduced-" + str(old_t) + "-to-" + str(new_t));
+    }
+    return out;
+}
+
 def parse_name_status(text: str) -> list[tuple[str, str]] {
     out: list[tuple[str, str]] = [];
     for line in text.splitlines() {
@@ -119,6 +158,30 @@ with entry {
             print(v);
         }
         sys.exit(1 if found else 0);
+    } elif len(args) == 5 and args[1] == "weakened" {
+        with open(args[3], "r") as fo {
+            old_text: str = fo.read();
+        }
+        with open(args[4], "r") as fn {
+            new_text: str = fn.read();
+        }
+        found2: list[str] = weakened(args[2], old_text, new_text);
+        for v in found2 {
+            print(v);
+        }
+        if not found2 {
+            # PRINT what was compared. Silence on success is indistinguishable from a guard that
+            # returned early, and lib/verify.sh logs a count it would otherwise have no way to
+            # justify -- the did-not-run-scored-as-passed shape, in the stage that exists to catch
+            # exactly that in the agent's work.
+            (chk_a, chk_t) = test_strength(old_text);
+            if chk_t == 0 {
+                print("SKIP " + args[2] + " no test blocks on the default branch");
+            } else {
+                print("OK " + args[2] + " " + str(chk_a) + " asserts / " + str(chk_t) + " tests preserved");
+            }
+        }
+        sys.exit(1 if found2 else 0);
     } elif len(args) == 3 and args[1] == "protected" {
         globs2: list[str] = load_globs(args[2]);
         for path in [l.strip() for l in read_stdin().splitlines() if l.strip()] {
@@ -128,6 +191,7 @@ with entry {
         }
     } elif len(args) > 1 and args[1] != "test" {
         eprint("usage: git diff --name-status main...HEAD | jac run check_scope.jac check <theme.json> <config.toml> <task>");
+        eprint("       jac run check_scope.jac weakened <path> <old_file> <new_file>");
         eprint("       git diff --name-only | jac run check_scope.jac protected <config.toml>");
         # NONZERO, and deliberately not 1 (which means "violations found"). This arm used to exit
         # 0, so any future arity drift -- exactly the kind Task 6 is about to introduce when
@@ -238,6 +302,33 @@ test "an unknown task is fatal, never an empty exemption list" {
         raised = True;
     }
     assert raised;
+}
+
+test "test_strength counts asserts and test blocks, and ignores prose" {
+    src: str = "test \"a\" {\n    assert x == 1;\n    assert(y);\n}\n# assertion in a comment\ntest \"b\" {\n    assert z;\n}\n";
+    (a, t) = test_strength(src);
+    assert a == 3;
+    assert t == 2;
+}
+
+test "weakened fires on EITHER dimension, independently" {
+    old: str = "test \"a\" {\n    assert x;\n    assert y;\n}\ntest \"b\" {\n    assert z;\n}\n";
+    # fewer asserts, same number of tests
+    fewer_asserts: str = "test \"a\" {\n    assert x;\n}\ntest \"b\" {\n    assert z;\n}\n";
+    assert len(weakened("t.jac", old, fewer_asserts)) == 1;
+    # same number of asserts, one fewer test block
+    fewer_tests: str = "test \"a\" {\n    assert x;\n    assert y;\n    assert z;\n}\n";
+    assert len(weakened("t.jac", old, fewer_tests)) == 1;
+    # strictly more of both is the whole point of the coverage task
+    stronger: str = old + "test \"c\" {\n    assert w;\n}\n";
+    assert weakened("t.jac", old, stronger) == [];
+    # unchanged is fine
+    assert weakened("t.jac", old, old) == [];
+}
+
+test "a file that was never a test file cannot be weakened" {
+    src: str = "def f(x: int) -> int {\n    return x;\n}\n";
+    assert weakened("f.jac", src, "def f(x: int) -> int {\n    return 0;\n}\n") == [];
 }
 
 test "parse_name_status splits STATUS and path, tolerates blank lines" {
