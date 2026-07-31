@@ -1866,7 +1866,14 @@ ns_wall="$(sed -n 's/^wallclock_min *= *\([0-9]*\).*/\1/p' config/nightshift.tom
 # the correct file forever -- which is how a tripwire gets deleted rather than fixed. (Caught by
 # running it: the first version of this check went red on the very plist it was written to bless.)
 # Section 9b's "comment lines stripped first" note is the same lesson in the same file.
-ns_plist_args="$(grep '<string>' config/com.nightshift.installed.plist)"
+# `|| true` plus an explicit empty check, not a bare assignment: a plist with no <string> elements
+# makes grep exit 1, and under this file's `set -e` the assignment alone would kill the harness with
+# a bare status and no message. Failing closed is right; failing closed SILENTLY is how a section
+# gets blamed on flakiness and deleted. Every `case` below would also match vacuously against "".
+ns_plist_args="$(grep '<string>' config/com.nightshift.installed.plist || true)"
+case "$ns_plist_args" in
+    "") fail "config/com.nightshift.installed.plist has no <string> elements at all -- the plist checks below would every one of them pass against an empty string" ;;
+esac
 case "$ns_plist_args" in
     *osascript*) fail "the tracked plist still EXECUTES osascript; that indirection exists only for an external-volume tree and would exec whatever path is baked into its AppleScript" ;;
 esac
