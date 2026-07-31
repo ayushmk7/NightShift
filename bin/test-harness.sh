@@ -1842,4 +1842,58 @@ assert "<table" in html and "</html>" in html, html[:200]
 PY
 echo "digest fires unconditionally, cannot abort the trap, and stays offline in dry-run"
 
+echo "== 24. window: plist StartCalendarInterval and [budgets].wallclock_min are one window =="
+# Two tracked files state one window. A mismatch does not fail loudly -- bin/nightshift.sh's
+# watchdog TERMs the run wallclock_min minutes after start, so a 23:00 fire against a stale
+# wallclock_min just ends the night early and reports a clean timeout. Both files are TRACKED, so
+# this check can never skip for a host reason (unlike section 5, which skips without work/repo).
+#
+# Section 24, not 11: RECONCILIATION.md allocates 11-14 to Plan 2, 15-18 to Plan 3, 19-23 to Plan 4
+# and 24 to Plan 5, because all four plans were written independently and all four said "11".
+ns_hour="$(sed -n 's/.*<key>Hour<\/key><integer>\([0-9]*\)<\/integer>.*/\1/p' \
+    config/com.nightshift.installed.plist | head -1)"
+ns_wall="$(sed -n 's/^wallclock_min *= *\([0-9]*\).*/\1/p' config/nightshift.toml | head -1)"
+[ -n "$ns_hour" ] && [ -n "$ns_wall" ] || fail "could not read the fire hour or wallclock_min"
+[ "$(( ns_wall % 60 ))" -eq 0 ] || fail "wallclock_min=$ns_wall is not a whole number of hours"
+[ "$(( (ns_hour + ns_wall / 60) % 24 ))" -eq 7 ] \
+    || fail "window ends at $(( (ns_hour + ns_wall / 60) % 24 )):00, not 07:00 (spec section 4): fire hour $ns_hour + ${ns_wall}m"
+# The plist that launchd runs must be the one this section just validated. Checking only the
+# window would leave the whole Task 4 change inert if the osascript form were still in the file:
+# the fire hour and the ceiling would agree perfectly about a plist that execs the OLD tree.
+#
+# Matched on <string> ELEMENTS, never on the bare word: this plist's own comment explains at length
+# what the osascript indirection was and why it went, so a plain `grep -q osascript` fails against
+# the correct file forever -- which is how a tripwire gets deleted rather than fixed. (Caught by
+# running it: the first version of this check went red on the very plist it was written to bless.)
+# Section 9b's "comment lines stripped first" note is the same lesson in the same file.
+ns_plist_args="$(grep '<string>' config/com.nightshift.installed.plist)"
+case "$ns_plist_args" in
+    *osascript*) fail "the tracked plist still EXECUTES osascript; that indirection exists only for an external-volume tree and would exec whatever path is baked into its AppleScript" ;;
+esac
+case "$ns_plist_args" in
+    *'/nightshift/bin/nightshift.sh'*) : ;;
+    *) fail "the tracked plist does not exec a .../nightshift/bin/nightshift.sh" ;;
+esac
+case "$ns_plist_args" in
+    */Volumes/*) fail "the tracked plist points at an external volume again; macOS TCC hangs a headless launchd agent that touches one, across every identity it forks" ;;
+esac
+# The fired-date log is the ONLY evidence that separates "launchd fired and the run died" from
+# "launchd never fired", and lib/preflight.sh's two missed-night classes are built on it. It is
+# written by the plist and read by preflight, so neither file alone would notice the link breaking:
+# assert BOTH ends name the same path.
+case "$ns_plist_args" in
+    *nightshift-fired.log*) : ;;
+    *) fail "the tracked plist no longer appends to nightshift-fired.log; lib/preflight.sh's fired-vs-never-fired classification has no input without it" ;;
+esac
+grep -q 'Library/Logs/nightshift-fired.log' lib/preflight.sh \
+    || fail "lib/preflight.sh no longer reads ~/Library/Logs/nightshift-fired.log, but the plist still writes it -- the two ends of the missed-night evidence chain have drifted apart"
+# Both missed-night classes must exist. The never-fired one is the whole point: 2026-07-28 fired
+# zero times and was invisible to the old fire-line-driven loop, because an absence of evidence
+# cannot appear in a list of events.
+grep -q 'NEVER FIRED' lib/preflight.sh \
+    || fail "lib/preflight.sh lost the never-fired missed-night class; a schedule that stops firing is silent again"
+grep -q 'grep -qxF' lib/preflight.sh \
+    || fail "lib/preflight.sh no longer matches the fire log with grep -qxF; a substring/regex match reports a night that never fired as 'fired and died'"
+echo "window ok: fires ${ns_hour}:00, ceiling ${ns_wall}m, ends 07:00; direct invocation, fire log intact"
+
 echo "ALL HARNESS TESTS PASSED"

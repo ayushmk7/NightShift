@@ -94,7 +94,14 @@ loc_per_theme      = 600                     # was 300 -- was silently dropping 
                                               # file, high-confidence dead-code finds outright (a
                                               # real 492-line dead file never even got considered:
                                               # 0 + 492 > 300 killed it before packing tried).
-wallclock_min      = 180                     # hard ceiling for the whole night
+wallclock_min      = 480                     # 23:00 -> 07:00, an 8h ceiling (spec section 4; was 180
+                                              # with an 02:00 fire). THIS NUMBER AND THE PLIST'S
+                                              # StartCalendarInterval ARE ONE WINDOW STATED TWICE:
+                                              # bin/nightshift.sh's watchdog sleeps wallclock_min*60
+                                              # from process start and TERMs the run, so a plist that
+                                              # fires at 23:00 against a stale 180 kills the night at
+                                              # 02:00 and it looks like a clean timeout. Change both
+                                              # or neither; bin/test-harness.sh section 24 checks it.
 inventory_min      = 120                     # ceiling for S1.6. Re-gating one open PR costs what S4
                                               # costs (~40min worst case), so N open PRs can eat the
                                               # whole night and ship nothing new. When this is spent
@@ -149,7 +156,9 @@ smtp_port = 465                              # SSL; creds live in ~/.nightshift.
 # `jac_repo` is the target repo's dev binary (built by fresh_env.sh) used for the jaseci
 # gates (jac check/test/format) and the agent sessions — it tracks the repo's version.
 jac      = "/Users/ayush/.local/bin/jac"
-jac_repo = "/Volumes/ExtremePro/JaseciLabs/NightShift/work/repo/jac/zig-out/bin/jac"
+# Literal /Users/..., never `~` or `$HOME`: this file is read by scripts/config.jac and by
+# ns_bootstrap_jac's `sed` (lib/common.sh:21), neither of which expands shell metacharacters.
+jac_repo = "/Users/ayush/nightshift/work/repo/jac/zig-out/bin/jac"
 claude   = "/Users/ayush/.local/bin/claude"
 gh       = "/opt/homebrew/bin/gh"
 precommit = "/Users/ayush/.local/bin/pre-commit"
