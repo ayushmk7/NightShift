@@ -12,8 +12,29 @@
 
 [source]
 workflow = ".github/workflows/ci.yml"
-sha256   = "8b8d9efcfbb1f298c5e32b4518a434f0dfc5bb370c2fdff17d43ca8a39f4f4e8"
-# RE-SYNCED 2026-07-30 after the post-reset upstream pull moved work/repo from bf505dc09 to
+sha256   = "9f11c82472d0af2420695c66f0e42ba217985b65f6aad99e2e1e1f94e240c698"
+# RE-SYNCED 2026-07-30 (Plan 5 Task 5 Step 2) at the NEW location. The fresh clone of the fork put
+# work/repo at 897bd55ce -> 0be9ea55f via `gh repo sync`, and the tripwire fired. Exactly ONE commit
+# touched ci.yml across that range -- 6667717f5 ("perf(cli): lazy CLI startup", #7447) -- and unlike
+# every previous re-sync it DID change a mirrored command string, so the commands moved BEFORE the
+# hash did:
+#   - The fmt exclusion regex gained `/manifest\.impl\.jac$` in all three ci.yml sites (:346 scoped,
+#     :357 whole-repo, :388 fixer). [jobs.fmt] transcribes the SCOPED one, so it is updated to
+#     match. Left stale, the mirror would have run `jac fmt --check` over a generated
+#     manifest.impl.jac that upstream deliberately skips -- a false RED on a file the agent never
+#     chose to touch.
+#   - jac-check gained `jac gen-cli-manifest --verify` (:419-421). Added to [jobs.jir]; see there.
+#   - jac-check ALSO gained a "Run CLI startup regression tests" step (:423-431) running four
+#     jac/tests/cli/test_*.jac files serially. DELIBERATELY NOT MIRRORED, and this is a known gap of
+#     the same kind as the scale gap at the bottom of this file, not an oversight: a new test
+#     command needs a recorded baseline (`nightshift.sh baseline`) and a gated_suites_from_diff
+#     routing entry, or assert_suite_ran refuses to score it at all. Three of the four already run
+#     inside [jobs.runtime], which collects jac/tests wholesale from `cd jac`; the gap is that they
+#     are not run with CI's JAC_TEST_JOBS=0 serialization. WHEN TO CLOSE IT: the next time a suite
+#     baseline is recorded anyway. The failure mode is a visible upstream red on the PR, never a
+#     silent local green.
+#
+# Earlier note, kept for provenance. RE-SYNCED 2026-07-30 after the post-reset upstream pull moved work/repo from bf505dc09 to
 # e61124559. Two commits touched ci.yml: 203d9162d ("ci: reuse the build-jac artifact instead of
 # rebuilding per job", #7796) and e61124559 ("test(scale): testing-trophy migration", #7628). The
 # whole diff was re-read line by line; NO mirrored command string changed, so `commands` below are
@@ -66,7 +87,7 @@ ci_job = "jac-check"
 # harness itself is broken", not "the branch under test is unformatted" -- and scoping `|| true`
 # to ONLY the `git diff | grep` pipeline that legitimately CAN be empty.
 commands = [
-  '''BASE="$(git merge-base "$NS_REPO_DEFAULT_BRANCH" HEAD 2>&1)" || { echo "ERROR: could not compute merge-base for jac fmt scoping: $BASE" >&2; exit 70; }; FILES="$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD -- '*.jac' | grep -vE '(/fixtures/|^scripts/|/passes/native/llvm/|_err\.jac$)' || true)"; if [ -z "$FILES" ]; then echo "No formattable .jac files changed; skipping format check."; else printf '%s\n' "$FILES" | tr '\n' '\0' | xargs -0 --no-run-if-empty jac fmt --check --lintfix; fi''',
+  '''BASE="$(git merge-base "$NS_REPO_DEFAULT_BRANCH" HEAD 2>&1)" || { echo "ERROR: could not compute merge-base for jac fmt scoping: $BASE" >&2; exit 70; }; FILES="$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD -- '*.jac' | grep -vE '(/fixtures/|^scripts/|/passes/native/llvm/|_err\.jac$|/manifest\.impl\.jac$)' || true)"; if [ -z "$FILES" ]; then echo "No formattable .jac files changed; skipping format check."; else printf '%s\n' "$FILES" | tr '\n' '\0' | xargs -0 --no-run-if-empty jac fmt --check --lintfix; fi''',
 ]
 
 [jobs.check]
@@ -115,10 +136,23 @@ commands = [
 
 [jobs.jir]
 ci_job = "jac-check"
-# ci.yml:415-417. Deleting a symbol during a dead-code sweep can invalidate the generated
-# registry, which CI verifies. Without this, dead-code PRs fail CI on a file the agent
-# never touched.
-commands = ["jac gen-jir-registry --verify"]
+# The GENERATED-ARTIFACT verifies from jac-check. Both are here for one reason: deleting or moving a
+# symbol during a janitorial sweep can invalidate a file the agent never touched, and without these
+# the PR fails upstream CI on exactly that.
+#
+#   1. ci.yml:415-417, `jac gen-jir-registry --verify`.
+#   2. ci.yml:419-421, `jac gen-cli-manifest --verify` -- ADDED 2026-07-30 with the re-sync to
+#      6667717f5 (#7447, "lazy CLI startup"), which introduced it. Same job, same shape, same
+#      failure mode: the CLI route table is generated from the command tree, so a dead-code pass
+#      over jac/jaclang/cli is precisely what invalidates it. Measured on this host: 13s, and it
+#      writes its comparison copy into a mktemp dir, never into the checkout -- so it stays a
+#      VERIFY and bin/test-harness.sh section 6's "no mirror job may mutate the tree" holds.
+#
+# Kept in [jobs.jir] rather than a new [jobs.manifest] deliberately: a new job would have to be
+# added to lib/verify.sh's fast-job loop AND to bin/test-harness.sh section 8's membership pin, and
+# cimirror_job already runs every command of a job in order. The job key is a schedule slot, not a
+# name for a single command.
+commands = ["jac gen-jir-registry --verify", "jac gen-cli-manifest --verify"]
 
 [jobs.byllm]
 ci_job = "test-packages-and-docs"
