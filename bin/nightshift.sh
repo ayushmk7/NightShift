@@ -132,6 +132,28 @@ EOF
 cmd="${1:-}"; shift || true
 ns_load_config
 
+# The TARGET REPO's dev jac must be findable as a bare `jac`. scripts/fresh_env.sh ends with
+# "Ensure 'jac' stays on PATH for the git hooks" and it means it: `jac precommit --install` writes
+# work/repo/.git/hooks/pre-commit as `exec jac precommit --staged --verify`, so EVERY `git commit`
+# the harness makes inside that repo or any of its worktrees runs it -- lib/sync.sh:56,
+# lib/ship.sh:22,144, lib/promote.sh:117,161, lib/tier2.sh:529, lib/verify.sh:576 -- as does the
+# agent's own `git commit` (its allowedTools list in lib/tier2.sh), and the same session is granted
+# Bash(jac fmt *) / Bash(jac check *) / Bash(jac test *), all bare.
+#
+# This never mattered before Plan 5. The old plist asked Terminal.app to run the script, so the
+# harness inherited a LOGIN SHELL's PATH. The direct-invocation plist gives it launchd's PATH
+# instead, where no `jac` exists at all -- and the failure is a bare `exec: jac: not found` from a
+# git hook, i.e. a `git commit` exit 1 under errexit with no [FATAL] line. Caught by the Task 9
+# rehearsal: S1 died there, at drafts_bootstrap's very first commit, before any night could reach
+# S3.
+#
+# This does NOT mix the two binaries. Every harness helper is invoked through ns_jac, which uses
+# the absolute "$NS_PATHS_JAC"; ns_bootstrap_jac has already resolved its own path from the toml
+# above, before this line runs. What resolves through PATH is exactly the population that SHOULD
+# get the repo's binary: git hooks and agent sessions. lib/cimirror.sh's cimirror_job and
+# ns_precommit already do this same prepend for their own children.
+export PATH="$(dirname "$NS_PATHS_JAC_REPO"):$PATH"
+
 case "$cmd" in
     run)        ns_run ;;
     dry-run)    export NS_DRY_RUN=1; ns_run ;;

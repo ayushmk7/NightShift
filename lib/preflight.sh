@@ -25,6 +25,25 @@ preflight_main() {
         ns_log S0 "$bin -> $("$bin" --version 2>&1 | head -1)"
     done
 
+    # A BARE `jac` must resolve, and must resolve to the TARGET REPO's binary. Two populations
+    # depend on it and neither goes through $NS_PATHS_*: work/repo's git hooks
+    # (`exec jac precommit --staged --verify`, installed by fresh_env.sh) fire on every commit the
+    # harness or the agent makes, and the apply session's allowedTools grant `Bash(jac fmt *)`,
+    # `Bash(jac check *)`, `Bash(jac test *)` -- all unqualified.
+    #
+    # Checked here rather than trusted because the failure is silent-shaped: an absent `jac` makes
+    # the hook print `exec: jac: not found` and `git commit` return 1, which under errexit inside
+    # ns_stage kills the night with a bare status and no [FATAL] line. Observed exactly that at S1
+    # during the Plan 5 cutover rehearsal. And a jac that resolves to the WRONG binary is worse than
+    # none: the gates would judge the branch with a different compiler than the one that built it.
+    local bare_jac
+    bare_jac="$(command -v jac 2>/dev/null || true)"
+    [ -n "$bare_jac" ] \
+        || ns_die "$EX_BUG" "no bare \`jac\` on PATH — work/repo's git hooks (\`exec jac precommit …\`) and the apply session's Bash(jac …) tools all need one, and their failure looks like a plain \`git commit\` exit 1. PATH=$PATH"
+    [ "$bare_jac" = "$NS_PATHS_JAC_REPO" ] \
+        || ns_die "$EX_BUG" "bare \`jac\` resolves to $bare_jac, not the target repo's dev binary $NS_PATHS_JAC_REPO — the git hooks and the agent's Bash(jac …) tools would run a different compiler than the gates do"
+    ns_log S0 "bare jac -> $bare_jac (git hooks + agent Bash(jac …) tools)"
+
     # CI/CD automation: retry gh auth (may need keychain unlock time)
     if ! ns_retry 3 5 "$NS_PATHS_GH" auth status >/dev/null 2>&1; then
         ns_die "$EX_AUTH" "gh not authenticated (3 attempts failed)"

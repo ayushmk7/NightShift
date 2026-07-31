@@ -1916,6 +1916,53 @@ case "$usr_rc" in
 esac
 grep -q 'USER is unset' lib/preflight.sh \
     || fail "lib/preflight.sh dropped the USER guard; under the direct-invocation plist a stripped environment makes claude report 'Not logged in' and the night dies EX_AUTH pointing at the auth instead of the environment"
+# The other half of the same class: work/repo's git hooks are `exec jac precommit --staged --verify`
+# and the apply session is granted Bash(jac fmt *) / Bash(jac check *) / Bash(jac test *) -- all
+# bare. Under the old osascript plist the harness inherited a login shell's PATH and this was free;
+# under the direct-invocation plist it is not, and the failure is a `git commit` exit 1 with no
+# [FATAL] line. bin/nightshift.sh must therefore put the repo binary's dir on PATH, and preflight
+# must refuse to start without it.
+grep -q 'export PATH="\$(dirname "\$NS_PATHS_JAC_REPO")' bin/nightshift.sh \
+    || fail "bin/nightshift.sh no longer puts the target repo's jac dir on PATH; work/repo's git hooks run 'exec jac' and launchd's PATH has none, so every git commit in the nightly path dies with a bare status"
+# Behavioural, and EXTRACTED from the shipped lib/preflight.sh rather than re-typed, so editing the
+# real guard changes this test's input. (The first version of this check grepped the guard's error
+# MESSAGE and went red against correct code: the message lives in a double-quoted string where the
+# backticks are backslash-escaped, so the file text is `no bare \`jac\` on PATH` and a literal
+# pattern misses it. Matching prose is how a tripwire ends up asserting its own typography.)
+sed -n '/^    local bare_jac$/,/^    ns_log S0 "bare jac/p' lib/preflight.sh > "$T/barejac.sh"
+case "$(grep -c 'ns_die' "$T/barejac.sh")" in
+    2) : ;;
+    *) fail "could not extract the bare-jac guard from lib/preflight.sh (expected its two ns_die arms) -- the drives below would be vacuous. Has the guard been deleted?" ;;
+esac
+bj_drive() {           # bj_drive <label> <want-rc> <PATH> <NS_PATHS_JAC_REPO>
+    local label=$1 want=$2 p=$3 repo=$4 got=0
+    (
+        . "$NS_ROOT/lib/common.sh" 2>/dev/null
+        LOG_DIR="$T/barejac-logs"; mkdir -p "$LOG_DIR"
+        PATH="$p"; NS_PATHS_JAC_REPO="$repo"
+        . "$T/barejac.sh"
+    ) >/dev/null 2>&1 || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "bare-jac guard '$label': expected rc=$want, got rc=$got" ;;
+    esac
+}
+mkdir -p "$T/fakebin" && printf '#!/bin/sh\nexit 0\n' > "$T/fakebin/jac" && chmod +x "$T/fakebin/jac"
+mkdir -p "$T/otherbin" && printf '#!/bin/sh\nexit 0\n' > "$T/otherbin/jac" && chmod +x "$T/otherbin/jac"
+# no jac anywhere on PATH -> the git hooks' `exec jac` would fail and take the night with it
+bj_drive "no jac on PATH" 70 "$T/empty" "$T/fakebin/jac"
+# a jac that is NOT the target repo's binary -> worse than none: the hooks and the agent's
+# Bash(jac …) tools would run a different compiler than the gates do
+bj_drive "wrong jac on PATH" 70 "$T/otherbin" "$T/fakebin/jac"
+# the healthy case must PASS, or the two rejections above prove nothing
+bj_drive "correct jac on PATH" 0 "$T/fakebin" "$T/fakebin/jac"
+# ...and that the PATH line runs AFTER ns_load_config, or $NS_PATHS_JAC_REPO is unbound under set -u.
+ns_cfg_ln="$(grep -n '^ns_load_config$' bin/nightshift.sh | head -1 | cut -d: -f1)"
+ns_path_ln="$(grep -n 'export PATH="\$(dirname "\$NS_PATHS_JAC_REPO")' bin/nightshift.sh | head -1 | cut -d: -f1)"
+case "$ns_cfg_ln" in ''|*[!0-9]*) fail "could not locate ns_load_config in bin/nightshift.sh" ;; esac
+case "$ns_path_ln" in ''|*[!0-9]*) fail "could not locate the jac PATH prepend in bin/nightshift.sh" ;; esac
+[ "$ns_cfg_ln" -lt "$ns_path_ln" ] \
+    || fail "the jac PATH prepend (line $ns_path_ln) runs BEFORE ns_load_config (line $ns_cfg_ln); \$NS_PATHS_JAC_REPO is unbound there and set -u would kill the run"
 echo "window ok: fires ${ns_hour}:00, ceiling ${ns_wall}m, ends 07:00; direct invocation, fire log intact"
 
 echo "ALL HARNESS TESTS PASSED"
