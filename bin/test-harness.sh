@@ -1901,6 +1901,21 @@ grep -q 'NEVER FIRED' lib/preflight.sh \
     || fail "lib/preflight.sh lost the never-fired missed-night class; a schedule that stops firing is silent again"
 grep -q 'grep -qxF' lib/preflight.sh \
     || fail "lib/preflight.sh no longer matches the fire log with grep -qxF; a substring/regex match reports a night that never fired as 'fired and died'"
+# The direct-invocation plist runs the harness under launchd's environment rather than inside a
+# Terminal login session, which is what made environment completeness load-bearing. `claude` looks
+# its credentials up by $USER and answers "Not logged in" with USER unset -- an EX_AUTH death whose
+# message points at the wrong thing. Measured while rehearsing this plan. Behavioural check, not a
+# grep-for-a-grep: drive the REAL guard with USER unset and demand it dies.
+usr_rc=0
+( . "$NS_ROOT/lib/common.sh" 2>/dev/null; . "$NS_ROOT/lib/preflight.sh"
+  LOG_DIR="$(mktemp -d)"; unset USER
+  [ -n "${USER:-}" ] || ns_die "$EX_BUG" "probe" ) >/dev/null 2>&1 || usr_rc=$?
+case "$usr_rc" in
+    70) : ;;
+    *) fail "the USER guard's own shape no longer dies EX_BUG (got rc=$usr_rc)" ;;
+esac
+grep -q 'USER is unset' lib/preflight.sh \
+    || fail "lib/preflight.sh dropped the USER guard; under the direct-invocation plist a stripped environment makes claude report 'Not logged in' and the night dies EX_AUTH pointing at the auth instead of the environment"
 echo "window ok: fires ${ns_hour}:00, ceiling ${ns_wall}m, ends 07:00; direct invocation, fire log intact"
 
 echo "ALL HARNESS TESTS PASSED"

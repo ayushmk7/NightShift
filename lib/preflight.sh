@@ -44,6 +44,21 @@ preflight_main() {
     fi
     ns_jac ledger state-set last_jac_version "\"$jac_ver\"" "$STATE"
 
+    # `claude` resolves its stored credentials through a $USER-derived lookup. With USER unset it
+    # answers `{"is_error": true, "result": "Not logged in · Please run /login"}` with
+    # duration_api_ms 0 -- it never reaches the network -- and the probe below then dies EX_AUTH
+    # with a message that sends the operator to re-authenticate something that is in fact perfectly
+    # healthy. Measured 2026-07-30 while rehearsing this plan's direct-invocation plist:
+    # `env -i HOME=… PATH=…` reproduces it exactly, and adding USER=… alone makes it answer "pong".
+    #
+    # This could not bite under the OLD osascript plist, because Terminal.app handed the script a
+    # full login environment. The direct launchd invocation does not, so environment completeness
+    # became load-bearing with Plan 5. A real LaunchAgent DOES get USER -- measured with a
+    # throwaway probe agent, which printed HOME/LOGNAME/SHELL/TMPDIR/USER/PATH -- so this is a
+    # diagnosis aid for the day something strips it, not a workaround for a known-broken schedule.
+    [ -n "${USER:-}" ] \
+        || ns_die "$EX_BUG" "USER is unset — claude looks its credentials up by \$USER and will report 'Not logged in' however healthy the auth really is. A launchd agent inherits USER normally; if this fires, something stripped the environment (a bare \`env -i\` does)."
+
     # Claude auth pong probe (subscription creds via Keychain or CLAUDE_CODE_OAUTH_TOKEN);
     # ANTHROPIC_API_KEY is unset so a stale key can't shadow the subscription auth
     ns_retry 3 2 claude_pong \
