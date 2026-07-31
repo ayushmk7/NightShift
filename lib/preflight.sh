@@ -54,17 +54,37 @@ preflight_main() {
         ns_die "$EX_BUG" "SMTP_USER/SMTP_PASS not set — source ~/.nightshift.env or fix nightshift.env"
     fi
 
-    # Missed-night detection: launchd's exit code only measures osascript, so a fire that never
-    # became a run (TCC hang, Terminal automation prompt) is invisible to it. The installed plist
-    # appends a dated line to nightshift-fired.log on every fire; a past date with no run dir
-    # means the night vanished — warn, which flows into the next digest via warnings.txt.
-    local fired
-    if [ -f "$HOME/Library/Logs/nightshift-fired.log" ]; then
-        while IFS= read -r fired; do
-            [ -n "$fired" ] && [ "$fired" != "$NS_DATE" ] && [ ! -d "$NS_ROOT/logs/$fired" ] \
-                && ns_warn "missed night: $fired (launchd fired, no run dir)"
-        done < <(tail -7 "$HOME/Library/Logs/nightshift-fired.log" | sort -u)
-    fi
+    # Missed-night detection, two classes, because they have different causes and different fixes.
+    #
+    # FIRED-BUT-NO-RUN: the plist ran and the harness died before mkdir -p $LOG_DIR, so it left no
+    # trace of its own. Diagnosed 2026-07-30 for 07-25/26/29 -- under the OLD osascript plist,
+    # launchd's exit code measured osascript, not the harness. The direct-invocation plist makes
+    # StandardErrorPath the evidence for this class; the warning stays as the cheap index.
+    #
+    # NEVER-FIRED: no fire line AND no run dir. 07-28 was exactly this and was INVISIBLE, because
+    # the old loop only iterated over fire lines -- an absence of evidence cannot appear in a list
+    # of events. This is the class the spec calls worthless-if-silent, so it is enumerated over
+    # CALENDAR DATES, not over the log.
+    #
+    # ponytail: 7 days of `date -v-Nd`, not a scheduler-health subsystem. The ceiling is that eight
+    #           consecutive misses roll off the window. Upgrade path: raise the 7, or have S0 stamp
+    #           a "last successful night" date into state.json and diff against today.
+    local d back fired_log="$HOME/Library/Logs/nightshift-fired.log"
+    for back in 1 2 3 4 5 6 7; do
+        d="$(date -v-${back}d +%F)"
+        [ -d "$NS_ROOT/logs/$d" ] && continue
+        # `if`, not `[ … ] && …`: a false && list returns nonzero, and this loop body is the last
+        # thing that runs before the log prune under an errexit-active caller.
+        #
+        # grep -qxF, not grep -q: fixed-string and whole-line. A bare grep -q "$d" treats the date
+        # as a regex (the dashes are literal but the dots in a future format would not be) and
+        # matches 2026-07-02 inside a longer line.
+        if [ -f "$fired_log" ] && grep -qxF "$d" "$fired_log"; then
+            ns_warn "missed night: $d (launchd fired, no run dir — see ~/Library/Logs/nightshift-launchd.err)"
+        else
+            ns_warn "missed night: $d (launchd NEVER FIRED — check: launchctl list | grep nightshift)"
+        fi
+    done
 
     # prune logs older than 60 nights (TPRD 13)
     find "$NS_ROOT/logs" -maxdepth 1 -type d -name '20*' -mtime +60 -exec rm -rf {} + 2>/dev/null || true
