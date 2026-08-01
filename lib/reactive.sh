@@ -113,7 +113,7 @@ reactive_stage() {
 # Returns 0 ALWAYS. A failed lens costs its own findings, never the night: this runs inside
 # tier2_main, which ns_stage invokes with errexit live.
 reactive_main() {
-    local scope n_files conc task task_list rc=0
+    local scope n_files conc task task_list rc=0 spent
 
     # A poll that never answered is NOT a quiet day, and the two must not read the same. S1.5
     # already wrote the failure row; this only has to avoid claiming the pass was skipped for lack
@@ -177,6 +177,13 @@ reactive_main() {
     for task in $task_list; do
         if [ "$(ns_remaining_min)" -lt $(( NS_BUDGETS_AUDIT_TIMEOUT_MIN + NS_BUDGETS_APPLY_TIMEOUT_MIN )) ]; then
             ns_warn "clock too short to schedule more reactive lenses — stopping at $task"
+            break
+        fi
+        # THE MONEY BRAKE. The four lenses are the single most expensive thing the harness does --
+        # $28.72 on 2026-07-31, of which three lenses produced nothing -- and until this guard
+        # existed nothing could stop them. Checked before SCHEDULING, same as the clock guard above.
+        if ! spent="$(ns_spend_check)"; then
+            ns_warn "NIGHT COST CEILING reached ($spent USD) — stopping the reactive pass at $task; no further audit sessions will be scheduled tonight"
             break
         fi
         ns_jobs_wait "$conc"

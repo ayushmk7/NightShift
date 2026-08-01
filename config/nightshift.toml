@@ -111,14 +111,77 @@ inventory_min      = 120                     # ceiling for S1.6. Re-gating one o
                                               # deliberately NOT clamped to wallclock_min: the
                                               # watchdog in bin/nightshift.sh is the hard stop, and
                                               # two ceilings that can disagree is a drift bug.
-audit_timeout_min  = 20                      # 15 was too tight for the jac core package: 07-18 hit the wall twice, 0-byte envelope both times
+audit_timeout_min  = 20                      # 15 was too tight for the jac core package: 07-18 hit the
+                                              # wall twice, 0-byte envelope both times. DELIBERATELY NOT
+                                              # RAISED for the new task lenses: the brief said
+                                              # compiler-core and compiler-passes came back 0 bytes at
+                                              # 20, and the artifacts say otherwise -- both envelopes
+                                              # are 35 KB and 18 KB, both is_error=false, and both
+                                              # produced findings (21 and 9). NOT ONE session on
+                                              # 2026-07-31 was killed by this timebox; the longest audit
+                                              # in the run was 8.0 min. compiler-passes failed SCHEMA
+                                              # VALIDATION, not the clock. The raised audit_max_turns
+                                              # below still fits: at the heaviest measured turn rate
+                                              # (46 turns in 5.6 min = 7.3 s/turn) 130 turns is ~16 min,
+                                              # inside this box. Raise it when a session is actually
+                                              # killed here, and not before.
 apply_timeout_min  = 25                      # per theme session
-audit_max_turns    = 45                      # audit is read-only investigation (grep/read heavy,
-                                              # no edits); 25 was too tight once the prompt started
-                                              # demanding real evidence per finding -- confirmed
-                                              # live: a real audit hit terminal_reason=max_turns
-max_turns          = 80                      # apply session cap; the real cost brake on a subscription
-max_budget_usd     = 5                       # inert on subscription; belt if ever on an API key
+audit_max_turns    = 130                     # audit is read-only investigation (grep/read heavy, no
+                                              # edits). 25, then 45, were both too tight. 2026-07-31
+                                              # settles it: THREE reactive lenses died at exactly
+                                              # num_turns=46 (subtype=error_max_turns) and contributed
+                                              # nothing, while the audits that FINISHED took 39, 50, 65,
+                                              # 66, 69, 73, 80, 113 and 115 turns. 115 is the observed
+                                              # ceiling for a completed audit, so anything under it
+                                              # truncates work that was going to succeed; 130 is that
+                                              # plus margin, and ~16 min at the heaviest measured turn
+                                              # rate, so it still fits audit_timeout_min above.
+                                              # MORE TURNS COST MORE MONEY -- what keeps that bounded
+                                              # is night_budget_usd below, not this number.
+max_turns          = 80                      # apply session cap
+max_budget_usd     = 5                       # per APPLY session. NOT inert: every session envelope
+                                              # from 2026-07-31 reports a real total_cost_usd, and the
+                                              # night really cost $76.55. Applies are cheap ($0.28-$2.13
+                                              # each, $9.19 for all eleven), so 5 is genuine headroom.
+audit_max_budget_usd = 12                    # per AUDIT session -- the flag audit sessions never got.
+                                              # NOT 5: the audits that succeeded cost up to $9.77
+                                              # (reactive-dead-code, 69 turns, 5 findings), so a 5 here
+                                              # would convert five of the nine successful audits into
+                                              # the truncated-session failure this same fix teaches the
+                                              # harness to report instead of salvage. 12 = the observed
+                                              # ceiling plus headroom for the raised turn cap.
+night_budget_usd   = 50                      # WHOLE-NIGHT ceiling, and the only thing that actually
+                                              # bounds spend: a per-session cap times fifty sessions is
+                                              # not a brake. lib/common.sh sums the total_cost_usd the
+                                              # harness already parses out of every envelope, and the
+                                              # two audit fan-outs (tier2_audit_all, reactive_main) stop
+                                              # SCHEDULING once the sum reaches this, loudly.
+                                              # WHAT IT PROTECTS AGAINST, with the arithmetic: on
+                                              # 2026-07-31 one unattended night spent $76.55 in 97
+                                              # minutes of a 480-minute window -- 27 UNIQUE session_ids,
+                                              # $67.36 of it audits ($28.72 on four reactive lenses of
+                                              # which three produced nothing, $38.36 on eight cycle
+                                              # shards), and only $9.19 on the eleven apply sessions that
+                                              # produced all six shipped branches. $76.55 is a FLOOR, not
+                                              # the total: two attempt-1 Opus audits were overwritten in
+                                              # place by their own retries and survive in no envelope, so
+                                              # the night was nearer $86. (It is NOT $152.82 across 50
+                                              # sessions, which is that same run counted twice -- every
+                                              # meta-<name>.json is a byte-twin of the <name>.json it was
+                                              # projected from. Hence the session_id dedupe in
+                                              # parse_result.spend_total.)
+                                              # 50 fires part-way through the cycle fan-out on that
+                                              # night, so it would have caught it; it still clears the
+                                              # whole reactive pass and it is five times the entire apply
+                                              # phase, so the value-producing half of the night survives
+                                              # the brake.
+                                              # DELIBERATELY NOT CHECKED IN tier2_apply: audits are 88%
+                                              # of the spend and the applies are what ship. Gating them
+                                              # on the same number would mean a night that spent its
+                                              # ceiling auditing throws that work away instead of
+                                              # shipping it. Apply spend is still ACCUMULATED here (so
+                                              # the number is the night's real total); it is the audit
+                                              # scheduling that is gated on it.
 
 [agent]
 # Two models, both pinned. An empty value means "account default", which silently drifts with

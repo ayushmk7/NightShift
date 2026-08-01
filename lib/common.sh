@@ -174,6 +174,55 @@ ns_jobs_wait() {
     done
 }
 
+# --- whole-night cost brake ---------------------------------------------------------------------
+# `--max-budget-usd` bounds ONE session. It does not bound the fifty a night starts, and until this
+# was written the audit sessions -- the expensive ones -- were not given the flag at all. 2026-07-31
+# spent $76.55 across 27 real sessions in 97 minutes of a 480-minute window, $67.36 of it in audits,
+# with nothing in the system that could have stopped it. Raising audit_max_turns (same fix) raises
+# that number, so this accumulator is what keeps it bounded.
+#
+# ponytail: one file of one number per line, one sum, one config value. Every session already
+# reports its own total_cost_usd in the envelope the harness parses anyway; nothing here estimates,
+# projects, or attributes cost to a task.
+#
+# Each row is `<session_id>\t<total_cost_usd>` and parse_result dedupes on the id. That is not
+# decoration: the first attempt to total this night read the envelopes on disk and got $152.82
+# across "50 sessions", exactly double, because every meta-<name>.json is a byte-twin of the
+# <name>.json it was projected from. The real night was 27 unique session_ids and $76.55.
+#
+# CALLED AT THE SESSION, never recovered from the envelopes afterwards, for the other half of that
+# lesson: audit-<name>.json is OVERWRITTEN in place by its own retry, so two real attempt-1 Opus
+# sessions from 2026-07-31 survive in no file and would be missing from any envelope-derived total.
+#
+# Concurrency: the shard and lens jobs run in parallel and all append here. One short line written
+# by one `>>` is far under PIPE_BUF, so appends do not interleave and no lock is needed.
+# Best-effort: a session with no cost in its envelope (0-byte, killed before it printed) records
+# nothing, and losing a row must never change the night's exit code.
+ns_spend_add() {   # ns_spend_add <envelope.json>
+    local row=""
+    if [ -s "$1" ]; then
+        row="$(ns_jac parse_result spend-row < "$1" 2>/dev/null || true)"
+    fi
+    # `case`, not `[ -n ] &&`: this is called on the success path of every session, and a false
+    # `&&` list is itself a nonzero return that would abort an errexit caller.
+    case "$row" in
+        '') return 0 ;;
+    esac
+    printf '%s\n' "$row" 2>/dev/null >> "$LOG_DIR/spend.txt" || true
+    return 0
+}
+
+# rc 0 = budget left, NONZERO = stop scheduling. Prints "<spent> of <ceiling>" either way, so the
+# caller can log the number it stopped on.
+#
+# Fails CLOSED. A missing ledger is $0.00 (parse_result handles that), but a junk ledger, a jac
+# error or a missing NS_BUDGETS_NIGHT_BUDGET_USD all come back nonzero and stop the fan-out. A cost
+# brake that cannot be evaluated must not read as "plenty left" -- that is this repo's dominant
+# defect class ("did not run" scoring as "passed") pointed straight at the bill.
+ns_spend_check() {
+    ns_jac parse_result spend "$LOG_DIR/spend.txt" "$NS_BUDGETS_NIGHT_BUDGET_USD"
+}
+
 ns_remaining_min() {
     local start now elapsed
     start="$(cat "$LOG_DIR/start_epoch")"; now="$(date +%s)"

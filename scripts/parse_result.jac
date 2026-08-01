@@ -9,12 +9,15 @@ argv:  findings | report | meta      (stdin: the full envelope from --output-for
                                        bullet would corrupt the value.)
        len                           (stdin: any JSON array; print its length)
        merge <f1.json> <f2.json> ..  (per-shard findings arrays; print one deduped array)
+       status                        (stdin: an envelope; print `completed` or `unfinished:<why>`)
+       spend <ledger> <ceiling>      (whole-night cost brake; rc 3 once the sum reaches <ceiling>)
 - findings: validate the audit's fenced JSON array; print the normalized array.
 - report:   validate the apply session's fenced JSON object; print the normalized object.
 - meta:     print {num_turns, total_cost_usd, session_id, is_error} for logging/email.
 Malformed output → message on stderr, exit 50 (TPRD 18) so the caller skips the phase.
 """
 import sys;
+import os;
 import json;
 import from nslib {
     eprint, read_stdin, parse_obj, parse_list, as_dict, normalize_fragment_body, score_of
@@ -162,6 +165,97 @@ def merge_findings(arrays: list[list[dict]]) -> list[dict] {
     return out;
 }
 
+"""Did the session RUN TO COMPLETION, or did it die mid-flight?
+
+These are OPPOSITE failures and the corrective re-prompt in tier2_audit_shard only repairs one of
+them. A session killed at the turn cap, at the timebox, or by an API error has NO output to
+correct: the 1-turn re-prompt is handed an empty "Previous output" block, answers `[]`, and an
+expensive truncated audit is recorded as a clean audit that found nothing -- the project's dominant
+defect class, "did not run" scoring as "passed". Observed live 2026-07-31: three reactive lenses
+came back is_error=true / subtype=error_max_turns / num_turns=46 against a cap of 45, with NO
+.result field at all, and all three were logged "salvaged via corrective re-prompt - 0 findings".
+fixtures/session-turn-capped.json is one of those three envelopes, byte for byte.
+
+TOTAL on purpose -- it never raises. A 0-byte or non-JSON envelope is also a session that did not
+finish, and the one thing this must never do is leave the caller with no answer, because the
+caller's fallback for "no answer" is the salvage path this exists to keep it out of."""
+def terminal_status(text: str) -> str {
+    envelope: dict = {};
+    try {
+        envelope = parse_obj(text);
+    } except ValueError {
+        return "unfinished:no-envelope";
+    }
+    if envelope.get("is_error", False) {
+        reason: any = envelope.get("terminal_reason");
+        if reason is None {
+            reason = envelope.get("subtype");
+        }
+        if reason is None {
+            reason = "unknown";
+        }
+        return "unfinished:" + str(reason);
+    }
+    # `.result` absent is the second half, kept separate so the reason NAMES it: the real max-turns
+    # envelope happens to carry both signals, but they are independent and a night is easier to read
+    # when "died at the turn cap" and "ended without ever answering" are different words.
+    if "result" not in envelope {
+        return "unfinished:no-result";
+    }
+    return "completed";
+}
+
+"""Sum a `<session_id>\t<total_cost_usd>` ledger, DEDUPED ON session_id.
+
+--max-budget-usd bounds ONE session; nothing bounded the fifty a night starts, and on 2026-07-31
+the audits alone spent $67.36 of the night's $76.55. Raising audit_max_turns (which this same fix
+does) raises that number, so this sum is what keeps it bounded.
+
+THE ID IS NOT DECORATION. The first attempt to total that night's cost read the logs/ envelopes and
+got $152.82 across "50 sessions" -- exactly double, because every meta-<name>.json is a byte-twin
+of the <name>.json it was projected from and both were summed. The real figure is 27 unique
+session_ids totalling $76.55. Deduping here means a ledger row written twice (a resumed night
+re-entering a stage, a retry loop that records before and after) cannot inflate the total and stop
+the night early, and it makes the ledger checkable against `sort -u`.
+
+The row is appended AT THE SESSION, not summed from envelopes afterwards, for the other half of the
+same lesson: audit-<name>.json is OVERWRITTEN in place by its retry, so two real attempt-1 Opus
+sessions from that night survive in no file and appear in no envelope-derived total at all.
+
+A junk row RAISES rather than being skipped: the caller reads a nonzero status as "stop
+scheduling", so an unparseable ledger fails CLOSED. A brake that cannot be evaluated must never
+read as "plenty left"."""
+def spend_total(lines: list[str]) -> float {
+    seen: set[str] = set();
+    total: float = 0.0;
+    for line in lines {
+        text: str = str(line).strip();
+        if text == "" {
+            continue;
+        }
+        parts: list[str] = text.split("\t");
+        if len(parts) != 2 {
+            raise ValueError("malformed spend row (want <session_id>\\t<usd>): " + text);
+        }
+        sid: str = parts[0];
+        if sid in seen {
+            continue;
+        }
+        seen.add(sid);
+        total += float(parts[1]);
+    }
+    return total;
+}
+
+def read_spend_ledger(path: str) -> list[str] {
+    if not os.path.exists(path) {
+        return [];           # no session has reported a cost yet -- $0.00 spent, not an error
+    }
+    with open(path, "r") as fh {
+        return fh.read().splitlines();
+    }
+}
+
 def meta(envelope: dict) -> dict {
     return {
         "num_turns": envelope.get("num_turns"),
@@ -185,6 +279,34 @@ with entry {
         print(normalize_fragment_body(text), end="");
     } elif cmd == "len" {
         print(len(parse_list(read_stdin())));
+    } elif cmd == "status" {
+        print(terminal_status(read_stdin()));
+    } elif cmd == "spend-row" {
+        # One ledger row for one session, or nothing and rc 1. Emitted at the session rather than
+        # recovered from the envelope later, because the envelope file is overwritten by the retry.
+        row_env: dict = {};
+        try {
+            row_env = parse_obj(read_stdin());
+        } except ValueError {
+            sys.exit(1);
+        }
+        sid_v: any = row_env.get("session_id");
+        cost_v: any = row_env.get("total_cost_usd");
+        if sid_v is None or cost_v is None {
+            sys.exit(1);        # a session that reported no cost puts no row on the ledger
+        }
+        # str() first: `cost_v` is Any out of a dict, and float(Any) does not type-check (E1053).
+        print(str(sid_v) + "\t" + str(float(str(cost_v))));
+    } elif cmd == "spend" and len(args) == 4 {
+        # Prints the running total EITHER WAY so the caller can log the number it stopped on.
+        # rc 3 (not 0/1) so a `spend` that dies for any other reason is still nonzero and still
+        # stops the fan-out: every failure direction here is "stop spending".
+        spent: float = spend_total(read_spend_ledger(args[2]));
+        ceiling: float = float(args[3]);
+        print(f"{spent:.2f} of {ceiling:.2f}");
+        if spent >= ceiling {
+            sys.exit(3);
+        }
     } elif cmd in ["findings", "report", "meta"] {
         try {
             envelope: dict = parse_obj(read_stdin());
@@ -330,6 +452,68 @@ test "merge tolerates empty and single arrays" {
     assert merge_findings([[], []]) == [];
     one: list[dict] = [{"file": "a.jac", "rule": "simplify"}];
     assert len(merge_findings([one])) == 1;
+}
+
+test "a turn-capped session is UNFINISHED, and a completed one is not -- both off the real envelopes" {
+    # fixtures/session-turn-capped.json is logs/2026-07-31/audit-reactive-abstraction.json byte for
+    # byte: is_error true, subtype error_max_turns, num_turns 46 against a cap of 45, no .result.
+    # It was salvaged into "0 findings" on the night it was written; this is the check that says no.
+    with open("fixtures/session-turn-capped.json", "r") as f1 {
+        capped: str = f1.read();
+    }
+    assert terminal_status(capped) == "unfinished:max_turns";
+    # ...and the other half, without which a classifier hardwired to "unfinished" would pass above
+    # and kill every audit in the harness. fixtures/session-completed.json is a real completed one.
+    with open("fixtures/session-completed.json", "r") as f2 {
+        done: str = f2.read();
+    }
+    assert terminal_status(done) == "completed";
+}
+
+test "every shape of 'no usable envelope' is unfinished, never completed" {
+    assert terminal_status("") == "unfinished:no-envelope";            # 0-byte timebox kill
+    assert terminal_status("not json at all") == "unfinished:no-envelope";
+    # an error envelope that names no reason still must not read as completed
+    assert terminal_status(json.dumps({"is_error": True, "result": "partial"})) == "unfinished:unknown";
+    # ...and a session that reports success while having answered nothing is named for THAT
+    assert terminal_status(json.dumps({"is_error": False, "terminal_reason": "completed"})) == "unfinished:no-result";
+    # ...and a plain success envelope with a result is completed, so the salvage still has a caller
+    assert terminal_status(json.dumps({"is_error": False, "result": "x"})) == "completed";
+}
+
+test "spend sums the ledger, dedupes on session_id, and refuses to guess at junk" {
+    assert spend_total([]) == 0.0;
+    assert spend_total(["", "  "]) == 0.0;
+    # the four real reactive-lens costs from 2026-07-31, with their real session ids
+    four: list[str] = ["73bdaaf7-45f7-4980-9d22-5588e3b730da\t9.7682",
+                       "145510c4-6438-4e35-a2a2-f678b6332f17\t7.8939",
+                       "b0000000-0000-0000-0000-000000000003\t6.1155",
+                       "b0000000-0000-0000-0000-000000000004\t4.9464"];
+    assert abs(spend_total(four) - 28.724) < 0.001;
+    # THE DOUBLE COUNT. Summing the same four sessions twice -- which is exactly what reading both
+    # audit-*.json and its meta-*.json byte-twin does -- must not move the total. $152.82 "across 50
+    # sessions" was this bug; the night really cost $76.55 across 27 unique session_ids.
+    assert abs(spend_total(four + four) - 28.724) < 0.001;
+    raised: bool = False;
+    try {
+        spend_total(["abc\t9.77", "def\tfree"]);
+    } except ValueError {
+        raised = True;
+    }
+    assert raised;      # fails CLOSED: the caller reads nonzero as "stop scheduling"
+    # ...and a row with no session_id at all is junk too, not a free session
+    bare: bool = False;
+    try {
+        spend_total(["9.77"]);
+    } except ValueError {
+        bare = True;
+    }
+    assert bare;
+}
+
+test "a ledger that does not exist yet is $0.00 spent, not an error" {
+    assert read_spend_ledger("/nonexistent/nightshift/spend.txt") == [];
+    assert spend_total(read_spend_ledger("/nonexistent/nightshift/spend.txt")) == 0.0;
 }
 
 test "error envelope raises" {

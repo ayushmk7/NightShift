@@ -2115,4 +2115,237 @@ grep -q 'second distinct error' "$CK/logs/check-branch-mod-new.txt" \
 rm -rf .jac
 echo "deleted .jac files: excluded from both baseline sides, named in the PR line, worktree returned clean; new errors still red"
 
+echo "== 26. an audit session that DIED is never salvaged into '0 findings' =="
+# THE 2026-07-31 DEFECT. Three reactive lenses came back is_error=true / subtype=error_max_turns /
+# num_turns=46 against a cap of 45, with no .result field at all. The corrective re-prompt -- which
+# exists to repair MALFORMED JSON FROM A SESSION THAT FINISHED -- was handed an empty "Previous
+# output" block, answered `[]`, and the pipeline logged "salvaged via corrective re-prompt — 0
+# findings" three times: $18.96 of truncated audit filed as three clean audits that found nothing.
+# That is this project's dominant defect class, "did not run" scoring as "passed".
+#
+# Driven against the REAL tier2_audit_shard with a stub claude, over the REAL envelope:
+# fixtures/session-turn-capped.json is logs/2026-07-31/audit-reactive-abstraction.json byte for byte.
+rm -rf .jac
+S26="$(mktemp -d)"
+mkdir -p "$S26/repo" "$S26/reply"
+cat > "$S26/claude" <<'STUB'
+#!/usr/bin/env bash
+n=$(( $(cat "$STUB_CALLS" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$STUB_CALLS"
+printf '%s\n' "$*" >> "$STUB_ARGV"
+if [ -f "$STUB_REPLY_DIR/$n" ]; then cat "$STUB_REPLY_DIR/$n"; else cat "$STUB_REPLY_DIR/default"; fi
+STUB
+chmod +x "$S26/claude"
+
+# A separate bash PROCESS, not `( … ) || fail`: bash suspends errexit for the whole dynamic extent
+# left of a `||`, so the subshell form cannot see a mid-function abort at all and the rc it reports
+# would be the function's `return`, never the abort. Prints "rc=<n> calls=<n>".
+audit_probe() {        # audit_probe <dir>
+    local d=$1 rc=0
+    : > "$d/calls"; : > "$d/argv"; rm -f "$d/failed.tsv" "$d/findings-probe.json" "$d/spend.txt"
+    NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
+        . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"
+        LOG_DIR="$1"; REPO="$1/repo"; NS_PATHS_CLAUDE="$1/claude"
+        export STUB_CALLS="$1/calls" STUB_ARGV="$1/argv" STUB_REPLY_DIR="$1/reply"
+        date +%s > "$1/start_epoch"
+        tier2_audit_shard probe "jac/jaclang/cli/a.jac" dead-code' _ "$d" > "$d/out.txt" 2>&1 || rc=$?
+    printf 'rc=%s calls=%s' "$rc" "$(cat "$d/calls" 2>/dev/null || echo 0)"
+}
+
+# --- A. the real turn-capped envelope: reported as a dead lens, never salvaged ------------------
+cp fixtures/session-turn-capped.json "$S26/reply/default"
+case "$(audit_probe "$S26")" in
+    "rc=1 calls=2") : ;;
+    # calls=2 is the whole point: two audit attempts and ZERO corrective re-prompts. calls=4 is the
+    # old behaviour (a salvage session fired after each dead attempt) and would mean the re-prompt
+    # is still being handed a session with no output.
+    *) fail "a turn-capped audit did not fail cleanly with exactly its two attempts: $(audit_probe "$S26") -- $(cat "$S26/out.txt")" ;;
+esac
+grep -q 'DID NOT FINISH (max_turns)' "$S26/out.txt" \
+    || fail "the log line does not say the session never finished, or does not name why: $(cat "$S26/out.txt")"
+grep -q 'salvaged' "$S26/out.txt" \
+    && fail "a session that died at the turn cap still went through the salvage path"
+[ -e "$S26/findings-probe.json" ] \
+    && fail "a dead audit left a findings file behind; the merge would count it as a lens that ran"
+grep -q 'never finished' "$S26/failed.tsv" \
+    || fail "failed.tsv does not distinguish 'never finished' from 'malformed': $(cat "$S26/failed.tsv" 2>/dev/null)"
+# ...and the money was still recorded. A session that produced nothing usable still spent $7.89.
+[ "$(wc -l < "$S26/spend.txt" | tr -d ' ')" = "2" ] \
+    || fail "the two dead attempts put $(wc -l < "$S26/spend.txt" | tr -d ' ') rows on the night's cost ledger, not 2"
+grep -q '^145510c4-6438-4e35-a2a2-f678b6332f17	7\.8939' "$S26/spend.txt" \
+    || fail "the ledger row is not <session_id>TAB<cost> off the real envelope: $(cat "$S26/spend.txt")"
+# ...and the id is what makes the total honest: the same session recorded twice must not double it.
+[ "$(sort -u "$S26/spend.txt" | wc -l | tr -d ' ')" = "1" ] \
+    || fail "two attempts of one shard wrote two DISTINCT ledger rows; a retry that reuses a session id would inflate the night's total"
+# ...and the audit session was finally given the budget flag it never had.
+grep -q -- '--max-budget-usd' "$S26/argv" \
+    || fail "the AUDIT session is still spawned with no --max-budget-usd; only apply sessions had one"
+
+# --- B. ...and the salvage must still WORK, or A is satisfied by a guard that kills everything ---
+# A completed session whose output is prose, repaired by a one-turn re-prompt. This is the ONLY
+# shape the corrective re-prompt was ever for.
+printf '%s\n' '{"type":"result","subtype":"success","terminal_reason":"completed","is_error":false,"num_turns":9,"total_cost_usd":0.5,"result":"I looked at the file and here is my answer in prose, sorry."}' > "$S26/reply/1"
+printf '%s\n' '{"type":"result","subtype":"success","terminal_reason":"completed","is_error":false,"num_turns":1,"total_cost_usd":0.02,"result":"```json\n[{\"file\":\"jac/jaclang/cli/a.jac\",\"rule\":\"dead-code\",\"snippet\":\"def gone()\",\"summary\":\"unreferenced helper\",\"est_loc_saved\":12,\"confidence\":4,\"risk\":1,\"theme_hint\":\"dead-helper\",\"complexity\":\"mechanical\"}]\n```"}' > "$S26/reply/2"
+case "$(audit_probe "$S26")" in
+    "rc=0 calls=2") : ;;
+    *) fail "a COMPLETED session with malformed JSON was no longer salvaged: $(audit_probe "$S26") -- $(cat "$S26/out.txt")" ;;
+esac
+grep -q 'salvaged malformed JSON from a COMPLETED session — 1 findings' "$S26/out.txt" \
+    || fail "the salvage log line does not say the session had completed: $(cat "$S26/out.txt")"
+[ "$(jac run scripts/parse_result.jac len < "$S26/findings-probe.json")" = "1" ] \
+    || fail "the salvaged finding did not survive into findings-probe.json"
+rm -f "$S26/reply/1" "$S26/reply/2"
+
+# --- C. a 0-byte envelope (timebox kill) is the same class of failure, not a salvage either -----
+printf '' > "$S26/reply/default"
+case "$(audit_probe "$S26")" in
+    "rc=1 calls=2") : ;;
+    *) fail "a 0-byte envelope did not fail cleanly with exactly its two attempts: $(audit_probe "$S26")" ;;
+esac
+grep -q 'DID NOT FINISH (no output' "$S26/out.txt" \
+    || fail "a timebox kill is not reported as a session that did not finish: $(cat "$S26/out.txt")"
+grep -q 'never finished (no-output)' "$S26/failed.tsv" \
+    || fail "failed.tsv did not carry the timebox kill's reason: $(cat "$S26/failed.tsv" 2>/dev/null)"
+
+# --- D. a session that finished but left NO .result must not buy a repair session either -------
+# The re-prompt builds `Previous output:` from `parse_result field result`. That is empty exactly
+# when the parse error was "envelope has no .result field", so the case that most needs repairing
+# is the case the repair session is handed nothing to repair -- and the model's REFUSAL, illustrated
+# with an empty array, parses as a clean "0 findings". This arm is the guard on that, driven with an
+# envelope that passes the is_error check and still carries no output, so C's classifier cannot be
+# what catches it.
+printf '%s\n' '{"type":"result","subtype":"success","terminal_reason":"completed","is_error":false,"num_turns":40,"total_cost_usd":6.1155,"session_id":"empty-result-probe","result":""}' > "$S26/reply/default"
+case "$(audit_probe "$S26")" in
+    "rc=1 calls=2") : ;;
+    *) fail "a completed session with no .result still bought repair sessions: $(audit_probe "$S26") -- $(cat "$S26/out.txt")" ;;
+esac
+grep -q 'NO output to correct' "$S26/out.txt" \
+    || fail "the refusal to run a repair with an empty Previous-output block was not logged: $(cat "$S26/out.txt")"
+[ -e "$S26/findings-probe.json" ] \
+    && fail "an audit with no output at all left a findings file behind"
+rm -rf .jac
+echo "a dead audit session fails as a dead lens; only a COMPLETED session's bad JSON is salvaged"
+
+echo "== 27. the night cost ceiling actually stops work =="
+# 2026-07-31 spent $76.55 across 27 real sessions in 97 minutes of a 480-minute window, $67.36 of it
+# on audits, and nothing in the harness could have stopped it: --max-budget-usd was passed to apply
+# sessions only, and a per-session cap times fifty sessions is not a brake. Driven, with a claude
+# stub that records any invocation -- nothing here can reach a real session even if the guard breaks.
+rm -rf .jac
+S27="$(mktemp -d)"
+mkdir -p "$S27/repo"
+cat > "$S27/claude" <<'STUB27'
+#!/usr/bin/env bash
+touch "$STUB27_CALLED"
+printf '{"is_error":false,"total_cost_usd":0.01,"result":"```json\n[]\n```"}\n'
+STUB27
+chmod +x "$S27/claude"
+printf 'jac/jaclang/cli/a.jac\njac/jaclang/cli/b.jac\n' > "$S27/reactive-files.txt"
+echo '[]' > "$S27/covmap.json"          # pre-seeded so no `jac code map` runs inside the harness
+
+# ns_spend_check's contract, over the REAL cost the harness would have recorded.
+spend_probe() {        # spend_probe <ledger-contents-or-EMPTY> -> "rc=<n> <printed>"
+    local body=$1 rc=0 out
+    rm -f "$S27/spend.txt"
+    case "$body" in EMPTY) : ;; *) printf '%s\n' "$body" > "$S27/spend.txt" ;; esac
+    out="$(NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
+        . "$NS_ROOT/lib/common.sh"; ns_load_config; LOG_DIR="$1"; ns_spend_check' _ "$S27" 2>&1)" || rc=$?
+    printf 'rc=%s %s' "$rc" "$out"
+}
+case "$(spend_probe EMPTY)" in
+    "rc=0 0.00 of 50.00") : ;;
+    *) fail "a night that has spent nothing is not under the ceiling: $(spend_probe EMPTY)" ;;
+esac
+case "$(spend_probe '73bdaaf7-45f7-4980-9d22-5588e3b730da	9.768192500000003')" in
+    "rc=0 9.77 of 50.00") : ;;
+    *) fail "one real session's cost was not summed correctly: $(spend_probe '73bdaaf7-45f7-4980-9d22-5588e3b730da	9.768192500000003')" ;;
+esac
+# the four real reactive-lens costs plus the eight real cycle-shard costs from 2026-07-31: $67.36,
+# which is over the ceiling and is exactly the spend that had nothing stopping it.
+NIGHT_0731="$(awk 'BEGIN{
+    split("9.768192500000003 7.8939439999999985 6.1155 4.9464 5.7347195 4.7166 5.5215 4.6127 5.1156 4.6885 2.9578 5.0077", c, " ")
+    for (i=1; i<=12; i++) printf "session-%02d\t%s\n", i, c[i]
+}')"
+case "$(spend_probe "$NIGHT_0731")" in
+    "rc=3 67.08 of 50.00") : ;;
+    *) fail "the real 2026-07-31 audit spend did not trip the ceiling: $(spend_probe "$NIGHT_0731")" ;;
+esac
+# THE DOUBLE COUNT, through the real reader: the same twelve sessions listed twice -- which is
+# exactly what summing both audit-<name>.json and its meta-<name>.json byte-twin does -- must not
+# move the total. That mistake is where "$152.82 across 50 sessions" came from; the night really
+# cost $76.55 across 27 unique session_ids, and a brake that inflates stops a healthy night early.
+case "$(spend_probe "$NIGHT_0731
+$NIGHT_0731")" in
+    "rc=3 67.08 of 50.00") : ;;
+    *) fail "the ledger double-counted repeated session_ids: $(spend_probe "$NIGHT_0731
+$NIGHT_0731")" ;;
+esac
+# ...and a ledger it cannot read fails CLOSED. A brake that cannot be evaluated must never read as
+# "plenty left" -- that is this repo's dominant defect class pointed at the bill.
+case "$(spend_probe 'sess	free')" in
+    rc=0*) fail "an unreadable cost ledger read as 'budget left': $(spend_probe 'sess	free')" ;;
+esac
+# ...including a bare cost with no session id, which is the pre-dedupe ledger format: silently
+# accepting it would let a stale spend.txt be summed with no way to notice the double count.
+case "$(spend_probe '9.77')" in
+    rc=0*) fail "a ledger row with no session_id read as 'budget left': $(spend_probe '9.77')" ;;
+esac
+
+# DRIVEN: over the ceiling, the reactive fan-out must schedule NOTHING.
+lens_probe() {         # lens_probe <ledger-contents> -> "called=<yes|no>"
+    rm -f "$S27/CLAUDE_WAS_CALLED" "$S27/warnings.txt" "$S27/run.log" "$S27/failed.tsv"
+    printf '%s\n' "$1" > "$S27/spend.txt"
+    NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
+        . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"; . "$NS_ROOT/lib/reactive.sh"
+        LOG_DIR="$1"; REPO="$1/repo"; NS_PATHS_CLAUDE="$1/claude"
+        export STUB27_CALLED="$1/CLAUDE_WAS_CALLED"
+        date +%s > "$1/start_epoch"; reactive_main' _ "$S27" > "$S27/out.txt" 2>&1 \
+        || fail "reactive_main returned nonzero; a spent budget must not fail the night"
+    if [ -e "$S27/CLAUDE_WAS_CALLED" ]; then printf 'called=yes'; else printf 'called=no'; fi
+}
+case "$(lens_probe "$(printf 'spent-it-all\t99.00')")" in
+    "called=no") : ;;
+    *) fail "the reactive pass started an audit session with the night's cost ceiling already spent" ;;
+esac
+grep -q 'NIGHT COST CEILING reached (99.00 of 50.00' "$S27/warnings.txt" \
+    || fail "the brake fired silently, or without the numbers: $(cat "$S27/warnings.txt" 2>/dev/null)"
+# ...and the positive control, without which the assertion above is satisfied by a harness that
+# never schedules anything at all.
+case "$(lens_probe "$(printf 'barely-started\t1.00')")" in
+    "called=yes") : ;;
+    *) fail "the reactive pass scheduled nothing with $48 of budget left; the brake is stuck on" ;;
+esac
+grep -q 'NIGHT COST CEILING' "$S27/warnings.txt" 2>/dev/null \
+    && fail "the brake fired with $48 of budget left"
+
+# ...and the CYCLE fan-out carries its own copy of the guard, which no reactive-pass assertion can
+# reach. Without this arm that copy could be deleted and every test above would still pass -- the
+# exact shape of vacuous guard this repo keeps shipping.
+shard_probe() {        # shard_probe <ledger-row> -> "called=<yes|no>"
+    rm -f "$S27/CLAUDE_WAS_CALLED" "$S27/warnings.txt" "$S27/failed.tsv" "$S27"/findings-*.json
+    printf '%s\n' "$1" > "$S27/spend.txt"
+    NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
+        . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"
+        LOG_DIR="$1"; REPO="$1/repo"; NS_PATHS_CLAUDE="$1/claude"
+        export STUB27_CALLED="$1/CLAUDE_WAS_CALLED"
+        NS_TASK_NAME=dead-code; NS_TASK_SCORING=loc_saved
+        date +%s > "$1/start_epoch"; tier2_audit_all' _ "$S27" > "$S27/shards.txt" 2>&1 || true
+    if [ -e "$S27/CLAUDE_WAS_CALLED" ]; then printf 'called=yes'; else printf 'called=no'; fi
+}
+case "$(shard_probe "$(printf 'spent-it-all\t99.00')")" in
+    "called=no") : ;;
+    *) fail "the cycle audit fan-out scheduled a shard with the night's cost ceiling already spent" ;;
+esac
+grep -q 'NIGHT COST CEILING reached (99.00 of 50.00' "$S27/warnings.txt" \
+    || fail "the cycle fan-out's brake fired silently: $(cat "$S27/warnings.txt" 2>/dev/null)"
+grep -q 'stopping the audit fan-out at' "$S27/warnings.txt" \
+    || fail "the cycle fan-out's warning does not name where it stopped: $(cat "$S27/warnings.txt")"
+# positive control, same reason as the reactive one above
+case "$(shard_probe "$(printf 'barely-started\t1.00')")" in
+    "called=yes") : ;;
+    *) fail "the cycle audit fan-out scheduled nothing with $49 of budget left; its brake is stuck on" ;;
+esac
+rm -rf .jac
+echo "the night ceiling is summed from real envelopes, fails closed, and stops the fan-out for real"
+
 echo "ALL HARNESS TESTS PASSED"

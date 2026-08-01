@@ -109,6 +109,7 @@ tier2_main() {
 # failure -- a dead scope must not kill the tier, the way a dead package used to.
 tier2_audit_shard() {   # tier2_audit_shard <name> <scope> <task>
     local name=$1 scope=$2 task=$3 prompt attempt evidence="" task_env rc=0
+    local session_status="" unfinished=0 prev_output=""
 
     # The TASK's own knobs, resolved here rather than read from the ambient NS_TASK_* that
     # tier2_resolve_task left behind: the shard fan-out runs tonight's one task, but the reactive
@@ -166,13 +167,21 @@ tier2_audit_shard() {   # tier2_audit_shard <name> <scope> <task>
             --model "$audit_model" \
             --permission-mode dontAsk \
             --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
-            --max-turns "$NS_BUDGETS_AUDIT_MAX_TURNS" --output-format json) \
+            --max-turns "$NS_BUDGETS_AUDIT_MAX_TURNS" \
+            --max-budget-usd "$NS_BUDGETS_AUDIT_MAX_BUDGET_USD" --output-format json) \
             > "$LOG_DIR/audit-$name.json" < /dev/null || true
+
+        # Every session's own reported cost goes on the night's ledger, before any parse can fail:
+        # a session that produced nothing usable still spent the money, and the four reactive lenses
+        # that cost $28.72 for five findings are exactly the ones a "record it if it worked"
+        # accumulator would have missed.
+        ns_spend_add "$LOG_DIR/audit-$name.json"
 
         # 0-byte envelope = the timebox killed the session before it printed anything; a longer
         # audit_timeout_min (not a re-prompt) is the lever for that failure mode.
         if [ ! -s "$LOG_DIR/audit-$name.json" ]; then
-            ns_log S3 "audit[$name] attempt $attempt produced no output (killed at ${NS_BUDGETS_AUDIT_TIMEOUT_MIN}m?)"
+            unfinished=1; session_status="unfinished:no-output"
+            ns_log S3 "audit[$name] attempt $attempt DID NOT FINISH (no output — killed at ${NS_BUDGETS_AUDIT_TIMEOUT_MIN}m?)"
             continue
         fi
 
@@ -180,6 +189,7 @@ tier2_audit_shard() {   # tier2_audit_shard <name> <scope> <task>
 
         if ns_jac parse_result findings "$task" "$NS_TASK_SCORING" < "$LOG_DIR/audit-$name.json" \
                 > "$LOG_DIR/findings-$name.json" 2> "$LOG_DIR/parse-err-audit-$name.txt"; then
+            unfinished=0
             ns_log S3 "audit[$name]: $(ns_jac parse_result len < "$LOG_DIR/findings-$name.json" || echo 0) findings"
             return 0
         fi
@@ -192,21 +202,69 @@ tier2_audit_shard() {   # tier2_audit_shard <name> <scope> <task>
             return 1
         fi
 
-        # Live envelope, bad JSON: one cheap single-turn corrective re-prompt before burning
-        # the attempt — two whole nights died to malformed audit output with no salvage.
+        # "DID NOT FINISH" and "finished but emitted bad JSON" are OPPOSITE failures, and the
+        # corrective re-prompt below repairs only the second. A session killed at the turn cap or
+        # the timebox has NO output to correct: the 1-turn re-prompt gets an empty "Previous
+        # output" block, answers `[]`, and an expensive truncated audit is filed as a clean audit
+        # that found nothing. Observed 2026-07-31 — three reactive lenses at num_turns=46 against a
+        # cap of 45, each logged "salvaged via corrective re-prompt — 0 findings", $18.96 spent to
+        # record three empty results. That is this project's dominant defect class, "did not run"
+        # scoring as "passed", and the classifier is in Jac (parse_result status, total by
+        # construction) so no failure of it can land here as "completed".
+        session_status="$(ns_jac parse_result status < "$LOG_DIR/audit-$name.json" 2>/dev/null || echo unfinished:unreadable)"
+        case "$session_status" in
+            unfinished:*)
+                unfinished=1
+                ns_log S3 "audit[$name] attempt $attempt DID NOT FINISH (${session_status#unfinished:}) — no output to correct; this scope FAILED, it did not find zero"
+                rm -f "$LOG_DIR/findings-$name.json"   # 0-byte leftover of the redirect above
+                continue ;;
+        esac
+        unfinished=0
+
+        # SECOND, INDEPENDENT GUARD on the same defect, because the two failures overlap by
+        # construction rather than by coincidence. The re-prompt builds its `Previous output:` block
+        # from `parse_result field result`, and that field is EMPTY exactly when the parse error was
+        # "envelope has no .result field" — so the one case that most needs repairing is the one
+        # case the repair session is handed nothing to repair. It then does the only thing it can:
+        # it refuses in prose and illustrates the refusal with an empty array. From
+        # logs/2026-07-31/audit-repair-reactive-abstraction.json, verbatim:
+        #   "No prior audit in context. 'Previous output' block empty — findings gone ...
+        #    ```json\n[]\n```\n That empty array is placeholder, not result."
+        # The fence was parsed. The refusal became "0 findings". reactive-maintenance escaped only
+        # because its refusal happened to omit the fence — luck, not a guard.
+        # So: NEVER spend a repair session that can only fabricate. Computed ONCE, into a variable,
+        # so the thing that is checked is byte-for-byte the thing that is sent.
+        prev_output="$(ns_jac parse_result field result < "$LOG_DIR/audit-$name.json" 2>/dev/null || true)"
+        case "$prev_output" in
+            "") unfinished=1
+                session_status="unfinished:empty-result"
+                ns_log S3 "audit[$name] attempt $attempt left NO output to correct — refusing the repair session, which could only invent one; this scope FAILED, it did not find zero"
+                rm -f "$LOG_DIR/findings-$name.json"
+                continue ;;
+        esac
+
+        # Live envelope from a session that RAN TO COMPLETION and left real output, bad JSON: one
+        # cheap single-turn corrective re-prompt before burning the attempt — two whole nights died
+        # to malformed audit output with no salvage.
         ns_timebox 3 "$NS_PATHS_CLAUDE" -p "Your audit output failed validation: $(cat "$LOG_DIR/parse-err-audit-$name.txt")
 Previous output:
-$(ns_jac parse_result field result < "$LOG_DIR/audit-$name.json")
+$prev_output
 Re-emit ONLY the corrected \`\`\`json fenced findings array — same schema, no prose." \
             --model "$audit_model" --max-turns 1 --output-format json \
             > "$LOG_DIR/audit-repair-$name.json" < /dev/null || true
+        ns_spend_add "$LOG_DIR/audit-repair-$name.json"
         if ns_jac parse_result findings "$task" "$NS_TASK_SCORING" < "$LOG_DIR/audit-repair-$name.json" > "$LOG_DIR/findings-$name.json"; then
-            ns_log S3 "audit[$name] salvaged via corrective re-prompt — $(ns_jac parse_result len < "$LOG_DIR/findings-$name.json" || echo 0) findings"
+            ns_log S3 "audit[$name] salvaged malformed JSON from a COMPLETED session — $(ns_jac parse_result len < "$LOG_DIR/findings-$name.json" || echo 0) findings"
             return 0
         fi
-        ns_log S3 "audit[$name] attempt $attempt failed to parse even after corrective re-prompt"
+        ns_log S3 "audit[$name] attempt $attempt completed but its output stayed malformed even after corrective re-prompt"
     done
-    ns_fail "audit[$name]" "malformed/failed audit after retry — this scope contributes nothing"
+    # The two outcomes are reported with different words, because "the session never finished" is a
+    # turn/timeout/budget cap to raise and "the output was malformed" is a prompt to fix.
+    case "$unfinished" in
+        1) ns_fail "audit[$name]" "session never finished (${session_status#unfinished:}) after retry — this scope contributes nothing, and its truncated output was NOT converted into an empty result" ;;
+        *) ns_fail "audit[$name]" "malformed audit output after retry — this scope contributes nothing" ;;
+    esac
     rm -f "$LOG_DIR/findings-$name.json"
     return 1
 }
@@ -215,7 +273,7 @@ Re-emit ONLY the corrected \`\`\`json fenced findings array — same schema, no 
 # A session limit collapses the fan-out to serial rather than aborting the tier: the old
 # behavior lost every remaining shard to one limit signal.
 tier2_audit_all() {
-    local shard conc merged
+    local shard conc merged spent
     conc="${NS_SHARDS_CONCURRENCY:-2}"
     rm -f "$LOG_DIR/.session-limit"
 
@@ -261,6 +319,15 @@ tier2_audit_all() {
         # tonight", not a corrupted branch.
         if [ "$(ns_remaining_min)" -lt $(( NS_BUDGETS_AUDIT_TIMEOUT_MIN + NS_BUDGETS_APPLY_TIMEOUT_MIN )) ]; then
             ns_warn "clock too short to schedule more audit shards — stopping the fan-out at $shard (in-flight shards still drain below)"
+            break
+        fi
+        # THE MONEY BRAKE, sitting beside the clock brake because it is the same kind of guard: the
+        # clock never stopped this fan-out on 2026-07-31 (97 minutes of 480) and the bill was the
+        # thing that ran away. Same under-reservation caveat as the clock guard above -- the shards
+        # already in flight still finish and still spend -- so the real ceiling is
+        # night_budget_usd + up to <concurrency> audit sessions.
+        if ! spent="$(ns_spend_check)"; then
+            ns_warn "NIGHT COST CEILING reached ($spent USD) — stopping the audit fan-out at $shard; no further audit sessions will be scheduled tonight"
             break
         fi
         ns_jobs_wait "$conc"
@@ -473,6 +540,12 @@ tier2_apply() {
                 --allowedTools "Read,Edit,Grep,Glob,Bash(jac fmt *),Bash(jac check *),Bash(jac code *),Bash(jac test *),Bash(git diff *),Bash(git status *),Bash(git log *),Bash(git add *),Bash(git rm *),Bash(git commit *),mcp__jac__*" \
                 --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \
                 --output-format json) > "$LOG_DIR/apply-$bslug.json" < /dev/null || true
+
+            # Apply spend is ACCUMULATED but the apply loop is deliberately NOT gated on the night
+            # ceiling — see [budgets].night_budget_usd. Audits are 88% of the bill; the applies are
+            # what ship, and refusing to spend $0.80 shipping work the night already paid $50 to
+            # find would be the expensive kind of thrift.
+            ns_spend_add "$LOG_DIR/apply-$bslug.json"
 
             ns_jac parse_result meta < "$LOG_DIR/apply-$bslug.json" > "$LOG_DIR/meta-apply-$bslug.json" || true
 
