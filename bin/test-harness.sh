@@ -1965,4 +1965,154 @@ case "$ns_path_ln" in ''|*[!0-9]*) fail "could not locate the jac PATH prepend i
     || fail "the jac PATH prepend (line $ns_path_ln) runs BEFORE ns_load_config (line $ns_cfg_ln); \$NS_PATHS_JAC_REPO is unbound there and set -u would kill the run"
 echo "window ok: fires ${ns_hour}:00, ceiling ${ns_wall}m, ends 07:00; direct invocation, fire log intact"
 
+echo "== 25. jac-check baseline: a branch that DELETES a .jac file must not kill the night =="
+# THE case: `dead-code` is task #1 in the cycle and DELETING a file is its happy path. The old
+# baseline swap put every changed .jac on the main side, so for a deleted path it ran
+#     git checkout main -- <path>     # re-creates it, staged as A
+#     git checkout HEAD -- <path>     # "pathspec ... did not match any file(s) known to git", rc=1
+# and the (correct, load-bearing) restore guard turned that into ns_die -- killing the whole night
+# at S4. Reproduced on 2026-07-30 against work/repo's own
+# nightshift/2026-07-30/dead-code-orphan-nongpt, and on a MIXED branch the failed batch restore also
+# left main's content in the worktree for the file the branch really did modify, which is the
+# "gates main and calls it the branch" failure the guard exists to prevent.
+#
+# Driven against the REAL stage, extracted out of the shipped lib/verify.sh rather than re-typed
+# (same technique as section 24's bare-jac guard), over a scratch git repo with tiny .jac files and
+# the harness's own jac as $NS_PATHS_JAC_REPO -- so this section costs ~4s, never touches work/repo,
+# and can never SKIP for a host reason. Each probe runs as its own `bash` process: this file's `set
+# -e` is suspended for the entire left side of `||`, so an in-process subshell would hide any death
+# that is not an explicit exit.
+CK="$T/checkstage"; mkdir -p "$CK"
+{
+    echo 'ns_check_stage() {'
+    # step 2 of verify_branch: the whole jac-check baseline-diff stage
+    awk '/^    local changed_jac changed_all changed_rc=0/{p=1} /^    # 3\. FAST CI-mirror jobs/{p=0} p' lib/verify.sh
+    # ...and the PR-body line it feeds, which is where a mis-keyed summary would claim "jac check ✓"
+    # for a branch the checker was never handed a single file from
+    awk '/^    local check_line/{p=1} /^    case "\$suites" in/{p=0} p' lib/verify.sh
+    echo '    printf "CHECK_LINE=%s\n" "$check_line"'
+    echo '    return 0'
+    echo '}'
+} > "$CK/stage.sh"
+# Vacuity guards on the extraction itself. Every assertion below is only as good as what got
+# extracted: an anchor that stops matching yields a two-line no-op function that returns 0 for
+# every probe and passes this entire section while testing nothing.
+bash -n "$CK/stage.sh" || fail "the stage extracted from lib/verify.sh does not parse; section 25 would be testing a syntax error"
+[ "$(wc -l < "$CK/stage.sh")" -ge 40 ] \
+    || fail "only $(wc -l < "$CK/stage.sh") lines extracted from lib/verify.sh -- the awk anchors no longer match the shipped stage, so section 25's probes would drive an empty function"
+for ck_need in 'checkgate gate' 'assert_check_ran' 'check_line'; do
+    grep -q "$ck_need" "$CK/stage.sh" \
+        || fail "the extracted stage contains no '$ck_need'; section 25 is not driving the real jac-check gate"
+done
+
+K="$CK/repo"
+git init -q "$K"
+# `git init -b main` is 2.28+; the symbolic-ref form works everywhere and, unlike relying on
+# init.defaultBranch, cannot leave this repo on `master` -- where every `... main` below would fail
+# and take the section with it for a reason that has nothing to do with the code under test.
+git -C "$K" symbolic-ref HEAD refs/heads/main
+git -C "$K" config user.email nightshift@localhost
+git -C "$K" config user.name nightshift-harness
+git -C "$K" config commit.gpgsign false
+# keep.jac carries ONE pre-existing error on main, so the baseline diff has something to be
+# baseline-diff ABOUT, and a MARKER line inside the error's printed context. The marker is what
+# makes the main-side swap positively observable: "the two captures differ" would also be satisfied
+# by a swap that half-happened.
+printf 'with entry {\n    marker: str = "MAIN-ONLY-MARKER";\n    bad: int = "pre-existing";\n    print(marker);\n    print(bad);\n}\n' > "$K/keep.jac"
+printf 'with entry {\n    print("dead code");\n}\n' > "$K/dead.jac"
+git -C "$K" add -A && git -C "$K" commit -q -m "main"
+ck_mod() { sed -i.bak 's/MAIN-ONLY-MARKER/BRANCH-ONLY-MARKER/' "$K/keep.jac" && rm -f "$K/keep.jac.bak"; }
+git -C "$K" checkout -q -b del-only main && git -C "$K" rm -q dead.jac && git -C "$K" commit -q -m d
+git -C "$K" checkout -q -b del-mod  main && git -C "$K" rm -q dead.jac && ck_mod && git -C "$K" commit -q -a -m dm
+git -C "$K" checkout -q -b mod-only main && ck_mod && git -C "$K" commit -q -a -m m
+git -C "$K" checkout -q -b mod-new  main && ck_mod \
+    && printf 'with entry {\n    alsobad: int = "second distinct error";\n    print(alsobad);\n}\n' >> "$K/keep.jac" \
+    && git -C "$K" commit -q -a -m mn
+git -C "$K" checkout -q main
+# Every probe must actually BE the shape it claims. A `git rm` that silently no-ops (it has, in this
+# project, when a hook rejected the commit) leaves four identical branches and four green probes.
+[ "$(git -C "$K" diff --name-status main...del-only)" = "$(printf 'D\tdead.jac')" ] \
+    || fail "the del-only probe branch does not delete dead.jac: $(git -C "$K" diff --name-status main...del-only)"
+[ "$(git -C "$K" diff --name-status main...del-mod | tr '\n' ' ')" = "$(printf 'D\tdead.jac M\tkeep.jac ')" ] \
+    || fail "the del-mod probe branch is not a deletion PLUS a modification: $(git -C "$K" diff --name-status main...del-mod | tr '\n' ' ')"
+[ "$(git -C "$K" diff --name-status main...mod-only)" = "$(printf 'M\tkeep.jac')" ] \
+    || fail "the mod-only probe branch does not modify keep.jac"
+
+cat > "$CK/run.sh" <<'CKRUN'
+#!/usr/bin/env bash
+# generated by bin/test-harness.sh section 25; argv: <NS_ROOT> <scratch repo> <stage.sh> <branch>
+set -uo pipefail
+NS_ROOT="$1"; CK_REPO="$2"; CK_STAGE="$3"; branch="$4"
+. "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/cimirror.sh"; . "$NS_ROOT/lib/verify.sh"
+ns_bootstrap_jac
+REPO="$CK_REPO"
+NS_REPO_DEFAULT_BRANCH=main
+NS_PATHS_JAC_REPO="$NS_PATHS_JAC"        # 0.16.1 prints the same run summary + error shape
+LOG_DIR="$CK_REPO/../logs"; mkdir -p "$LOG_DIR"
+. "$CK_STAGE"
+# verify_red is the "reject this branch" seam; stub it so the reason is observable and the probe
+# does not need the ledger. The stage still decides WHETHER to call it.
+verify_red() { printf 'VERIFY_RED %s\n' "$2"; }
+theme="-"; on_red="noop"; suites=""
+git -C "$REPO" checkout -q "$branch" || { echo "CHECKOUT-FAILED"; exit 97; }
+rm -rf "$REPO/.jac"
+rc=0
+ns_check_stage || rc=$?
+printf 'WORKTREE=[%s]\n' "$(git -C "$REPO" status --porcelain | tr '\n' ';')"
+printf 'STAGE_RC=%s\n' "$rc"
+exit "$rc"
+CKRUN
+ck_drive() {           # ck_drive <branch> <want-rc>
+    local br=$1 want=$2 got=0
+    bash "$CK/run.sh" "$NS_ROOT" "$K" "$CK/stage.sh" "$br" > "$CK/$br.out" 2>&1 || got=$?
+    case "$got" in
+        "$want") : ;;
+        *) fail "jac-check stage on the '$br' probe: expected rc=$want, got rc=$got -- $(tr '\n' ' ' < "$CK/$br.out")" ;;
+    esac
+    # A branch left half-swapped is the whole point of the guard this stage carries: EVERY probe,
+    # green or red, must hand the worktree back exactly as it found it.
+    grep -qx 'WORKTREE=\[\]' "$CK/$br.out" \
+        || fail "the jac-check stage left $REPO dirty after the '$br' probe: $(grep '^WORKTREE=' "$CK/$br.out"). Every stage after it would gate a tree that is neither the branch nor main."
+}
+
+# --- A. deletion only: the night must SURVIVE, and must not claim the checker ran ---------------
+ck_drive del-only 0
+grep -q 'deleted on this branch, so excluded from both sides' "$CK/del-only.out" \
+    || fail "the deletion-only probe did not report its excluded path; the partition is gone and this section's other probes prove nothing: $(cat "$CK/del-only.out")"
+grep -q 'CHECK_LINE=jac check (only deletions:' "$CK/del-only.out" \
+    || fail "a branch whose only .jac change is a DELETION published '$(grep '^CHECK_LINE=' "$CK/del-only.out")' -- the checker was handed zero files, so anything resembling a tick is this project's dominant defect in the one line that reaches the PR"
+[ ! -s "$CK/logs/check-branch-del-only.txt" ] \
+    || fail "the branch-side capture for a deletion-only branch is not empty; \$NS_PATHS_JAC_REPO was handed a path that does not exist on the branch, and a could-not-open error would be scored as a type error"
+
+# --- B. deletion MIXED with a modification: the modification is still gated, for real ------------
+ck_drive del-mod 0
+grep -q 'CHECK_LINE=jac check ✓ · not checked (deleted on branch): dead.jac' "$CK/del-mod.out" \
+    || fail "the mixed probe's PR line does not name the file it could not check: $(grep '^CHECK_LINE=' "$CK/del-mod.out")"
+# The two captures must be BRANCH content and MAIN content respectively. Asserting only that they
+# differ would also pass for a swap that never happened (the stage would then have compared the
+# branch against itself -- a gate that structurally cannot fail).
+grep -q 'BRANCH-ONLY-MARKER' "$CK/logs/check-branch-del-mod.txt" \
+    || fail "the branch-side capture of the mixed probe does not contain the branch's own content"
+grep -q 'MAIN-ONLY-MARKER'   "$CK/logs/check-main-del-mod.txt" \
+    || fail "the main-side capture of the mixed probe does not contain main's content -- the baseline swap did not happen, so 'no NEW type errors' could never be violated"
+grep -q 'BRANCH-ONLY-MARKER' "$CK/logs/check-main-del-mod.txt" \
+    && fail "the main-side capture contains BRANCH content: the swap silently failed and the branch was compared against itself"
+grep -q 'MAIN-ONLY-MARKER' "$K/keep.jac" \
+    && fail "the mixed probe left MAIN's content in the worktree for the file the branch modified; every stage after S4 would gate main and score it as the branch"
+
+# --- C. the plain modification path must be untouched by all of the above -----------------------
+ck_drive mod-only 0
+grep -qx 'CHECK_LINE=jac check ✓' "$CK/mod-only.out" \
+    || fail "an ordinary modification no longer publishes a plain 'jac check ✓': $(grep '^CHECK_LINE=' "$CK/mod-only.out")"
+
+# --- D. ...and the gate must still be ABLE to red. Without this, A-C are satisfied by a stage
+#        that returns 0 unconditionally. ---------------------------------------------------------
+ck_drive mod-new 1
+grep -q 'VERIFY_RED jac check: new type errors vs main' "$CK/mod-new.out" \
+    || fail "a branch that introduces a genuinely new type error was not rejected for that reason: $(cat "$CK/mod-new.out")"
+grep -q 'second distinct error' "$CK/logs/check-branch-mod-new.txt" \
+    || fail "the new error never reached the branch-side capture, so the rejection above cannot have been caused by it"
+rm -rf .jac
+echo "deleted .jac files: excluded from both baseline sides, named in the PR line, worktree returned clean; new errors still red"
+
 echo "ALL HARNESS TESTS PASSED"

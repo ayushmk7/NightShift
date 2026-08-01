@@ -355,7 +355,10 @@ verify_branch() {
     #    entire jac-check stage silently. Same shape as the reader bugs already fixed in
     #    lib/cimirror.sh; found in the same code review. The `|| true` on the grep itself is
     #    legitimate and stays: grep exits 1 when a branch genuinely touches no .jac file.
-    local changed_jac changed_all changed_rc=0 main_jac f br mr
+    # branch_jac/deleted_jac are initialised HERE, not just inside the `if` below: the PR-body line
+    # near the end of this function reads them, and `local x` leaves x UNSET, which `set -u` turns
+    # into an immediate shell exit rather than a catchable failure.
+    local changed_jac changed_all changed_rc=0 main_jac branch_jac="" deleted_jac="" f br mr
     changed_all="$(git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD")" || changed_rc=$?
     case "$changed_rc" in
         0) : ;;
@@ -365,17 +368,67 @@ verify_branch() {
     if [ -n "$changed_jac" ]; then
         br="$LOG_DIR/check-branch-$(basename "$branch").txt"
         mr="$LOG_DIR/check-main-$(basename "$branch").txt"
-        # branch side (the branch is checked out)
-        rm -rf "$REPO/.jac"
-        # shellcheck disable=SC2086  # word-split into per-file args; jac paths have no spaces
-        ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $changed_jac ) > "$br" 2>&1 || true
-        # main side: only files that exist on main (new-on-branch files have no baseline -> their
-        # errors all count as new). Restore just those files to main content, check, then put back.
-        main_jac=""
+        # 2a. Partition the changed .jac files by whether they STILL EXIST on the branch. Deleting
+        #     dead code is the dead-code task's happy path, not an edge case, and a deletion breaks
+        #     the batch swap this stage used to do:
+        #       * `$NS_PATHS_JAC_REPO check <path that no longer exists>` is not a branch-side type
+        #         error, it is a could-not-open error, and it would be counted as one; and
+        #       * `git checkout HEAD -- <deleted path>` cannot express "delete it again" -- it exits
+        #         1 with "pathspec ... did not match any file(s) known to git". The restore guard
+        #         below is right to be fatal (a half-restored tree gates main's content as if it
+        #         were the branch's), so the whole night died on every such branch. Reproduced.
+        #
+        #     What the baseline comparison MEANS for a deleted file: the branch does not contain it,
+        #     so the branch side has no errors for it, so it cannot introduce a NEW one. It is
+        #     un-gateable by construction and belongs on NEITHER side of the diff -- putting it on
+        #     the main side only would report its pre-existing errors as errors the branch REMOVED,
+        #     which checkgate ignores anyway, at the cost of a swap that cannot be undone.
+        #
+        #     The file's ABSENCE can of course introduce errors -- in the files that referenced it.
+        #     Those are different files. If the agent updated them they are already in $changed_jac
+        #     and are gated here on their own merits; if it did NOT update them, they are unchanged,
+        #     invisible to this baseline-diff stage by design, and caught downstream by the CI-mirror
+        #     [jobs.check] and [jobs.jir] jobs, which run over the repo rather than the diff.
+        #
+        #     Partitioned PER FILE, and swapped/restored per file below, so a theme that mixes
+        #     deletions with modifications gates the modifications normally instead of dying on the
+        #     batch. `${var:+$var }` rather than `$var $f` so the lists carry no leading space --
+        #     the old form put one into the ns_die message and into every `check` argv.
+        branch_jac=""
+        deleted_jac=""
         for f in $changed_jac; do
-            git -C "$REPO" cat-file -e "$NS_REPO_DEFAULT_BRANCH:$f" 2>/dev/null && main_jac="$main_jac $f"
+            if git -C "$REPO" cat-file -e "HEAD:$f" 2>/dev/null; then
+                branch_jac="${branch_jac:+$branch_jac }$f"
+            else
+                deleted_jac="${deleted_jac:+$deleted_jac }$f"
+            fi
         done
-        if [ -n "$main_jac" ]; then
+        case "$deleted_jac" in
+            "") : ;;
+            *)  ns_log S4 "jac check: deleted on this branch, so excluded from both sides of the baseline diff: $deleted_jac" ;;
+        esac
+        # branch side (the branch is checked out). Deliberately truncated first: a branch whose ONLY
+        # .jac change is a deletion has nothing to check, and $br must then be empty rather than
+        # stale from a previous branch in the same night's $LOG_DIR.
+        rm -rf "$REPO/.jac"
+        : > "$br"
+        case "$branch_jac" in
+            "") : ;;
+            # shellcheck disable=SC2086  # word-split into per-file args; jac paths have no spaces
+            *)  ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $branch_jac ) > "$br" 2>&1 || true ;;
+        esac
+        # main side: of the files that still exist on the branch, only those that also exist on main
+        # (new-on-branch files have no baseline -> their errors all count as new). Restore just those
+        # files to main content, check, then put back.
+        main_jac=""
+        for f in $branch_jac; do
+            if git -C "$REPO" cat-file -e "$NS_REPO_DEFAULT_BRANCH:$f" 2>/dev/null; then
+                main_jac="${main_jac:+$main_jac }$f"
+            fi
+        done
+        case "$main_jac" in
+            "") : > "$mr" ;;
+            *)
             # Both checkouts are `|| ns_die` for the same errexit-is-suspended reason as the branch
             # checkout at the top of this function, and each has its own did-not-run failure mode:
             #   * a failed SWAP-TO-MAIN leaves branch content in place, so `$mr` is captured from
@@ -384,18 +437,22 @@ verify_branch() {
             #   * a failed RESTORE leaves MAIN's content for those files in the working tree, so
             #     every stage below (fmt/check/jir, the test suites, pre-commit, contribution)
             #     gates main instead of the branch, and the branch ships ungated.
-            # shellcheck disable=SC2086
-            git -C "$REPO" checkout "$NS_REPO_DEFAULT_BRANCH" -- $main_jac \
-                || ns_die "$EX_BUG" "could not restore $NS_REPO_DEFAULT_BRANCH content for the jac-check baseline side ($main_jac) in $REPO. The main-side capture would have been taken from BRANCH content, making 'no NEW type errors' impossible to violate."
+            # Per file, so the message names the ONE path that failed instead of the whole batch.
+            # Every path in $main_jac exists on both sides by construction (the two cat-file probes
+            # above), so neither checkout has a "cannot express this" case left.
+            for f in $main_jac; do
+                git -C "$REPO" checkout "$NS_REPO_DEFAULT_BRANCH" -- "$f" \
+                    || ns_die "$EX_BUG" "could not swap $f to $NS_REPO_DEFAULT_BRANCH content for the jac-check baseline side in $REPO. The main-side capture would have been taken from BRANCH content, making 'no NEW type errors' impossible to violate."
+            done
             rm -rf "$REPO/.jac"
             # shellcheck disable=SC2086
             ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $main_jac ) > "$mr" 2>&1 || true
-            # shellcheck disable=SC2086
-            git -C "$REPO" checkout HEAD -- $main_jac \
-                || ns_die "$EX_BUG" "could not restore BRANCH content for $main_jac in $REPO after the jac-check baseline side. Every remaining gate stage would have run against $NS_REPO_DEFAULT_BRANCH's version of those files."
-        else
-            : > "$mr"
-        fi
+            for f in $main_jac; do
+                git -C "$REPO" checkout HEAD -- "$f" \
+                    || ns_die "$EX_BUG" "could not restore BRANCH content for $f in $REPO after the jac-check baseline side. Every remaining gate stage would have run against $NS_REPO_DEFAULT_BRANCH's version of those files."
+            done
+            ;;
+        esac
         # Same did-not-run hole as the test gate, on this stage. Both `jac check` invocations above
         # end in `|| true` -- legitimately, since the checker exits 1 whenever the file has any
         # error -- which discards the difference between "ran, exit 1, found errors" and "never
@@ -405,7 +462,12 @@ verify_branch() {
         # an `N passed|failed in Xs` summary, a missing binary exits 127 and prints none.
         # The main side is asserted only when it actually ran: `$mr` is deliberately left EMPTY
         # when no changed file exists on main (every branch error is then correctly new).
-        assert_check_ran "$branch" "$br" "branch"
+        # The BRANCH side is asserted on the same terms, for the same reason: a branch whose only
+        # .jac change is a DELETION has an empty $branch_jac, so `check` was correctly never
+        # invoked and `$br` is legitimately empty. Asserting it there would kill exactly the night
+        # this stage was fixed to survive; NOT asserting it whenever $branch_jac is non-empty would
+        # re-open the did-not-run hole the guard exists for. Keyed off the argv, never off the file.
+        case "$branch_jac" in "") : ;; *) assert_check_ran "$branch" "$br" "branch" ;; esac
         case "$main_jac" in "") : ;; *) assert_check_ran "$branch" "$mr" "main" ;; esac
         if ! ns_jac checkgate gate "$mr" "$br"; then
             verify_red "$branch" "jac check: new type errors vs main (see $(basename "$br"))" "$on_red"
@@ -684,8 +746,20 @@ verify_branch() {
         *)  mirror_line="$mirror_line · mirror not applicable:${mirror_skipped} (no .jac files to check)" ;;
     esac
 
-    local check_line="jac check ✓" tests_line
-    case "$changed_jac" in "") check_line="jac check (no .jac files changed)" ;; esac
+    # Keyed off $branch_jac, the list `check` was actually handed, NOT off $changed_jac. A branch
+    # that only DELETES .jac files has a non-empty $changed_jac and an empty $branch_jac, so the
+    # checker never ran -- and "jac check ✓" in the PR body would be this project's dominant defect
+    # in the one line that leaves the repo. Same reasoning as the mirror line above.
+    local check_line tests_line
+    if [ -z "$changed_jac" ]; then
+        check_line="jac check (no .jac files changed)"
+    elif [ -z "$branch_jac" ]; then
+        check_line="jac check (only deletions: $deleted_jac — nothing left to check)"
+    elif [ -n "$deleted_jac" ]; then
+        check_line="jac check ✓ · not checked (deleted on branch): $deleted_jac"
+    else
+        check_line="jac check ✓"
+    fi
     case "$suites" in
         "") tests_line="tests (no suite covers this change)" ;;
         *)  case "$gated" in
