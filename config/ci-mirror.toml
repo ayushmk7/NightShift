@@ -12,8 +12,19 @@
 
 [source]
 workflow = ".github/workflows/ci.yml"
-sha256   = "9f11c82472d0af2420695c66f0e42ba217985b65f6aad99e2e1e1f94e240c698"
-# RE-SYNCED 2026-07-30 (Plan 5 Task 5 Step 2) at the NEW location. The fresh clone of the fork put
+sha256   = "0f8c89183e3b73964e6f9d9668073ed80bf8407b6486ac46de509c304d366540"
+# RE-SYNCED 2026-08-01. The tripwire fired on an UNRELATED upstream pull (it fails identically at
+# HEAD~1, before the cost/salvage/cap fixes it was blocking). `git diff 6667717f5..HEAD --
+# .github/workflows/ci.yml` in work/repo is ONE hunk in its entirety: commit 6ebc0c405
+# ("feat(scale): programmatic deploy SDK", #7809) added a single step to the test-scale-k8s job --
+# "Run SDK programmatic deploy e2e (ScaleClient)", `if: matrix.base == 'official-image'`,
+# CLUSTER_TYPE=kind, running jac/jaclang/scale/tests/deploy/sdk_deploy_real_e2e.sh. NO mirrored
+# command string changed: the step lives in the k8s job, and this file mirrors fmt/check/jir/byllm/
+# compiler/runtime/contribution, none of which can run a kind cluster. It falls under the same
+# scale gap noted at the bottom of this file, so `commands` below are untouched and only the hash
+# moved -- in that order, and after reading the whole diff, per the rule the tripwire prints.
+#
+# Earlier note, kept for provenance. RE-SYNCED 2026-07-30 (Plan 5 Task 5 Step 2) at the NEW location. The fresh clone of the fork put
 # work/repo at 897bd55ce -> 0be9ea55f via `gh repo sync`, and the tripwire fired. Exactly ONE commit
 # touched ci.yml across that range -- 6667717f5 ("perf(cli): lazy CLI startup", #7447) -- and unlike
 # every previous re-sync it DID change a mirrored command string, so the commands moved BEFORE the
