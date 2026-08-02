@@ -18,9 +18,10 @@ Malformed output → message on stderr, exit 50 (TPRD 18) so the caller skips th
 """
 import sys;
 import os;
+import glob;
 import json;
 import from nslib {
-    eprint, read_stdin, parse_obj, parse_list, as_dict, normalize_fragment_body, score_of
+    eprint, read_stdin, parse_obj, parse_list, as_dict, as_int, normalize_fragment_body, score_of
 }
 
 """Return the body of the last ```json fenced block, or the whole text if none."""
@@ -256,6 +257,98 @@ def read_spend_ledger(path: str) -> list[str] {
     }
 }
 
+"""The three envelope families one night writes, and the ONLY files a cost roll-up may read.
+
+`meta-*.json` is a byte-twin projection of the `audit-*.json` / `apply-*.json` it came from, and
+`audit-*.json` also matches the `audit-repair-*.json` written by the corrective re-prompt. All three
+are listed deliberately -- deduping on session_id below is what makes listing a twin harmless, and
+listing the twin is what makes the roll-up survive a night where one half is missing (the repair
+sessions write an envelope but NO meta file, which is the $0.28 the old `meta-*.json` glob lost)."""
+glob SESSION_ENVELOPE_GLOBS: list[str] = ["audit-*.json", "apply-*.json", "meta-*.json"];
+
+"""Cost/turns/session-count recovered from a log dir's envelopes, DEDUPED ON session_id.
+
+This is the FALLBACK path only. `logs/2026-07-31/` predates lib/common.sh's ns_spend_add and has no
+spend.txt at all, so a replay of it has nothing else to read; every night since writes the ledger.
+
+Deduping is not optional. The first attempt to total that night summed every envelope in the dir and
+got $152.82 across "50 sessions" -- exactly double, because of the byte-twins described above. The
+real night was 27 unique session_ids and $76.55.
+
+It is a FLOOR, not the truth: `audit-<name>.json` is OVERWRITTEN in place by its own retry, so a
+night's superseded attempts survive in no envelope and are absent from any number derived here.
+That is the whole reason ns_spend_add writes the ledger AT the session -- and the reason this
+function reports how it got its answer rather than letting a caller assume."""
+def envelope_totals(log_dir: str) -> dict {
+    seen: set[str] = set();
+    cost: float = 0.0;
+    turns: int = 0;
+    for pattern in SESSION_ENVELOPE_GLOBS {
+        for path in sorted(glob.glob(os.path.join(log_dir, pattern))) {
+            with open(path, "r") as fh {
+                text: str = fh.read();
+            }
+            if not text.strip() {
+                continue;               # 0-byte envelope: the timebox killed it before it printed
+            }
+            env: dict = {};
+            try {
+                env = parse_obj(text);
+            } except Exception {
+                continue;
+            }
+            sid_any: any = env.get("session_id");
+            if sid_any is None {
+                continue;
+            }
+            sid: str = str(sid_any);
+            if sid in seen {
+                continue;
+            }
+            seen.add(sid);
+            turns += as_int(env.get("num_turns", 0) or 0);
+            cost += float(str(env.get("total_cost_usd", 0) or 0));
+        }
+    }
+    return {"cost_usd": cost, "turns": turns, "sessions": len(seen), "source": "envelopes"};
+}
+
+"""What a night actually cost, preferring the ledger and SAYING which source answered.
+
+`spend.txt` is written at the session by ns_spend_add and deduped on session_id by spend_total, so
+it is retry-complete and overwrite-proof; the envelopes are neither. Both the digest and the dataset
+read this, so neither can quietly disagree with the brake that stopped the night.
+
+Turns always come from the envelopes: the ledger carries cost only, by design (one number per line).
+
+An UNREADABLE ledger falls back rather than raising. spend_total fails closed on purpose -- for
+ns_spend_check, whose caller reads nonzero as "stop scheduling" -- but here the caller is a digest or
+a dataset row, and a reporting path that dies on a junk line reports nothing at all. The source
+string carries the fact instead."""
+def night_spend(log_dir: str) -> dict {
+    env: dict = envelope_totals(log_dir);
+    lines: list[str] = read_spend_ledger(os.path.join(log_dir, "spend.txt"));
+    if not lines {
+        return env;
+    }
+    total: float = 0.0;
+    try {
+        total = spend_total(lines);
+    } except ValueError {
+        env["source"] = "envelopes (spend.txt unreadable)";
+        return env;
+    }
+    ids: set[str] = set();
+    for line in lines {
+        stripped: str = str(line).strip();
+        if stripped {
+            ids.add(stripped.split("\t")[0]);
+        }
+    }
+    return {"cost_usd": total, "turns": as_int(env["turns"]),
+            "sessions": len(ids), "source": "spend.txt"};
+}
+
 def meta(envelope: dict) -> dict {
     return {
         "num_turns": envelope.get("num_turns"),
@@ -265,7 +358,7 @@ def meta(envelope: dict) -> dict {
     };
 }
 
-with entry {
+with entry:__main__ {   # only dispatch the CLI on direct `jac run`; dataset.jac imports the readers
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "field" and len(args) == 3 {

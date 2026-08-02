@@ -23,8 +23,9 @@ import from contextlib { redirect_stderr }
 import from pathlib { Path }
 import from email.mime.text { MIMEText }
 import from email.mime.multipart { MIMEMultipart }
-import from nslib { eprint, read_stdin, parse_obj, parse_list, as_dict, as_list, as_int, load_config_toml, today }
+import from nslib { eprint, read_stdin, parse_obj, parse_list, as_dict, as_list, as_int, as_float, load_config_toml, today }
 import from render_draft { split_draft }
+import from parse_result { night_spend }
 
 """What a dry run's digest says, in the two places a reader cannot skip. On 2026-07-31 a dry run's
 artifacts were mailed as a real result -- six `#0` PR rows linking to github.com/DRY-RUN/pull/0 and
@@ -199,8 +200,12 @@ def plain_body(summary: dict) -> str {
     clock2: dict = as_dict(summary.get("clock", {}));
     lines.append("clock: " + str(clock2.get("consumed_min", "?")) + " of "
                  + str(clock2.get("window_min", "?")) + " min");
+    # The cost SOURCE rides with the cost, always. "$76.55 off the session ledger" and "$76.27 added
+    # up from whatever envelopes were left on disk" are different claims, and the second one is a
+    # floor -- an overwritten retry is in the first and in neither the second nor any file.
     lines.append("runtime: " + str(summary.get("runtime_min", "?")) + " min · turns: "
-                 + str(summary.get("turns", "?")) + " · cost: $" + str(summary.get("cost_usd", "0")));
+                 + str(summary.get("turns", "?")) + " · cost: $" + str(summary.get("cost_usd", "0"))
+                 + " (" + str(summary.get("cost_source", "unknown source")) + ")");
     for w in as_list(summary.get("warnings", [])) {
         lines.append("WARNING: " + str(w));
     }
@@ -228,7 +233,8 @@ def html_body(summary: dict) -> str {
         + "clock: " + esc(clock.get("consumed_min", "?")) + " of "
         + esc(clock.get("window_min", "?")) + " min consumed ("
         + esc(clock.get("remaining_min", "?")) + " left) · turns "
-        + esc(summary.get("turns", "?")) + " · $" + esc(summary.get("cost_usd", 0)) + "</p>",
+        + esc(summary.get("turns", "?")) + " · $" + esc(summary.get("cost_usd", 0))
+        + " (" + esc(summary.get("cost_source", "unknown source")) + ")</p>",
     ];
 
     # 0. DRY RUN, above everything including the fatal box: every PR number and branch link further
@@ -753,15 +759,20 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
         failed.append({"what": parts[0], "reason": parts[1] if len(parts) > 1 else ""});
     }
     bugs: list = [];
-    turns: int = 0;
-    cost: float = 0.0;
     for rep in read_json_files(log_dir, "report-*.json") {
         bugs += as_list(rep.get("suspected_bugs", []));
     }
-    for m in read_json_files(log_dir, "meta-*.json") {
-        turns += as_int(m.get("num_turns", 0) or 0);
-        cost += float(str(m.get("total_cost_usd", 0) or 0));
-    }
+    # THE NIGHT'S BILL, off the same reader the dataset uses (parse_result.night_spend) rather than a
+    # second `meta-*.json` roll-up living here. The old loop was that second roll-up, and it was
+    # wrong in the same way scripts/dataset.jac's was: a repair session charges the ledger
+    # (lib/tier2.sh's ns_spend_add after the corrective re-prompt) but writes NO meta file, so the
+    # glob missed $0.28 of 2026-07-31. `spend.txt` is written at the session and deduped on
+    # session_id, so it is retry-complete and overwrite-proof; the envelopes are the fallback for log
+    # dirs written before the ledger existed. The digest names the source it used, because "the
+    # ledger said" and "we added up what files were left" are not the same claim.
+    spend: dict = night_spend(log_dir);
+    turns: int = as_int(spend["turns"]);
+    cost: float = as_float(spend["cost_usd"]);
     # THE NIGHT'S origin, not this process's. bin/nightshift.sh rewrites start_epoch on every run --
     # deliberately, because the watchdog sleeps from process start and the budget clock must share
     # that origin -- and writes first_start_epoch exactly once per (date-keyed) log dir. Reading
@@ -837,6 +848,7 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
         "runtime_min": runtime,
         "turns": turns,
         "cost_usd": cost,
+        "cost_source": spend["source"],
         "warnings": read_lines(os.path.join(log_dir, "warnings.txt")),
         "disabled": os.path.exists(os.path.join(log_dir, "DISABLED")),
         "error_stage": error_lines[0] if error_lines else None,
@@ -876,7 +888,7 @@ def doctor(cfg: dict) -> int {
     return 0;
 }
 
-with entry {
+with entry:__main__ {   # only dispatch the CLI on direct `jac run`; dataset.jac imports scope_outcomes
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "summarize" and len(args) == 6 {
@@ -927,8 +939,10 @@ test "summarize assembles branches, failures and bugs from disk conventions" {
     with open(os.path.join(log_dir, "report-dead-code.json"), "w") as f {
         f.write("{\"suspected_bugs\": [{\"file\": \"a.jac\", \"line\": 3, \"note\": \"?\"}]}");
     }
+    # session_id is what makes an envelope a SESSION here: the roll-up dedupes on it, so an
+    # id-less blob is not counted at all. Every real envelope carries one.
     with open(os.path.join(log_dir, "meta-apply-dead-code.json"), "w") as f {
-        f.write("{\"num_turns\": 41, \"total_cost_usd\": 0.7}");
+        f.write("{\"num_turns\": 41, \"total_cost_usd\": 0.7, \"session_id\": \"s-apply\"}");
     }
     cfg: dict = {"repo": {"fork": "me/jaseci"}};
     summary: dict = summarize(log_dir, drafts_dir, "2026-07-10", cfg);
@@ -940,6 +954,48 @@ test "summarize assembles branches, failures and bugs from disk conventions" {
     assert len(as_list(summary["suspected_bugs"])) == 1;
     assert summary["turns"] == 41;
     assert subject(summary) == "Nightshift 2026-07-10 · 1 ready · +40 -100 · 1 failed";
+}
+
+test "the night's bill comes off the ledger, and the fallback counts the repair session" {
+    import tempfile;
+    log_dir: str = tempfile.mkdtemp();
+    drafts_dir: str = tempfile.mkdtemp();
+    cfg: dict = {"repo": {"fork": "me/jaseci"}};
+    # An audit envelope, its BYTE-TWIN meta projection, and the corrective re-prompt that
+    # lib/tier2.sh charges to the ledger but for which it writes no meta file. This is the exact
+    # 2026-07-31 shape: the old `meta-*.json` roll-up saw $4.00 of a $4.25 night.
+    with open(os.path.join(log_dir, "audit-cli.json"), "w") as f {
+        f.write("{\"num_turns\": 40, \"total_cost_usd\": 4.0, \"session_id\": \"s-audit\"}");
+    }
+    with open(os.path.join(log_dir, "meta-audit-cli.json"), "w") as f {
+        f.write("{\"num_turns\": 40, \"total_cost_usd\": 4.0, \"session_id\": \"s-audit\"}");
+    }
+    with open(os.path.join(log_dir, "audit-repair-cli.json"), "w") as f {
+        f.write("{\"num_turns\": 1, \"total_cost_usd\": 0.25, \"session_id\": \"s-repair\"}");
+    }
+    no_ledger: dict = summarize(log_dir, drafts_dir, "2026-07-10", cfg);
+    # The twin is deduped away (else this is 8.25) and the repair IS counted (else it is 4.0).
+    assert as_float(no_ledger["cost_usd"]) == 4.25;
+    assert as_int(no_ledger["turns"]) == 41;
+    assert no_ledger["cost_source"] == "envelopes";
+
+    # ...and once spend.txt exists it WINS, including for a session whose envelope its own retry
+    # overwrote -- the one thing no envelope-derived total can ever recover.
+    with open(os.path.join(log_dir, "spend.txt"), "w") as f {
+        f.write("s-audit\t4.0\ns-repair\t0.25\ns-overwritten-attempt-1\t9.5\n");
+    }
+    from_ledger: dict = summarize(log_dir, drafts_dir, "2026-07-10", cfg);
+    assert as_float(from_ledger["cost_usd"]) == 13.75;
+    assert from_ledger["cost_source"] == "spend.txt";
+
+    # A junk ledger falls BACK and says so, rather than taking the whole digest down with it: this
+    # is a reporting path, and spend_total's fail-closed raise belongs to the brake, not here.
+    with open(os.path.join(log_dir, "spend.txt"), "w") as f {
+        f.write("this is not a ledger row\n");
+    }
+    junk: dict = summarize(log_dir, drafts_dir, "2026-07-10", cfg);
+    assert as_float(junk["cost_usd"]) == 4.25;
+    assert junk["cost_source"] == "envelopes (spend.txt unreadable)";
 }
 
 test "receipt_from_debug returns the 250 acceptance of the DATA payload" {

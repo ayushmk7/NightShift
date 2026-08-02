@@ -314,8 +314,10 @@ ns_gh() {   # READ-ONLY gh. Runs even under NS_DRY_RUN.
 # The dry-run branch prints a shape-valid but obviously fake URL for `pr create`, because the
 # caller's job is to assert it got a URL (a gh call that silently returns nothing must never read
 # as success) and that assertion has to be exercised in rehearsal too. The sentinel reaches only
-# gitignored state: state/ledger.jsonl.cache and $LOG_DIR, since ns_git_push stubs the drafts push
-# and lib/dataset.sh already records nothing under NS_DRY_RUN.
+# gitignored state: state/ledger.jsonl.cache and $LOG_DIR, since ns_git_push stubs the drafts push.
+# lib/dataset.sh DOES record a dry run now (flagged, with the fork URL nulled) -- but this sentinel
+# is not what it writes: dataset_record_refactor is handed ship_branch's fork tree URL, not this
+# one, and nulls it. The `pr_url` this returns reaches only the gitignored ledger.
 ns_gh_write() {
     local pair="${1:-} ${2:-}"
     case "$pair" in

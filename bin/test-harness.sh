@@ -1739,8 +1739,16 @@ case "$sfx_react" in
     "-reactive") : ;;
     *) fail "the reactive phase suffix is '$sfx_react', so its artifacts would collide with the cycle phase's" ;;
 esac
-grep -q 'LOG_DIR/findings.json' "$NS_ROOT/lib/dataset.sh" \
+grep -q 'LOG_DIR"*/findings\.json' "$NS_ROOT/lib/dataset.sh" \
     || fail "lib/dataset.sh no longer reads findings.json by that name -- the B6 check above is pinned to the wrong fact"
+# ...and the reactive artifact by ITS name too, on both sides. dataset_record_night used to gate on
+# findings.json alone, so a night whose cycle audit produced nothing recorded nothing -- while the
+# reactive pass it ignored had shipped 3 of the 6 branches of 2026-07-31.
+grep -q 'LOG_DIR"*/findings-reactive\.json' "$NS_ROOT/lib/dataset.sh" \
+    || fail "lib/dataset.sh does not look for findings-reactive.json, so a reactive-only night records nothing"
+# The jac side is pinned BEHAVIOURALLY in section 36, not by a source grep: scripts/dataset.jac
+# composes the name from ns_phase_suffix's own "-reactive" rather than spelling it, so a grep here
+# would match this repo's favourite false positive -- a comment.
 
 # RECONCILIATION B7 -- carry-over is consumed and rewritten by the CYCLE phase only. The reactive
 # phase runs first; if it also owned carryover.json it would pack yesterday's deferrals into the
@@ -2514,5 +2522,280 @@ case "$(sel 424 "$S29/old.toml")" in
 esac
 rm -rf .jac
 echo "the night's theme count is bounded by the clock it has, and never over-commits it"
+
+echo "== 33. a dry run is RECORDED, flagged, with only the fork URL withheld =="
+# THE 2026-07-31 LOSS. lib/dataset.sh:17 and :26 early-returned on NS_DRY_RUN "because rehearsal
+# nights are sandbox data". But only `git push` and `gh pr create` are stubbed under NS_DRY_RUN: 12
+# audit sessions, 11 apply sessions, 112 findings, 6 branches, the whole S4 gate and $76.55 of real
+# billing were all real that night, and every row of it was discarded. The one field a dry run makes
+# untrue is the fork URL -- the branch was never pushed -- so that is the only field withheld.
+rm -rf .jac
+S33="$T/dry"; mkdir -p "$S33/ds" "$S33/repo"
+git -C "$S33/repo" init -q
+git -C "$S33/repo" config user.email t@t.com
+git -C "$S33/repo" config user.name t
+printf 'def old() -> int { return 1; }\n' > "$S33/repo/x.jac"
+git -C "$S33/repo" add -A && git -C "$S33/repo" commit -qm base
+git -C "$S33/repo" checkout -q -B feat
+printf 'def new() -> int { return 1; }\n' > "$S33/repo/x.jac"
+git -C "$S33/repo" commit -qam clean
+printf '{"summary": "s", "risk": "low", "files": ["x.jac"]}\n' > "$S33/report.json"
+
+# Drives the REAL recorders out of a NAMED copy of lib/dataset.sh, so the mutation below can swap
+# that one file and change nothing else. $1 is the library to source; $2 is the dataset dir.
+dry_probe() {   # dry_probe <lib/dataset.sh> <dataset_dir>
+    (
+        . "$NS_ROOT/lib/common.sh"; . "$1"
+        ns_load_config
+        export NS_DRY_RUN=1
+        NS_DATE=2026-07-31
+        LOG_DIR="$NS_ROOT/logs/2026-07-31"
+        REPO="$S33/repo"
+        DATASET_DIR="$2"
+        dataset_record_night repo
+        dataset_record_refactor feat repo - "$S33/report.json" 1 1 "jac check ok" \
+            "https://github.com/ayushmk7/jaseci/tree/feat"
+    ) >/dev/null 2>&1 || fail "the dry-run recorders exited nonzero"
+}
+
+dry_probe "$NS_ROOT/lib/dataset.sh" "$S33/ds"
+[ -s "$S33/ds/nights.jsonl" ] \
+    || fail "a dry run still records no nights row -- 2026-07-31 would be discarded again"
+[ -s "$S33/ds/refactors.jsonl" ] || fail "a dry run still records no refactor row"
+[ -s "$S33/ds/sessions.jsonl" ] || fail "a dry run still records no session rows"
+grep -q '"dry_run": true' "$S33/ds/nights.jsonl" \
+    || fail "the nights row does not say it came from a dry run: $(cat "$S33/ds/nights.jsonl")"
+# THE BRANCH ROW SPECIFICALLY. dataset_record_night above also writes the night's five DECLINE rows
+# into this same file, and every one of them legitimately carries "url": null and "dry_run": true --
+# so a grep over the whole file is satisfied by rows that prove nothing about the branch. (Measured:
+# the file-wide version of the next assertion survived a mutation that removed the URL nulling
+# entirely.) Isolate the row this probe created, and assert on that.
+grep '"branch": "feat"' "$S33/ds/refactors.jsonl" > "$S33/feat-row.json" \
+    || fail "the dry-run branch produced no refactor row at all"
+[ "$(wc -l < "$S33/feat-row.json" | tr -d ' ')" = "1" ] \
+    || fail "expected exactly one row for the probe branch, got $(wc -l < "$S33/feat-row.json" | tr -d ' ')"
+grep -q '"dry_run": true' "$S33/feat-row.json" || fail "the refactor row is not flagged dry_run"
+# THE ONE FIELD A DRY RUN FALSIFIES. Nothing was pushed, so tree/<branch> resolves to nothing.
+grep -q '"url": null' "$S33/feat-row.json" \
+    || fail "a dry run wrote a fork URL for a branch it never pushed: $(grep -o '"url": [^,]*' "$S33/feat-row.json")"
+# ...and everything else on the row is the real work, or the assertion above is satisfied by a
+# recorder that writes nulls for everything.
+grep -q '"before": "def old' "$S33/feat-row.json" \
+    || fail "the dry-run refactor row lost the real before-content"
+grep -q '"after": "def new' "$S33/feat-row.json" \
+    || fail "the dry-run refactor row lost the real after-content"
+grep -q '"shipped": true' "$S33/feat-row.json" \
+    || fail "the dry-run branch row is not marked shipped; it would be indistinguishable from a decline"
+
+# THE INTERACTIVE RECORDER KEEPS ITS GUARD. promote/discard is a human at a terminal; nothing behind
+# it ran and dataset/human_reviews.jsonl is TRACKED, so a rehearsal there dirties the repo.
+(
+    . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/dataset.sh"
+    ns_load_config
+    export NS_DRY_RUN=1
+    DATASET_DIR="$S33/ds"
+    dataset_record_review nightshift/2026-07-31/x true "looks good"
+) >/dev/null 2>&1 || fail "dataset_record_review exited nonzero under NS_DRY_RUN"
+[ -f "$S33/ds/human_reviews.jsonl" ] \
+    && fail "a rehearsed promote/discard wrote a synthetic row to the TRACKED human_reviews.jsonl"
+
+# MUTATION. Restore the exact early return that was deleted, in a copy, and require the probe above
+# to go red. Without this every assertion in this section is satisfied by a night that happened to
+# be recorded for some other reason.
+sed 's|^dataset_record_night() {|dataset_record_night() {\n    [ -n "${NS_DRY_RUN:-}" ] \&\& return 0|' \
+    "$NS_ROOT/lib/dataset.sh" > "$S33/mutant.sh"
+grep -q 'NS_DRY_RUN:-}" \] && return 0' "$S33/mutant.sh" \
+    || fail "the section-33 mutant was not built; the mutation proves nothing"
+mkdir -p "$S33/ds-mutant"
+dry_probe "$S33/mutant.sh" "$S33/ds-mutant"
+[ -s "$S33/ds-mutant/nights.jsonl" ] \
+    && fail "the mutant with the NS_DRY_RUN early return restored STILL recorded a nights row -- section 33 cannot fail"
+echo "a rehearsal night is captured, flagged, and only its push-dependent URL is withheld"
+
+echo "== 34. sessions.jsonl: one row per LLM session, and a dead lens is never a clean zero =="
+# Replayed against the REAL 2026-07-31 log dir, which is the fixture set for sections 26/28/29 too.
+# 27 unique session_ids and $76.55 are the two numbers lib/common.sh's ns_spend_add docstring and
+# parse_result's spend_total docstring both cite; if this section disagrees with them, one of the
+# three is wrong and the harness says so.
+rm -rf .jac
+S34="$T/sessions"; mkdir -p "$S34"
+jac run scripts/dataset.jac record-audit logs/2026-07-31 "$S34" 2026-07-31 repo \
+    config/nightshift.toml true >/dev/null \
+    || fail "replaying the real 2026-07-31 log dir into the dataset failed outright"
+[ -s "$S34/sessions.jsonl" ] || fail "the replay wrote no sessions.jsonl at all"
+[ "$(wc -l < "$S34/sessions.jsonl" | tr -d ' ')" = "27" ] \
+    || fail "the night's 27 sessions did not produce 27 rows: $(wc -l < "$S34/sessions.jsonl")"
+# 12 audits + 4 corrective re-prompts + 11 applies. The 4 repairs are the ones that charge the
+# ledger and write NO meta-*.json, so any meta-glob-derived count reports 23.
+[ "$(grep -c '"kind": "audit"' "$S34/sessions.jsonl")" = "12" ] \
+    || fail "expected 12 audit sessions, got $(grep -c '"kind": "audit"' "$S34/sessions.jsonl")"
+[ "$(grep -c '"kind": "audit-repair"' "$S34/sessions.jsonl")" = "4" ] \
+    || fail "the 4 corrective re-prompt sessions are missing -- they cost \$0.28 and appear in no meta file"
+[ "$(grep -c '"kind": "apply"' "$S34/sessions.jsonl")" = "11" ] \
+    || fail "expected 11 apply sessions, got $(grep -c '"kind": "apply"' "$S34/sessions.jsonl")"
+# every row identifies its own session, or "one row per session" is not a claim this file supports
+[ "$(grep -c '"session_id": "' "$S34/sessions.jsonl")" = "27" ] \
+    || fail "some session row carries no session_id"
+[ "$(grep -o '"session_id": "[^\"]*"' "$S34/sessions.jsonl" | sort -u | wc -l | tr -d ' ')" = "27" ] \
+    || fail "the 27 rows are not 27 DISTINCT sessions"
+
+# THE THREE DEAD LENSES. reactive-abstraction and reactive-coverage were salvaged into a
+# placeholder `[]` and their findings files say 0; only reactive-maintenance reached failed.tsv.
+# scope_outcomes fuses all three sources, so all three must be scope_failed here -- a row saying
+# `"findings_out": 0, "scope_failed": false` for one of them is this project's dominant defect class
+# ("did not run" scoring as "passed") reproduced inside the training data.
+for lens in reactive-abstraction reactive-coverage reactive-maintenance; do
+    grep '"kind": "audit", "name": "'"$lens"'"' "$S34/sessions.jsonl" | grep -q '"scope_failed": true' \
+        || fail "audit[$lens] died at the turn cap but its session row does not say the scope failed: $(grep -o '"name": "'"$lens"'".*"wasted": [a-z]*' "$S34/sessions.jsonl" | head -1)"
+    grep '"kind": "audit", "name": "'"$lens"'"' "$S34/sessions.jsonl" | grep -q '"outcome": "unfinished:' \
+        || fail "audit[$lens] is not recorded as an unfinished session"
+    # ...and it is attributed to the phase that ran it. Checked HERE, on an audit row, not by a
+    # file-wide grep for `"phase": "reactive"` -- the three reactive APPLY rows satisfy that grep on
+    # their own, so the file-wide version survived a mutation that stopped phasing audits entirely.
+    grep '"kind": "audit", "name": "'"$lens"'"' "$S34/sessions.jsonl" | grep -q '"phase": "reactive"' \
+        || fail "audit[$lens] is not attributed to the reactive phase"
+done
+# ...and a lens that genuinely RAN is not swept up with them, or the three assertions above are
+# satisfied by marking everything failed.
+grep '"kind": "audit", "name": "reactive-dead-code"' "$S34/sessions.jsonl" | grep -q '"scope_failed": false' \
+    || fail "the one reactive lens that completed was also marked failed; the classifier is stuck on"
+grep '"kind": "audit", "name": "reactive-dead-code"' "$S34/sessions.jsonl" | grep -q '"outcome": "completed"' \
+    || fail "reactive-dead-code did not come back `completed`"
+# the taxonomy is parse_result's, not a second one invented here
+grep -q '"outcome": "unfinished:max_turns"' "$S34/sessions.jsonl" \
+    || fail "no session carries the turn-cap outcome parse_result status returns"
+
+# waste, model and phase are all on the row -- these are the columns the whole file exists for
+grep -q '"wasted": true' "$S34/sessions.jsonl" || fail "no session is marked wasted"
+grep -q '"wasted": false' "$S34/sessions.jsonl" || fail "EVERY session is marked wasted"
+grep -q '"model": "claude-opus-5"' "$S34/sessions.jsonl" || fail "no row carries the model that ran"
+grep -q '"model": "claude-sonnet-5"' "$S34/sessions.jsonl" \
+    || fail "the sonnet apply sessions lost their model; complexity routing cannot be evaluated"
+grep -q '"phase": "reactive"' "$S34/sessions.jsonl" || fail "no session is attributed to the reactive phase"
+grep -q '"phase": "cycle"' "$S34/sessions.jsonl" || fail "no session is attributed to the cycle phase"
+# attempt cannot come from the envelope (the retry overwrites it); it comes off run.log
+grep -q '"attempt": 2' "$S34/sessions.jsonl" \
+    || fail "the night's retried sessions all read as attempt 1 -- run.log is the only record of them"
+echo "every session the night ran has a row, and a session that died never reads as one that found nothing"
+
+echo "== 35. the night's bill comes off the session ledger, not the meta-*.json glob =="
+# `ns_spend_add` writes <session_id>\t<cost> AT THE SESSION, so it survives a retry overwriting the
+# envelope and it is deduped on the id. The old roll-up globbed meta-*.json in TWO places
+# (scripts/dataset.jac and scripts/sendmail.jac) and missed every corrective re-prompt, because
+# lib/tier2.sh charges the ledger for one but writes it no meta file.
+rm -rf .jac
+S35="$T/spend"; mkdir -p "$S35/night"
+# The exact shape: an audit, its byte-twin meta projection, and a repair with no twin.
+printf '{"num_turns": 40, "total_cost_usd": 4.0, "session_id": "s-a"}\n'  > "$S35/night/audit-cli.json"
+printf '{"num_turns": 40, "total_cost_usd": 4.0, "session_id": "s-a"}\n'  > "$S35/night/meta-audit-cli.json"
+printf '{"num_turns": 1, "total_cost_usd": 0.25, "session_id": "s-r"}\n'  > "$S35/night/audit-repair-cli.json"
+spend_of() { jac run scripts/sendmail.jac summarize "$1" "$S35" 2026-07-31 config/nightshift.toml; }
+env_sum="$(spend_of "$S35/night" | jac run scripts/parse_result.jac field cost_usd)"
+[ "$env_sum" = "4.25" ] \
+    || fail "the envelope fallback did not total 4.25 (twin deduped, repair counted); got $env_sum"
+[ "$(spend_of "$S35/night" | jac run scripts/parse_result.jac field cost_source)" = "envelopes" ] \
+    || fail "the digest does not say WHICH source its cost came from"
+printf 's-a\t4.0\ns-r\t0.25\ns-overwritten\t9.5\n' > "$S35/night/spend.txt"
+led_sum="$(spend_of "$S35/night" | jac run scripts/parse_result.jac field cost_usd)"
+[ "$led_sum" = "13.75" ] \
+    || fail "spend.txt did not win over the envelopes (expected 13.75, the overwritten retry included); got $led_sum"
+[ "$(spend_of "$S35/night" | jac run scripts/parse_result.jac field cost_source)" = "spend.txt" ] \
+    || fail "the digest attributed a ledger-derived cost to the envelopes"
+
+# MUTATION, over the REAL night: delete the four repair envelopes and the total must MOVE. If it
+# does not, the roll-up is not reading them and every assertion above is decorative.
+cp -R logs/2026-07-31 "$S35/real"
+rm -f "$S35/real/spend.txt"                    # this log dir predates the ledger anyway; be explicit
+real_full="$(spend_of "$S35/real" | jac run scripts/parse_result.jac field cost_usd)"
+case "$real_full" in
+    76.55*) : ;;
+    *) fail "the real 2026-07-31 night no longer totals \$76.55 from its envelopes; got $real_full" ;;
+esac
+rm -f "$S35/real"/audit-repair-*.json
+real_cut="$(spend_of "$S35/real" | jac run scripts/parse_result.jac field cost_usd)"
+[ "$real_full" = "$real_cut" ] \
+    && fail "removing all four corrective re-prompt envelopes did not change the night's cost -- the roll-up is still blind to them"
+case "$real_cut" in
+    76.27*) : ;;
+    *) fail "the four repair sessions do not account for the known \$0.28 gap; without them the night reads $real_cut" ;;
+esac
+echo "the bill is read from the ledger, names its source, and no longer loses the repair sessions"
+
+echo "== 36. the schema gaps: both phases, real counts, and the refusals that used to be deleted =="
+# All against $S34, the replay of the real night from section 34.
+[ -s "$S34/audit_findings.jsonl" ] || fail "section 36 needs section 34's replay; it is missing"
+# 112 in the cycle phase (95 fresh + 17 carried) and 5 in the reactive phase. record_audit read
+# findings.json and selection.json ONLY, so the reactive pass -- which produced 3 of the night's 6
+# shipped branches -- contributed zero rows, and the 17 carried findings contributed zero too.
+[ "$(wc -l < "$S34/audit_findings.jsonl" | tr -d ' ')" = "117" ] \
+    || fail "the night's findings did not replay as 117 rows (112 cycle + 5 reactive): $(wc -l < "$S34/audit_findings.jsonl")"
+[ "$(grep -c '"phase": "cycle"' "$S34/audit_findings.jsonl")" = "112" ] \
+    || fail "the cycle phase is not 112 findings: $(grep -c '"phase": "cycle"' "$S34/audit_findings.jsonl")"
+[ "$(grep -c '"phase": "reactive"' "$S34/audit_findings.jsonl")" = "5" ] \
+    || fail "the reactive phase contributed $(grep -c '"phase": "reactive"' "$S34/audit_findings.jsonl") findings, not 5"
+[ "$(grep -c '"carry": true' "$S34/audit_findings.jsonl")" = "17" ] \
+    || fail "the 17 carried findings are not marked: $(grep -c '"carry": true' "$S34/audit_findings.jsonl")"
+# THE THREE DROPPED FIELDS. `task` is the most waste-relevant column there is; `theme_hint` is the
+# join key from a finding to the branch it became.
+grep -q '"task": "abstraction"' "$S34/audit_findings.jsonl" \
+    || fail "audit_findings rows still carry no task"
+grep -q '"task": "dead-code"' "$S34/audit_findings.jsonl" \
+    || fail "the carried dead-code findings lost their own task to tonight's"
+grep -q '"complexity": "judgement"' "$S34/audit_findings.jsonl" \
+    || fail "audit_findings rows still carry no complexity"
+[ "$(grep -c '"theme_hint": null' "$S34/audit_findings.jsonl")" = "0" ] \
+    || fail "$(grep -c '"theme_hint": null' "$S34/audit_findings.jsonl") findings have no theme_hint"
+# nights.jsonl counted FINDINGS and called them themes: it emitted 9 for a night that packed 6
+# cycle themes, and never mentioned the reactive phase's 5 at all.
+grep -q '"themes_selected": 11' "$S34/nights.jsonl" \
+    || fail "themes_selected is not the 11 themes actually packed (6 cycle + 5 reactive): $(cat "$S34/nights.jsonl")"
+grep -q '"findings_carryover": 17' "$S34/nights.jsonl" \
+    || fail "the nights row does not count the carry-over the selector packed"
+grep -q '"phases": \["cycle", "reactive"\]' "$S34/nights.jsonl" \
+    || fail "the nights row does not record which phases ran"
+# THE FIVE REFUSALS. Real report-*.json with real skipped[] reasons ("deleting scalar_layout would
+# break test_abi_lib.jac"), deleted with the log dir every morning until now.
+[ "$(grep -c '"shipped": false' "$S34/refactors.jsonl")" = "5" ] \
+    || fail "the 5 apply sessions that correctly refused did not produce 5 shipped:false rows: $(grep -c '"shipped": false' "$S34/refactors.jsonl")"
+grep -q 'test_abi_lib.jac' "$S34/refactors.jsonl" \
+    || fail "the declines carry no concrete refusal reason -- the whole value of the row"
+grep -q '"session_id": "91ce2039-7f68-4d53-b187-4853132544ce"' "$S34/refactors.jsonl" \
+    || fail "a decline row does not carry the session that produced it, so its cost is unknowable"
+# ...and a theme that DID produce a branch is not filed as a refusal. queue.tsv is what separates
+# them; green.tsv does not exist yet when this runs (S4 has not gated anything).
+for shipped_slug in dead-code-unused-enum-members dead-code-unreachable-config-fallback; do
+    grep -q "\"theme_slug\": \"$shipped_slug\"" "$S34/refactors.jsonl" \
+        && fail "$shipped_slug produced a branch but was recorded as a decline"
+done
+# A REACTIVE-ONLY NIGHT still records. This is the B6 pin from section 22, driven rather than
+# grepped: the cycle audit produced nothing, and the phase that DID produce work must not vanish
+# with it. Before this, dataset_record_night returned 0 on a missing findings.json and the reactive
+# pass -- 3 of the 6 branches of 2026-07-31 -- was invisible to the dataset by construction.
+S36R="$T/reactive-only"; mkdir -p "$S36R/night" "$S36R/ds"
+cp logs/2026-07-31/findings-reactive.json logs/2026-07-31/selection-reactive.json "$S36R/night/"
+# stderr to a file, not the console: this fixture legitimately has no queue.tsv, and the recorder
+# SAYING SO is the correct behaviour asserted below -- it just must not read like a harness failure.
+jac run scripts/dataset.jac record-audit "$S36R/night" "$S36R/ds" 2026-07-30 repo \
+    config/nightshift.toml false >/dev/null 2>"$S36R/err.txt" \
+    || fail "a reactive-only night failed to record: $(cat "$S36R/err.txt")"
+grep -q 'cannot tell a refused theme from a queued one' "$S36R/err.txt" \
+    || fail "the recorder did not say why it recorded no declines for a log dir with no queue.tsv"
+[ "$(wc -l < "$S36R/ds/audit_findings.jsonl" 2>/dev/null | tr -d ' ' || echo 0)" = "5" ] \
+    || fail "a night with only reactive artifacts recorded $(wc -l < "$S36R/ds/audit_findings.jsonl" 2>/dev/null | tr -d ' ' || echo 0) findings, not 5"
+grep -q '"phases": \["reactive"\]' "$S36R/ds/nights.jsonl" \
+    || fail "the reactive-only night does not name the one phase that ran: $(cat "$S36R/ds/nights.jsonl")"
+
+# MUTATION: with queue.tsv gone the two cannot be told apart, and the recorder must record NOTHING
+# rather than file all 11 applies as refusals.
+S36="$T/declines"; mkdir -p "$S36/ds"
+cp -R logs/2026-07-31 "$S36/night"
+rm -f "$S36/night/queue.tsv"
+jac run scripts/dataset.jac record-audit "$S36/night" "$S36/ds" 2026-07-31 repo \
+    config/nightshift.toml true >/dev/null 2>&1 \
+    || fail "the replay without queue.tsv failed outright"
+[ "$(grep -c '"shipped": false' "$S36/ds/refactors.jsonl" 2>/dev/null || echo 0)" = "0" ] \
+    || fail "with queue.tsv deleted the recorder guessed, and filed shipped themes as refusals"
+rm -rf .jac
+echo "both phases are recorded, the counts are the night's own, and a refusal is kept as data"
 
 echo "ALL HARNESS TESTS PASSED"
