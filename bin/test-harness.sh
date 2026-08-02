@@ -3230,4 +3230,43 @@ grep -q '"branch": "nightshift/2026-07-31/dead-code-on-the-fork"' "$S37/ds-mutan
 rm -rf .jac
 echo "a branch that only ever existed locally is recovered, with no URL and no gate claim invented"
 
+echo "== 38. S1 branch pruning: the verb must EMIT a branch, not fall through to usage =="
+# `ledger prunable` shipped with `len(args) == 5` against a 4-element argv, so every call from
+# 2026-07-30 to 2026-08-02 hit the usage arm: stderr text, exit 0, zero branches. lib/sync.sh pipes
+# it into `while read`, so "the prune found nothing" and "the prune never parsed" were the same
+# night. A unit test on prunable_branches() would have been green throughout -- the defect lived in
+# the dispatch -- so this drives the real CLI and asserts on stdout.
+S38="$T/prunable"; mkdir -p "$S38"
+cat > "$S38/led.jsonl" <<'EOF'
+{"fingerprint":"aaa","file":"x.jac","rule":"dead-code","status":"shipped","branch":"nightshift/2026-07-01/stale","last_seen":"2026-07-01","first_seen":"2026-07-01"}
+{"fingerprint":"bbb","file":"y.jac","rule":"dead-code","status":"shipped","branch":"nightshift/2026-08-01/fresh","last_seen":"2026-08-01","first_seen":"2026-08-01"}
+{"fingerprint":"ccc","file":"z.jac","rule":"dead-code","status":"deferred","last_seen":"2026-07-01","first_seen":"2026-07-01"}
+EOF
+jac run "$NS_ROOT/scripts/ledger.jac" prunable 14 "$S38/led.jsonl" > "$S38/out.txt" 2> "$S38/err.txt" \
+    || fail "ledger prunable exited nonzero"
+grep -q 'nightshift/2026-07-01/stale' "$S38/out.txt" \
+    || fail "prunable emitted no branch for a 30-day-old shipped finding -- S1 has nothing to prune, ever"
+grep -q 'usage:' "$S38/err.txt" \
+    && fail "prunable fell through to the usage arm; it printed help and exited 0 instead of pruning"
+grep -q 'fresh' "$S38/out.txt" \
+    && fail "prunable returned a branch inside the 14-day window -- it would delete a live draft"
+grep -q 'deferred\|ccc' "$S38/out.txt" \
+    && fail "prunable returned a deferred finding's row; only shipped/rejected branches are prunable"
+
+# MUTATION. Put the off-by-one back and require the assertion above to go red. Without this, a
+# section that only ever greps for a branch name is satisfied by any verb that prints something.
+# The mutant must live beside nslib.jac for its imports to resolve; the leading dot keeps it out of
+# the `scripts/*.jac` glob that section 1 sweeps, and the trap removes it on any exit.
+S38M="$NS_ROOT/scripts/.ledger-mutant.jac"
+trap 'rm -f "$S38M"' EXIT
+sed 's|elif cmd == "prunable" and len(args) == 4 {|elif cmd == "prunable" and len(args) == 5 {|; s|prunable_branches(args\[3\], int(args\[2\]))|prunable_branches(args[4], int(args[3]))|' \
+    "$NS_ROOT/scripts/ledger.jac" > "$S38M"
+grep -q 'len(args) == 5' "$S38M" \
+    || fail "the section-38 mutant was not built; the mutation proves nothing"
+jac run "$S38M" prunable 14 "$S38/led.jsonl" > "$S38/mut-out.txt" 2>/dev/null || true
+grep -q 'nightshift/2026-07-01/stale' "$S38/mut-out.txt" \
+    && fail "the restored off-by-one STILL emitted the stale branch -- section 38 cannot fail"
+rm -rf .jac
+echo "prunable parses its own argv, and a night with nothing to prune is not a night that never asked"
+
 echo "ALL HARNESS TESTS PASSED"

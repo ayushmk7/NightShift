@@ -121,8 +121,15 @@ with entry {
         print(json.dumps(set_status(args[4], args[2], args[3], extra)));
     } elif cmd == "tally" and len(args) == 3 {
         print(json.dumps(tally(args[2])));
-    } elif cmd == "prunable" and len(args) == 5 {
-        for b in prunable_branches(args[4], int(args[3])) {
+    } elif cmd == "prunable" and len(args) == 4 {
+        # argv is [script, "prunable", days, ledger] -- FOUR, not five. This arm demanded 5 and read
+        # args[3]/args[4] (the shape of the 3-argument verbs below it) from 2026-07-30 until
+        # 2026-08-02, so every call fell through to the usage arm: it printed usage to stderr, exited
+        # 0, and emitted no branches. lib/sync.sh:20 pipes this into a `while read` loop, so a prune
+        # that never ran was indistinguishable from a night with nothing to prune. No stale branch
+        # has ever been deleted. Harness section 38 now runs the real CLI and asserts a branch comes
+        # back, because a unit test on prunable_branches() would have passed throughout.
+        for b in prunable_branches(args[3], int(args[2])) {
             print(b);
         }
     } elif cmd == "upsert-theme" and len(args) == 5 {
