@@ -155,6 +155,25 @@ tier2_audit_shard() {   # tier2_audit_shard <name> <scope> <task>
     # is unconditional, which also removes one of the bash-3.2 empty-array hazards.
     local audit_model="$NS_AGENT_MODEL"
 
+    # THE PER-SESSION MONEY CAP, SPLIT BY CALLER. Both callers of this function pass through the one
+    # `--max-budget-usd` below, and their per-turn costs differ 2.2x (2026-07-31: reactive $0.139/turn
+    # over 207 turns, cycle shards $0.0638/turn over 601). A single number therefore cannot bound both:
+    # set for the shards it lets four reactive lenses bill $48 of a $50 night before the fan-out is
+    # scheduled at all; set for the lenses it truncates shard audits that were going to succeed.
+    # Keyed on the NAME prefix, the same thing the coverage-evidence filter above keys on and the one
+    # attribute the two callers already differ in by construction (reactive_main passes
+    # "reactive-<task>"), so the argv stays at three.
+    #
+    # `case`, not `[ "$x" = y ] && z`: this is the last statement before the loop and an `&&` that
+    # takes the false branch returns 1, which under this file's `set -e` discipline would abort the
+    # audit before it ran -- and a session that never ran writes a 0-byte envelope that reads as
+    # "killed by the timebox". A `case` returns 0 on every arm.
+    local audit_budget
+    case "$name" in
+        reactive-*) audit_budget="$NS_BUDGETS_REACTIVE_AUDIT_MAX_BUDGET_USD" ;;
+        *)          audit_budget="$NS_BUDGETS_AUDIT_MAX_BUDGET_USD" ;;
+    esac
+
     # Up to 2 attempts: a transient API error (e.g. "Connection closed mid-response") shouldn't
     # burn this scope. Each attempt is time-boxed; the parse decides success.
     # </dev/null on every claude call is load-bearing: the driver loop feeds stdin, and without
@@ -168,7 +187,7 @@ tier2_audit_shard() {   # tier2_audit_shard <name> <scope> <task>
             --permission-mode dontAsk \
             --allowedTools "Read,Grep,Glob,Bash(jac code *),Bash(jac check *),Bash(jac guide *),mcp__jac__*" \
             --max-turns "$NS_BUDGETS_AUDIT_MAX_TURNS" \
-            --max-budget-usd "$NS_BUDGETS_AUDIT_MAX_BUDGET_USD" --output-format json) \
+            --max-budget-usd "$audit_budget" --output-format json) \
             > "$LOG_DIR/audit-$name.json" < /dev/null || true
 
         # Every session's own reported cost goes on the night's ledger, before any parse can fail:

@@ -180,13 +180,41 @@ max_budget_usd     = 5                       # per APPLY session. NOT inert: eve
                                               # from 2026-07-31 reports a real total_cost_usd, and the
                                               # night really cost $76.55. Applies are cheap ($0.28-$2.13
                                               # each, $9.19 for all eleven), so 5 is genuine headroom.
-audit_max_budget_usd = 12                    # per AUDIT session -- the flag audit sessions never got.
+audit_max_budget_usd = 12                    # per SHARD audit session (the cycle fan-out).
                                               # NOT 5: the audits that succeeded cost up to $9.77
                                               # (reactive-dead-code, 69 turns, 5 findings), so a 5 here
                                               # would convert five of the nine successful audits into
                                               # the truncated-session failure this same fix teaches the
                                               # harness to report instead of salvage. 12 = the observed
                                               # ceiling plus headroom for the raised turn cap.
+                                              # Eight shards at the measured $0.0638/turn and a 130-turn
+                                              # cap is $8.29 worst case, so 12 is never the binding
+                                              # limit for a shard -- night_budget_usd is.
+reactive_audit_max_budget_usd = 8            # per REACTIVE LENS session. A SEPARATE NUMBER, and the
+                                              # reason is arithmetic, not tidiness: the two callers of
+                                              # tier2_audit_shard have 2.2x different per-turn costs.
+                                              # Measured 2026-07-31: the four reactive lenses cost
+                                              # $28.72 over 207 turns ($0.139/turn); the eight cycle
+                                              # shards cost $38.36 over 601 turns ($0.0638/turn). A
+                                              # reactive lens therefore reaches a shared 12 at ~turn 86,
+                                              # inside the raised 130-turn cap, so four lenses could
+                                              # bill $48 of the $50 night_budget_usd and leave ~2 of 8
+                                              # shards schedulable -- moving money from the shards that
+                                              # produced 95 findings for $38.36 to the reactive lenses
+                                              # that produced 5 for $28.72. That is a REGRESSION the
+                                              # raised turn cap introduced, not a pre-existing one.
+                                              # WHY 8 AND NOT 6: a truncated audit still bills its full
+                                              # cap and returns nothing, so this must sit ABOVE the cost
+                                              # of a lens that finishes, not at it. The one reactive
+                                              # lens that produced findings cost $9.77 at 69 turns; with
+                                              # the scope filter in scripts/merges.jac the same window
+                                              # drops from 2,168,503 to 1,324,887 bytes (-38.9%), and at
+                                              # the measured 93% ingestion share that projects to ~$6.2.
+                                              # 6 would truncate it at ~turn 62 and pay $6 for nothing --
+                                              # manufacturing the exact failure the row above refuses.
+                                              # 8 is that projection plus ~30% headroom, and four lenses
+                                              # at 8 is $32 of 50, which still leaves the fan-out room.
+                                              # RE-MEASURE after the first filtered night.
 night_budget_usd   = 50                      # WHOLE-NIGHT ceiling, and the only thing that actually
                                               # bounds spend: a per-session cap times fifty sessions is
                                               # not a brake. lib/common.sh sums the total_cost_usd the

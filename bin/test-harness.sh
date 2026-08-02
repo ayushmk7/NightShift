@@ -2523,6 +2523,277 @@ esac
 rm -rf .jac
 echo "the night's theme count is bounded by the clock it has, and never over-commits it"
 
+
+echo "== 30. the reactive scope holds only files a lens can act on =="
+# 2026-07-31: the reactive pass cost $28.72 and 93% of that was context ingestion. Ten of the forty
+# files it fed to all four lenses -- 1,049,880 of 2,168,503 bytes -- could not yield a finding under
+# any of them: three .md, two .sh and five under **/tests/**, where
+# jac/jaclang/cli/docs/community/release_notes/jaclang.md alone is 753,123 bytes, 35% of the whole
+# read set. The only filter was `path.startswith(<shard root>)`.
+#
+# Driven over the REAL merge poll (logs/2026-07-31/merges.json, 21 merged PRs, 522 changed paths)
+# through the REAL reader lib/reactive.sh calls, and asserted on the WINDOW rather than the whole
+# list: reactive_main audits `head -(files_per_theme*4)` and never looks below it.
+rm -rf .jac
+S30="$(mktemp -d)"
+jac run scripts/merges.jac files logs/2026-07-31/merges.json config/nightshift.toml > "$S30/scope.txt" \
+    || fail "merges files no longer parses the real 2026-07-31 merge poll"
+head -40 "$S30/scope.txt" > "$S30/win.txt"
+[ "$(wc -l < "$S30/win.txt" | tr -d ' ')" = "40" ] \
+    || fail "the filtered scope no longer fills the 40-file window ($(wc -l < "$S30/win.txt" | tr -d ' ') files); the filter must REFILL it from further down the churn ranking, not shrink it"
+if grep -q 'release_notes/jaclang.md' "$S30/win.txt"; then
+    fail "the 753 KB changelog is still in the reactive window: 35% of the read set, and no lens has a rule that can fire on it"
+fi
+if grep -qE '\.(md|sh|py|txt|yml|toml)$' "$S30/win.txt"; then
+    fail "a non-Jac file is still in the reactive window: $(grep -E '\.(md|sh|py|txt|yml|toml)$' "$S30/win.txt" | tr '\n' ' ')"
+fi
+if grep -qE '(^|/)tests/' "$S30/win.txt"; then
+    fail "a protected tests/** path is still in the reactive window: $(grep -E '(^|/)tests/' "$S30/win.txt" | tr '\n' ' ')"
+fi
+# ...and the freed slots are FILLED from the same churn ranking, not left as ten fewer files.
+for p in jac/jaclang/scale/sdk/client.jac jac/jaclang/cli/impl/dispatch.impl.jac \
+         jac/jaclang/jac0core/constant.jac jac/jaclang/project/__init__.jac; do
+    grep -qxF "$p" "$S30/win.txt" \
+        || fail "$p ranked 41-50 before the filter and should have been promoted into the window; it is not there"
+done
+
+# THE MUTATION CONTROL, and it is not synthetic: logs/2026-07-31/reactive-files.txt IS this same
+# reader's output over this same merges.json before the filter existed. Every assertion above must
+# FAIL against it, or it is pinned to something the old code already satisfied.
+head -40 logs/2026-07-31/reactive-files.txt > "$S30/unfiltered.txt"
+grep -q 'release_notes/jaclang.md' "$S30/unfiltered.txt" \
+    || fail "the changelog assertion cannot fail: it does not even match the recorded unfiltered window"
+[ "$(grep -cE '\.(md|sh)$' "$S30/unfiltered.txt" | tr -d ' ')" = "5" ] \
+    || fail "the non-Jac assertion is pinned to the wrong fact: the recorded unfiltered window held 5 non-Jac paths, this reader counts $(grep -cE '\.(md|sh)$' "$S30/unfiltered.txt" | tr -d ' ')"
+[ "$(grep -cE '(^|/)tests/' "$S30/unfiltered.txt" | tr -d ' ')" = "6" ] \
+    || fail "the protected-path assertion is pinned to the wrong fact: the recorded unfiltered window held 6 tests/** paths, this reader counts $(grep -cE '(^|/)tests/' "$S30/unfiltered.txt" | tr -d ' ')"
+
+# ...and the two halves of the filter are SEPARATE, proven by deleting one of them from the config
+# rather than by reading the code. With **/tests/** gone from [protect].globs the five test .jac
+# files come back -- so that half really is driven by the config -- while the .md and .sh stay out,
+# which is the other half doing its own work.
+sed 's|"\*\*/tests/\*\*", ||' config/nightshift.toml > "$S30/noprotect.toml"
+grep -q '"\*\*/fixtures/\*\*"' "$S30/noprotect.toml" \
+    || fail "the mutant config was not built (the globs line did not match); the comparison below proves nothing"
+if grep -q '"\*\*/tests/\*\*"' "$S30/noprotect.toml"; then
+    fail "the mutant config still protects **/tests/**; the mutation did nothing"
+fi
+jac run scripts/merges.jac files logs/2026-07-31/merges.json "$S30/noprotect.toml" | head -40 > "$S30/mut.txt"
+grep -qE '(^|/)tests/' "$S30/mut.txt" \
+    || fail "removing **/tests/** from [protect].globs changed the scope not at all -- the filter is not reading the config, so the tests/** assertion above is vacuous"
+if grep -qE '\.(md|sh)$' "$S30/mut.txt"; then
+    fail "the .jac-extension half of the filter is gone: unprotecting tests/** also readmitted .md/.sh"
+fi
+rm -rf .jac
+echo "the reactive window is 40 auditable .jac files: no changelog, no docs, no scripts, no protected tests"
+
+echo "== 31. the audit money cap is per CALLER, because the two callers cost 2.2x apart =="
+# 2026-07-31: four reactive lenses cost $28.72 over 207 turns ($0.139/turn) and eight cycle shards
+# cost $38.36 over 601 turns ($0.0638/turn). One audit_max_budget_usd served both, so raising
+# audit_max_turns to 130 let a lens reach $12 at ~turn 86 -- four lenses billing $48 of a $50 night
+# before the shard fan-out is scheduled at all, moving money from the audits that produced 95
+# findings to the ones that produced 5. Driven through the REAL tier2_audit_shard with a stub claude
+# that records the flags it was handed; nothing here can reach a real session.
+rm -rf .jac
+S31="$(mktemp -d)"
+mkdir -p "$S31/repo"
+cat > "$S31/claude" <<'STUB31'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB31_ARGV"
+printf '{"is_error":false,"total_cost_usd":0.01,"result":"```json\n[]\n```"}\n'
+STUB31
+chmod +x "$S31/claude"
+
+# A separate bash PROCESS, one per probe: `( … ) || fail` suspends errexit for the whole dynamic
+# extent left of the ||, so it cannot see a mid-function abort at all.
+budget_probe() {       # budget_probe <audit-name> [config] -> the --max-budget-usd it was handed
+    local name=$1 cfg=${2:-$NS_ROOT/config/nightshift.toml}
+    : > "$S31/argv"
+    NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
+        . "$NS_ROOT/lib/common.sh"; CONFIG="$3"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"
+        LOG_DIR="$1"; REPO="$1/repo"; NS_PATHS_CLAUDE="$1/claude"
+        export STUB31_ARGV="$1/argv"
+        date +%s > "$1/start_epoch"
+        tier2_audit_shard "$2" "jac/jaclang/cli/a.jac" dead-code' _ "$S31" "$name" "$cfg" \
+        > "$S31/out.txt" 2>&1 || true
+    sed -n 's/.*--max-budget-usd \([0-9.][0-9.]*\).*/\1/p' "$S31/argv" | head -1
+}
+# The name prefix is the only thing the two callers differ in by construction: reactive_main passes
+# "reactive-<task>", tier2_audit_all passes the shard name.
+react_cap="$(budget_probe reactive-dead-code)"
+shard_cap="$(budget_probe cli)"
+case "$react_cap" in
+    "") fail "the reactive lens was started with no --max-budget-usd at all: $(tr '\n' ' ' < "$S31/out.txt")" ;;
+esac
+case "$shard_cap" in
+    "") fail "the shard audit was started with no --max-budget-usd at all: $(tr '\n' ' ' < "$S31/out.txt")" ;;
+esac
+[ "$react_cap" = "8" ] \
+    || fail "a reactive lens was capped at \$$react_cap, not the \$8 [budgets].reactive_audit_max_budget_usd declares"
+[ "$shard_cap" = "12" ] \
+    || fail "a shard audit was capped at \$$shard_cap, not the \$12 [budgets].audit_max_budget_usd declares"
+
+# THE REGRESSION ITSELF, as an inequality rather than as two constants: whatever the numbers become,
+# four reactive lenses must not be able to bill the whole night before a shard can be scheduled.
+react_num="$(sed -n 's/^reactive_audit_max_budget_usd *= *\([0-9][0-9]*\).*/\1/p' config/nightshift.toml | head -1)"
+shard_num="$(sed -n 's/^audit_max_budget_usd *= *\([0-9][0-9]*\).*/\1/p' config/nightshift.toml | head -1)"
+night_num="$(sed -n 's/^night_budget_usd *= *\([0-9][0-9]*\).*/\1/p' config/nightshift.toml | head -1)"
+case "$react_num.$shard_num.$night_num" in
+    *[!0-9.]*|.*|*..*|*.) fail "could not read the three budget numbers out of config/nightshift.toml (got '$react_num' '$shard_num' '$night_num')" ;;
+esac
+[ "$react_num" -lt "$shard_num" ] \
+    || fail "reactive_audit_max_budget_usd ($react_num) is not below audit_max_budget_usd ($shard_num); a reactive turn costs 2.2x a shard turn, so an equal cap starves the fan-out"
+[ "$(( react_num * 4 ))" -lt "$night_num" ] \
+    || fail "four reactive lenses at \$$react_num is \$$(( react_num * 4 )), which reaches the \$$night_num night ceiling on its own -- the cycle shards would never be scheduled"
+
+# THE MUTATION CONTROL: with the two numbers made equal in the config, the probe must report the
+# SAME cap for both callers. Without this arm every assertion above is satisfied by a
+# tier2_audit_shard that ignores the name and reads one number, which is what it did before.
+sed 's/^reactive_audit_max_budget_usd = 8/reactive_audit_max_budget_usd = 12/' config/nightshift.toml > "$S31/same.toml"
+grep -q '^reactive_audit_max_budget_usd = 12' "$S31/same.toml" \
+    || fail "the equal-caps mutant config was not built; the comparison below proves nothing"
+mut_react="$(budget_probe reactive-dead-code "$S31/same.toml")"
+[ "$mut_react" = "12" ] \
+    || fail "the reactive cap does not come from the config: the mutant says 12 and the session was handed \$$mut_react"
+# ...and the other direction, so the split cannot be satisfied by a hard-coded 8: move the SHARD
+# number and the shard probe must follow it while the reactive one does not.
+sed 's/^audit_max_budget_usd = 12/audit_max_budget_usd = 20/' config/nightshift.toml > "$S31/shard20.toml"
+grep -q '^audit_max_budget_usd = 20' "$S31/shard20.toml" \
+    || fail "the shard mutant config was not built; the comparison below proves nothing"
+mut_shard="$(budget_probe cli "$S31/shard20.toml")"
+[ "$mut_shard" = "20" ] \
+    || fail "the shard cap is hard-coded: the mutant config says 20 and the session was handed \$$mut_shard"
+mut_react2="$(budget_probe reactive-dead-code "$S31/shard20.toml")"
+[ "$mut_react2" = "8" ] \
+    || fail "moving the SHARD cap to 20 moved the REACTIVE cap to \$$mut_react2 too; the two callers are still sharing one number"
+rm -rf .jac
+echo "a reactive lens is capped at \$8 and a shard audit at \$12, read from the config, keyed on the caller"
+
+echo "== 32. the selector ships what the audits already paid for, and drops what cannot be applied =="
+# 2026-07-31, three defects in one selection:
+#   * 112 findings grouped into 105 themes, 99 of them singletons, so 103 findings were deferred
+#     `over-night-budget` while the night had used 56 of its 480 minutes -- $38.36 of shard audit and
+#     $28.72 of reactive lens, banked and never shipped.
+#   * 14 of the 36 file slots (39%) were guessed decl/impl siblings that are not on disk.
+#   * five of the eleven apply sessions were impossible before they started: the symbol each was
+#     asked to delete is still imported by a file under **/tests/**, which the theme may neither
+#     edit nor remove. 25 minutes and ~$0.45 each, and every one reported "no changes made".
+# Driven over the REAL findings sets against the REAL repo clone.
+rm -rf .jac
+if [ ! -d "$NS_ROOT/work/repo/jac" ]; then
+    echo "SKIP: no work/repo clone present"
+else
+S32="$(mktemp -d)"
+printf '{"verify_estimate_min": 1}\n' > "$S32/state.json"
+resel() {              # resel <findings.json> <out.json> [config]
+    jac run scripts/selector.jac select "${3:-config/nightshift.toml}" /nonexistent "$S32/state.json" \
+        424 "$NS_ROOT/work/repo" < "$1" > "$2" || fail "the selector failed over $1"
+}
+# Every theme's own JSON, concatenated -- read through `selector split`, the same reader tier2_apply
+# drives the night from, so a selection that packs themes nothing can split cannot read as green.
+themes_blob() {        # themes_blob <selection.json> <tag>
+    rm -rf "$S32/split-$2"; mkdir -p "$S32/split-$2"
+    jac run scripts/selector.jac split "$1" "$S32/split-$2" > "$S32/slugs-$2.txt"
+    cat "$S32/split-$2"/theme-*.json > "$S32/blob-$2.json" 2>/dev/null || : > "$S32/blob-$2.json"
+}
+# Every file slot of every selected theme, `slug<TAB>file`, in ONE reader call. bash never parses
+# the JSON (global constraint) and the harness does not pay a jac startup per theme.
+missing_slots() {      # missing_slots <selection.json> -> how many named paths are not on disk
+    local n=0 p
+    for p in $(jac run scripts/selector.jac slots "$1" | cut -f2); do
+        [ -e "$NS_ROOT/work/repo/$p" ] || n=$(( n + 1 ))
+    done
+    printf '%s' "$n"
+}
+resel logs/2026-07-31/findings-all.json "$S32/cycle.json"
+resel logs/2026-07-31/findings-reactive.json "$S32/react.json"
+themes_blob "$S32/cycle.json" cycle
+themes_blob "$S32/react.json" react
+themes_blob logs/2026-07-31/selection.json old
+
+# --- A. the five sessions that could not have worked are dropped at SELECTION -------------------
+# Named by the file each finding sits in, because that is what a reader can check against the apply
+# report that proved it.
+jac run scripts/selector.jac dropped "$S32/cycle.json" > "$S32/dropped-cycle.tsv"
+jac run scripts/selector.jac dropped "$S32/react.json" > "$S32/dropped-react.tsv"
+for f in jac/jaclang/compiler/type_registry.jac \
+         jac/jaclang/compiler/targets/abi.jac \
+         jac/jaclang/project/config.jac; do
+    grep -qF "$(printf '%s\tblocked-by-protected-test' "$f")" "$S32/dropped-cycle.tsv" \
+        || fail "$f still reaches an apply session; its deletion is blocked by a protected test that imports the symbol"
+done
+for f in jac/jaclang/cli/commands/impl/execution.impl.jac \
+         jac/jaclang/scale/injector/bundle.jac; do
+    grep -qF "$(printf '%s\tblocked-by-protected-test' "$f")" "$S32/dropped-react.tsv" \
+        || fail "$f still reaches an apply session; its deletion is blocked by a protected test that imports the symbol"
+done
+# THE FALSE-POSITIVE ARM, and it is the one that matters: the six themes that DID ship must still be
+# selected. A blocker rule that drops everything satisfies all five assertions above and costs this
+# harness its entire output -- which is exactly what reusing vestigial_test_files' file-stem grep
+# does: that grep matches 2 to 280 protected files per theme, on all eleven of them.
+for f in jac/jaclang/compiler/type_system/type_utils.jac \
+         jac/jaclang/project/template_registry.jac \
+         jac/jaclang/byllm/llm.impl/basellm.impl.jac; do
+    grep -qF "\"$f\"" "$S32/blob-cycle.json" \
+        || fail "$f shipped a real branch on 2026-07-31 and is no longer selected; the blocker rule is over-matching"
+done
+for f in jac/jaclang/cli/commands/project.jac \
+         jac/jaclang/cli/commands/impl/tools.impl.jac \
+         jac/jaclang/cli/impl/registry.impl.jac; do
+    grep -qF "\"$f\"" "$S32/blob-react.json" \
+        || fail "$f shipped a real branch on 2026-07-31 and is no longer selected; the blocker rule is over-matching"
+done
+
+# --- B. no theme carries a file slot that does not exist ----------------------------------------
+[ "$(missing_slots "$S32/cycle.json")" = "0" ] \
+    || fail "the cycle selection still names $(missing_slots "$S32/cycle.json") file(s) that do not exist in work/repo"
+[ "$(missing_slots "$S32/react.json")" = "0" ] \
+    || fail "the reactive selection still names $(missing_slots "$S32/react.json") file(s) that do not exist in work/repo"
+# THE MUTATION CONTROL, again not synthetic: logs/2026-07-31/selection.json is what this same
+# selector produced from these same findings before the existence check, and it must FAIL the
+# assertion above -- 12 phantom slots in the cycle selection, 2 in the reactive one.
+[ "$(missing_slots logs/2026-07-31/selection.json)" = "12" ] \
+    || fail "the phantom-slot check is pinned to the wrong fact: the recorded 2026-07-31 cycle selection held 12 non-existent file slots, this reader counts $(missing_slots logs/2026-07-31/selection.json)"
+[ "$(missing_slots logs/2026-07-31/selection-reactive.json)" = "2" ] \
+    || fail "the phantom-slot check is pinned to the wrong fact for the reactive selection: expected 2, this reader counts $(missing_slots logs/2026-07-31/selection-reactive.json)"
+
+# --- C. the grouping converts banked findings into shipped themes -------------------------------
+packed() {             # packed <tag> -> how many findings the selected themes carry
+    grep -o '"fingerprint"' "$S32/blob-$1.json" | wc -l | tr -d ' '
+}
+# 9 of 112 is what the recorded night actually handed to apply sessions. That number is the baseline
+# and the mutation control in one: if the new grouping does not beat it by a wide margin, the $38.36
+# of shard audit is still being thrown away.
+[ "$(packed old)" = "9" ] \
+    || fail "the baseline is wrong: the recorded 2026-07-31 cycle selection carried 9 findings, this reader counts $(packed old)"
+[ "$(packed cycle)" -ge 40 ] \
+    || fail "the same 112 findings now pack only $(packed cycle) into the night's themes (was $(packed old)); grouping by directory was supposed to multiply this"
+# ...and nothing was silently deleted to achieve it. `over-theme-budget` is TERMINAL -- select()
+# deliberately does not carry it -- so a group that overflows must SPILL into another theme rather
+# than drop its tail. Any row here is a finding lost for good.
+[ "$(grep -c 'over-theme-budget' "$S32/dropped-cycle.tsv" || true)" = "0" ] \
+    || fail "coarser grouping is dropping $(grep -c 'over-theme-budget' "$S32/dropped-cycle.tsv") finding(s) as over-theme-budget instead of spilling them into a second theme; that reason is terminal, so they are gone for good"
+# ...and every theme still respects files_per_theme, which grouping by directory is the first thing
+# ever to make binding (that night produced zero over-theme-budget rows because every group held one
+# finding, so the caps bounded nothing at all).
+widest="$(jac run scripts/selector.jac slots "$S32/cycle.json" | cut -f1 | uniq -c | awk '{ if ($1 > m) { m = $1; s = $2 } } END { print m "\t" s }')"
+[ "$(printf '%s' "$widest" | cut -f1)" -le 10 ] \
+    || fail "theme $(printf '%s' "$widest" | cut -f2) names $(printf '%s' "$widest" | cut -f1) files against files_per_theme = 10"
+
+# --- D. ...and the blocker really is driven by the protected globs -------------------------------
+# With **/tests/** unprotected the five blocked deletions become ordinary findings again: the rule
+# reads is_protected, it does not carry its own list of paths.
+sed 's|"\*\*/tests/\*\*", ||' config/nightshift.toml > "$S32/noprotect.toml"
+if grep -q '"\*\*/tests/\*\*"' "$S32/noprotect.toml"; then
+    fail "the mutant config still protects **/tests/**; the check below proves nothing"
+fi
+resel logs/2026-07-31/findings-reactive.json "$S32/react-mut.json" "$S32/noprotect.toml"
+[ "$(jac run scripts/selector.jac dropped "$S32/react-mut.json" | grep -c 'blocked-by-protected-test' || true)" = "0" ] \
+    || fail "findings are still dropped blocked-by-protected-test with **/tests/** removed from [protect].globs -- the rule is not reading the config"
+fi
+rm -rf .jac
+echo "the five impossible themes are dropped at selection, the six that shipped survive, no phantom file slots, and the night's themes carry 4x the findings"
+
 echo "== 33. a dry run is RECORDED, flagged, with only the fork URL withheld =="
 # THE 2026-07-31 LOSS. lib/dataset.sh:17 and :26 early-returned on NS_DRY_RUN "because rehearsal
 # nights are sandbox data". But only `git push` and `gh pr create` are stubbed under NS_DRY_RUN: 12

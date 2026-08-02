@@ -12,7 +12,7 @@ argv:
 import sys;
 import json;
 import from datetime { date, timedelta }
-import from nslib { eprint, as_dict, as_list, state_read, load_config_toml }
+import from nslib { eprint, as_dict, as_list, state_read, load_config_toml, is_protected }
 import from shards { shard_names, shard_paths }
 
 """Default window is ONE DAY, not "since the harness started". A missed night (07-28 to 07-30
@@ -77,6 +77,46 @@ def audited_roots(cfg: dict) -> list[str] {
     return sorted(roots);
 }
 
+"""[protect].globs off an ALREADY-PARSED config table.
+
+Not nslib.load_globs, which takes a path: auditable_files is handed the parsed table (its callers
+and every test already have it), and re-reading the file here would create a second read that could
+disagree with the first. Raises rather than defaulting to []: an empty deny-list silently readmits
+every protected path into the audit scope, which is the failure this filter exists to prevent."""
+def protect_globs(cfg: dict) -> list[str] {
+    globs: any = as_dict(cfg["protect"])["globs"];
+    if isinstance(globs, list) {
+        return [str(g) for g in globs];
+    }
+    raise ValueError("[protect].globs missing or not a list");
+}
+
+"""Can any of the four audit lenses produce a finding about this path at all?
+
+TWO conditions, and both were measured on the real 2026-07-31 reactive scope rather than assumed:
+
+* IT MUST BE JAC. Every lens's prompt is about Jac source, every finding is scored in Jac lines,
+  and check_scope rejects a diff that touches anything else. The 40-file window that night carried
+  three .md files, two .sh scripts and (on the wider list) a .py -- including
+  jac/jaclang/cli/docs/community/release_notes/jaclang.md at 753,123 bytes, which is 35% of the
+  ENTIRE 2,168,503-byte read set on its own, ingested by all four lenses, and cannot yield a
+  finding under any of them. 93% of the reactive pass's $28.72 was context ingestion.
+* IT MUST NOT BE PROTECTED. is_protected is the same matcher the S4 gate and the selector use --
+  deliberately reused rather than re-encoded, because a second protected-path matcher that drifts
+  from check_scope.jac's is a branch that passes selection and is discarded after a 25-minute apply
+  session. A finding inside **/tests/** is dropped by selector.drop_reason as `protected-path`
+  anyway, so auditing those files can only ever buy a drop reason. That night's window held five of
+  them.
+
+Filtering both, that window loses 1,049,880 bytes and gains ten real .jac files from further down
+the churn ranking: 2,168,503 -> 1,324,887 bytes for the same 40 slots."""
+def is_auditable(path: str, globs: list[str]) -> bool {
+    if not path.endswith(".jac") {
+        return False;
+    }
+    return not is_protected(path, globs);
+}
+
 """The reactive audit SCOPE: the merged-file union, restricted to the tree the lenses can audit and
 RANKED, most-churned first.
 
@@ -97,9 +137,14 @@ jaseci-labs/jac merges was 21 PRs touching 522 files:
 
 So the order is churn: how many of tonight's merged PRs touched the file, then how many lines
 moved, then the path (which is what keeps it deterministic and replayable). Truncating a
-churn-ranked list is the "largest-signal subset" the ceiling promises."""
+churn-ranked list is the "largest-signal subset" the ceiling promises.
+
+The is_auditable filter runs BEFORE the ranking, not after: lib/reactive.sh truncates this list at
+files_per_theme*4, so a file that cannot yield a finding has to be gone before it can occupy one of
+those slots. Filtering the truncated head instead would shrink the window rather than refill it."""
 def auditable_files(prs: list[dict], cfg: dict) -> list[str] {
     roots: list[str] = audited_roots(cfg);
+    globs: list[str] = protect_globs(cfg);
     touches: dict[str, int] = {};
     churn: dict[str, int] = {};
     for pr in prs {
@@ -107,7 +152,7 @@ def auditable_files(prs: list[dict], cfg: dict) -> list[str] {
         for f in as_list(pr.get("files", [])) {
             entry: dict = as_dict(f);
             path: str = str(entry.get("path", ""));
-            if not path {
+            if not path or not is_auditable(path, globs) {
                 continue;
             }
             covered: bool = False;
@@ -220,7 +265,7 @@ test "changed_files is the deduped union across PRs, sorted" {
     assert len(rows) == 2;
 }
 
-test "auditable_files keeps only what a shard covers" {
+test "auditable_files keeps only what a shard covers AND what a lens can act on" {
     # The real 2026-07-30 poll returned 522 paths whose sorted-first 40 were .github/**, README.md
     # and release_notes/** -- so an unfiltered head-of-list scope would have spent four Opus
     # sessions on files no lens has a rule for and reported "nothing found".
@@ -231,12 +276,39 @@ test "auditable_files keeps only what a shard covers" {
         {"path": "release_notes/unreleased/jaclang/7628.refactor.md"},
         {"path": "jac/jaclang/cli/cli.jac"},
         {"path": "jac/jaclang/scale/plugin.jac"},
+        # ...and three shapes that DO sit under a shard root but still cannot yield a finding.
+        # All three are real paths from the 2026-07-31 window.
+        {"path": "jac/jaclang/cli/docs/community/release_notes/jaclang.md"},   # the 753 KB changelog
+        {"path": "jac/jaclang/scale/scripts/k8s_microservice_real_e2e.sh"},
+        {"path": "jac/jaclang/byllm/tests/test_byllm.jac"},                    # **/tests/**
     ]}];
     assert changed_files(prs) == [".github/workflows/ci.yml", "README.md",
-                                  "jac/jaclang/cli/cli.jac", "jac/jaclang/scale/plugin.jac",
+                                  "jac/jaclang/byllm/tests/test_byllm.jac",
+                                  "jac/jaclang/cli/cli.jac",
+                                  "jac/jaclang/cli/docs/community/release_notes/jaclang.md",
+                                  "jac/jaclang/scale/plugin.jac",
+                                  "jac/jaclang/scale/scripts/k8s_microservice_real_e2e.sh",
                                   "release_notes/unreleased/jaclang/7628.refactor.md"];
     assert sorted(auditable_files(prs, cfg))
         == ["jac/jaclang/cli/cli.jac", "jac/jaclang/scale/plugin.jac"];
+    # The two halves of is_auditable, asserted separately: an assertion on the union alone is
+    # satisfied by either filter doing all the work, and the .md/.sh half is the one that removes
+    # the 753 KB changelog while the glob half is the one that removes the five test files.
+    globs: list[str] = protect_globs(cfg);
+    assert is_auditable("jac/jaclang/cli/cli.jac", globs);
+    assert not is_auditable("jac/jaclang/cli/docs/community/release_notes/jaclang.md", globs);
+    assert not is_auditable("jac/jaclang/scale/scripts/e2e_lib.sh", globs);
+    assert not is_auditable("jac/jaclang/jac0core/parser/__init__.py", globs);
+    assert not is_auditable("jac/jaclang/byllm/tests/test_byllm.jac", globs);
+    assert not is_auditable("jac/jaclang/scale/tests/data/test_s3_storage.jac", globs);
+    # a config with no [protect] table is an ERROR, not "nothing is protected"
+    raised: bool = False;
+    try {
+        protect_globs({"shards": {}});
+    } except Exception {
+        raised = True;
+    }
+    assert raised;
     # a merge day that touched nothing auditable yields an EMPTY scope, which reactive_main treats
     # as a quiet day -- correctly: there is nothing for a lens to read.
     docs_only: list[dict] = [{"number": 2, "title": "t", "author": {"login": "x"},
