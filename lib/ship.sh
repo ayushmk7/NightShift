@@ -31,13 +31,15 @@ ship_branch() {
     slug="$(basename "$branch")"
     if [ "$theme" != "-" ]; then
         # Themes carry no `package` key since the audit went whole-repo/sharded, so this is normally
-        # empty now. Fall back to the same "repo" the tier-1 branch below uses: pkg reaches the draft
-        # title AND dataset_record_refactor's row, where "" would sit inconsistently next to
-        # nights.jsonl's "repo" and historical rows' real package names.
+        # empty now. Fall back to "repo": pkg reaches the draft title AND
+        # dataset_record_refactor's row, where "" would sit inconsistently next to nights.jsonl's
+        # "repo" and historical rows' real package names.
         pkg="$(ns_jac parse_result field package < "$theme")"
         [ -n "$pkg" ] || pkg="repo"
     else
-        pkg="repo"          # tier-1 autofix touches whichever packages drifted
+        # theme "-" — nothing writes that today (tier-1, which did, was retired 2026-07-30), but
+        # ship_main reads the column, so the fallback stays rather than becoming an unbound var.
+        pkg="repo"
     fi
     # The fallback must NOT assert a green gate. This string goes verbatim into the draft's
     # "## Verification" section (render_draft.jac body_lines) and from there into the PR body a
@@ -74,7 +76,7 @@ ship_branch() {
         cp "$LOG_DIR/theme-$slug.json" "$DRAFTS/themes/$slug.json"
     fi
 
-    # findings on this branch: drafted (autofix has no ledger rows — that's fine)
+    # findings on this branch: drafted (a branch with no ledger rows simply loops zero times)
     local fp
     ns_jac ledger by-branch "$branch" "$LEDGER" | while IFS= read -r fp; do
         ns_jac ledger set-status "$fp" drafted "$LEDGER" >/dev/null

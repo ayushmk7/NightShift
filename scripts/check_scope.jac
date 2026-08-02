@@ -1,7 +1,6 @@
 """S4 scope-containment gate (TechnicalPRD 7-S4, threat T1 backstop).
 
-stdin: `check` mode: git diff --name-status output (STATUS<TAB>path per line). `protected` mode:
-newline-separated paths (git diff --name-only).
+stdin: `check` mode: git diff --name-status output (STATUS<TAB>path per line).
 argv:  check <theme.json> <config.toml> <task>  theme-scoped gate (apply branches). <task> is the
                                               name lib/common.sh's ns_task_of_branch derived from
                                               the BRANCH, and it -- not the theme -- decides
@@ -10,8 +9,11 @@ argv:  check <theme.json> <config.toml> <task>  theme-scoped gate (apply branche
                                               from an existing test file (exit 1), else print what
                                               was compared (OK ...) or that there was nothing to
                                               compare (SKIP ...)
-       protected <config.toml>                print the stdin paths that hit a protected glob
-                                              (tier-1 uses this to revert formatter overreach)
+
+A third verb, `protected <config.toml>`, was deleted with tier-1 on 2026-08-02: it printed the
+stdin paths hitting a protected glob so the S2 autofix could revert formatter overreach, and it
+had zero callers once that stage went away. `is_protected` itself is very much alive -- the
+`check` arm above and the reactive scope filter both use it.
 Exit 0 = diff contained; exit 1 = violation(s), one `VIOLATION <path> <reason>` line each.
 A diff outside the theme's declared files or inside a protected glob is rejected
 no matter how green the tests are -- UNLESS the path is in the theme's own
@@ -182,17 +184,9 @@ with entry {
             }
         }
         sys.exit(1 if found2 else 0);
-    } elif len(args) == 3 and args[1] == "protected" {
-        globs2: list[str] = load_globs(args[2]);
-        for path in [l.strip() for l in read_stdin().splitlines() if l.strip()] {
-            if is_protected(path, globs2) {
-                print(path);
-            }
-        }
     } elif len(args) > 1 and args[1] != "test" {
         eprint("usage: git diff --name-status main...HEAD | jac run check_scope.jac check <theme.json> <config.toml> <task>");
         eprint("       jac run check_scope.jac weakened <path> <old_file> <new_file>");
-        eprint("       git diff --name-only | jac run check_scope.jac protected <config.toml>");
         # NONZERO, and deliberately not 1 (which means "violations found"). This arm used to exit
         # 0, so any future arity drift -- exactly the kind Task 6 is about to introduce when
         # `check` grows a <task> argv -- would make lib/verify.sh's `if ! ... check_scope`

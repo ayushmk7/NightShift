@@ -376,7 +376,8 @@ tier2_audit_all() {
     fi
     # Guarded: the redirect has already TRUNCATED findings.json by the time merge can fail, and an
     # unguarded failure here would leave 0 bytes, fail tier2_select, and abort the whole night under
-    # errexit -- taking S4/S5 and tier-1's already-queued branches with it. Skip the tier instead.
+    # errexit -- taking S4/S5 and the reactive pass's already-queued branches with it. Skip the
+    # tier instead.
     # shellcheck disable=SC2086  # deliberate word-split into one arg per shard findings file
     if ! ns_jac parse_result merge $found > "$LOG_DIR/findings.json"; then
         ns_fail "audit" "merge of $n_found shard findings failed — agentic tier skipped tonight"
@@ -538,7 +539,10 @@ tier2_apply() {
         # Up to 2 attempts, each on a FRESH branch: a transient API error mid-session (same class
         # tier2_audit already retries) shouldn't burn the whole theme for the night.
         # checkout -f everywhere: a session killed mid-edit leaves uncommitted changes that would
-        # otherwise ride along to main and get committed fail-open by the next night's autofix.
+        # otherwise ride along into the next theme's branch and be committed as if that theme had
+        # made them. (The original rationale named tier-1's autofix as what would sweep them up;
+        # tier-1 was retired 2026-07-30 and the discard is now the only thing standing between a
+        # killed session and a mislabelled diff, which makes the -f more load-bearing, not less.)
         got_report=0
         limit_hit=0
         for attempt in 1 2; do

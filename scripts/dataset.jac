@@ -617,8 +617,9 @@ the unified diff, and the finding + verify outcome that justified shipping it.
 Plus WHAT IT COST. These rows used to carry no effort data at all -- no session, no model, no turns,
 no cost -- so the dataset could say a refactor shipped but not whether it took a $0.28 five-turn
 Sonnet session or a $2.13 fifty-eight-turn Opus one. `log_dir` is what supplies it (the apply
-envelope and its theme sit there under the branch's own slug); an autofix branch with no apply
-session leaves those fields null, which is the truth about it.
+envelope and its theme sit there under the branch's own slug); a branch with no apply session --
+every v1 tier-1 row, and any branch a backfill recovers without its logs -- leaves those fields
+null, which is the truth about it.
 
 `url` arrives EMPTY for a dry run and is stored as null. That is the single field a dry run makes
 untrue -- the branch was real, the commits were real, the gate was real, but nothing was pushed, so
