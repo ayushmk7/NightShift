@@ -10,6 +10,21 @@ is actually dead, and trace one level of call chain for anything you claim is un
 finding without that evidence behind it is a guess, not a finding. Depth over breadth: it is far
 better to report fewer findings you have rigorously confirmed than many you have merely suspected.
 
+Then check the OTHER direction, which is the one this audit has actually got wrong in production.
+"Is X dead today" and "is Y still alive AFTER X is deleted" are different questions, and the second
+one is not answered by the first. For every symbol your finding deletes, list what that symbol
+CALLS, and grep for each callee's remaining callers **excluding the code you are deleting**. A
+callee whose only surviving reference was inside your own deletion is now orphaned — it is either
+part of this finding or the finding is wrong. A real example: a finding deleted a bundle-target
+helper and left `build_runtime_to` with zero callers, while its own summary asserted the
+surrounding functions were "consumed elsewhere". That claim was about the deleted symbol, not about
+what it dragged down with it, and nothing downstream can catch the difference — the type checker
+and the test suite are both perfectly happy with unreachable-but-valid code.
+
+State that check explicitly in `summary`: name the callees you traced and where their surviving
+callers are. If a finding orphans nothing, say so in as many words. "No callers" with no mention of
+the cascade will be read as work you did not do.
+
 Ground yourself in Jac before judging Jac:
 - Consult the Jac agent skills and the `jac` MCP resources (grammar, pitfalls) whenever unsure
   about idiomatic Jac.
