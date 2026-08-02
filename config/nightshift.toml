@@ -84,11 +84,48 @@ fragment = ""            # tests-only changes need no release-note fragment
 protect_unless = ["**/tests/**", "**/*.test.jac"]
 
 [budgets]                                    # PRD 9 guardrails — no step may violate these
-themes_per_night   = 6                       # was 3 -- real data: 85% of real findings were being
-                                              # dropped for pure over-night-budget reasons while
-                                              # verify_estimate_min sat at 3 (180min budget, huge
-                                              # unused headroom). Revisit if a night's real
-                                              # runtime/cost grows uncomfortable.
+themes_per_night   = 15                      # A CEILING ON OUTPUT VOLUME, not an estimate of what
+                                              # fits the clock. Read that sentence before changing it:
+                                              # scripts/selector.jac has TWO limits and they answer
+                                              # different questions. fit_clock() reserves
+                                              # apply_timeout_min + verify_estimate_min per theme
+                                              # against the clock actually left, and sheds what does
+                                              # not fit (reason `no-clock-left`). THIS number is the
+                                              # separate, unconditional truncation applied first
+                                              # (reason `over-night-budget`), and its job is to bound
+                                              # how many draft PRs land upstream in one night and how
+                                              # much apply spend goes with them -- neither of which
+                                              # the wallclock knows anything about.
+                                              #
+                                              # WAS 6, AND 6 WAS THE SINGLE LARGEST WASTE OF THE
+                                              # 2026-07-31 RUN. The cycle audits cost $38.36 and
+                                              # produced 95 findings; deferred.jsonl holds 103 rows
+                                              # and ALL 103 say `over-night-budget` -- not one says
+                                              # `no-clock-left`. The clock was never consulted: the
+                                              # night had used 56 of its 480 minutes when the selector
+                                              # ran (start 20:43:39, audit merge 21:39:21), and at the
+                                              # per-theme reservation then in force (25 + 1) fit_clock
+                                              # would have admitted 16 themes. Even at the 30-minute
+                                              # default verify estimate it admits 7. This constant,
+                                              # alone, threw away 99 of 105 packed themes.
+                                              #
+                                              # WHY 15 AND NOT "AS MANY AS THE CLOCK HOLDS": 15 is
+                                              # under the 16 that night's clock allowed, so the
+                                              # invariant that makes over-commitment impossible still
+                                              # holds -- fit_clock reserves the WORST CASE
+                                              # (apply_timeout_min is a TIMEOUT, not a mean; measured
+                                              # apply+verify was ~6.6 min/theme, 4x under it), so no
+                                              # theme is ever scheduled that the night could not
+                                              # finish even if every session ran to its box. That
+                                              # matters because a theme selected and then skipped for
+                                              # lack of clock is LOST: carryover.json is built from
+                                              # the selector's `dropped` list, so a theme that was
+                                              # selected and never applied is in neither.
+                                              # 15 themes cost ~$12.6 of apply spend at the measured
+                                              # $0.84/session and ~8 draft PRs at the measured 6/11
+                                              # conversion. RE-MEASURE AFTER ONE NIGHT before going
+                                              # further: above ~18 the binding constraint is a human's
+                                              # PR review queue, not this harness.
 files_per_theme    = 10
 loc_per_theme      = 600                     # was 300 -- was silently dropping confirmed, single-
                                               # file, high-confidence dead-code finds outright (a

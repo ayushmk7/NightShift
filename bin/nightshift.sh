@@ -53,6 +53,32 @@ ns_run() {
     # Unconditional: the watchdog sleeps from *process* start, so the budget clock must too.
     # A same-day re-run inheriting the 02:00 epoch once yielded "-414m remaining" and a skipped S3.
     date +%s > "$LOG_DIR/start_epoch"
+    # ...and, SEPARATELY, the origin of the NIGHT. These are two different questions and they were
+    # being answered out of one file:
+    #   start_epoch       -- "how much of THIS PROCESS's budget is left" (ns_remaining_min, the
+    #                        watchdog). Must be rewritten every run, per the line above.
+    #   first_start_epoch -- "how long has the night this digest describes been running". Written
+    #                        ONCE per (date-keyed) log dir and never rewritten.
+    # On 2026-07-31 the 23:00 launchd fire re-entered the log dir of a night that had run
+    # 20:43->22:20, rewrote start_epoch to 23:00:05, skipped every .done stage, re-entered S6 from
+    # the EXIT trap and mailed a real digest reading `clock: 0 of 480 min consumed (480 left)` for a
+    # 97-minute night. scripts/sendmail.jac now reads THIS file, so the clock describes the night the
+    # rest of the digest is about. The watchdog rationale above is untouched.
+    if [ ! -f "$LOG_DIR/first_start_epoch" ]; then
+        cp "$LOG_DIR/start_epoch" "$LOG_DIR/first_start_epoch"
+    else
+        # The re-fire itself is the fact that was invisible. ns_stage's "already done — skipping"
+        # lines are in run.log; nothing reached the one channel that is read.
+        ns_warn "RE-FIRE: $LOG_DIR already holds a night that started earlier. Every completed stage is skipped, so this digest reports on THAT night, not on this process."
+    fi
+    # A dry run leaves its evidence IN THE LOG DIR, not in this process's environment. That is the
+    # whole point: on 2026-07-31 the dry run's artifacts (six github.com/DRY-RUN/pull/0 stubs, six
+    # branch URLs for refs that were never pushed) were mailed for real by a LATER process which had
+    # no NS_DRY_RUN set, with no banner anywhere in the message. A marker file survives the process
+    # boundary that an env var cannot.
+    if [ -n "${NS_DRY_RUN:-}" ]; then
+        touch "$LOG_DIR/DRY_RUN"
+    fi
     # Same-night re-runs share $LOG_DIR (it is date-keyed), so markers left by an earlier attempt
     # would be re-reported against this one. ERROR_STAGE was missing from this line, so a GREEN
     # re-run after a red one still mailed "ERROR S4" -- the one case where the digest actively

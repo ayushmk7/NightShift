@@ -2348,4 +2348,171 @@ esac
 rm -rf .jac
 echo "the night ceiling is summed from real envelopes, fails closed, and stops the fan-out for real"
 
+echo "== 28. the digest tells the truth about the night it describes =="
+# 2026-07-31 delivered a real email to a real inbox saying, for a 97-minute night that pushed
+# nothing: `clock: 0 of 480 min consumed (480 left)`, six live-looking links to
+# github.com/DRY-RUN/pull/0 with no dry-run banner anywhere, and `abstraction: 0` / `coverage: 0`
+# for two lenses that had died at the turn cap -- while `maintenance`, the ONE lens honestly flagged
+# FAILED, was dropped from the `audited:` line altogether.
+#
+# EVERY ASSERTION BELOW IS ON THE RENDERED MESSAGE, decoded out of the MIME body. That is the whole
+# point: every unit-level piece worked on 2026-07-31, and the lie only existed in the delivered text.
+# The fixture is logs/2026-07-31 COPIED (never modified: it is the evidence), with only the two
+# epoch files rewritten to make the clock deterministic.
+rm -rf .jac
+S28="$(mktemp -d)"
+mkdir -p "$S28/logs" "$S28/drafts"
+cp -R logs/2026-07-31/. "$S28/logs"
+S28_NOW="$(date +%s)"
+echo "$(( S28_NOW - 97 * 60 ))" > "$S28/logs/first_start_epoch"   # the night began 97 minutes ago
+echo "$S28_NOW"                  > "$S28/logs/start_epoch"        # ...the re-fire started just now
+
+# The two MIME parts are base64: the digest carries · and —, so MIMEText falls back to utf-8+base64
+# (which is also why nobody eyeballing S6.log spotted the zeros). Decode both back to the text a
+# human actually reads, and assert on THAT.
+digest_render() {      # digest_render <log_dir> <drafts_dir> -> decoded text on stdout
+    local d=$1 dr=$2 t; t="$(mktemp -d)"
+    jac run scripts/sendmail.jac summarize "$d" "$dr" 2026-07-31 config/nightshift.toml > "$t/sum.json" \
+        || fail "sendmail summarize failed over $d"
+    jac run scripts/sendmail.jac render config/nightshift.toml < "$t/sum.json" > "$t/msg.txt" \
+        || fail "sendmail render failed over $d"
+    awk -v out="$t/part" 'BEGIN{n=0;inb=0}
+        /^Content-Transfer-Encoding: base64/ {want=1; next}
+        want && $0=="" {want=0; inb=1; n++; next}
+        /^--=/ {inb=0; next}
+        inb {print > (out n ".b64")}' "$t/msg.txt"
+    [ -f "$t/part1.b64" ] || fail "the rendered message carried no base64 body part (over $d)"
+    grep '^Subject:' "$t/msg.txt"
+    for p in "$t"/part*.b64; do base64 -D < "$p"; echo; done
+}
+digest_render "$S28/logs" "$S28/drafts" > "$S28/text.txt"
+
+# --- A. the clock describes the NIGHT, not the process that re-fired into it -------------------
+grep -q 'clock: 97 of 480 min' "$S28/text.txt" \
+    || fail "the digest's clock does not describe the 97-minute night: $(grep -n 'clock:' "$S28/text.txt" || echo '(no clock line at all)')"
+grep -q '97 of 480 min consumed (383 left)' "$S28/text.txt" \
+    || fail "the html clock line is not the night's: $(grep -n 'consumed' "$S28/text.txt" || true)"
+grep -q '0 of 480 min consumed (480 left)' "$S28/text.txt" \
+    && fail "the delivered digest still reports a 97-minute night as having consumed none of its window"
+
+# --- B. a dry run says so, in the subject and above the stub links it is warning about ---------
+# `DRY.RUN`, not `DRY RUN`: the subject is RFC-2047 q-encoded (=?utf-8?q?=5BDRY_RUN=5D_...) because
+# the digest's own subject grammar uses ·, so the space arrives as an underscore.
+grep -q '^Subject:.*DRY.RUN' "$S28/text.txt" \
+    || fail "the subject line of a dry run's digest does not say DRY RUN: $(grep '^Subject:' "$S28/text.txt")"
+grep -q 'DRY RUN — nothing was pushed' "$S28/text.txt" \
+    || fail "the digest body carries no dry-run banner, for a night whose PR links are all stubs"
+# ...and it is ABOVE the six #0 rows, not a footnote below 370 lines of body
+[ "$(grep -n 'nothing was pushed' "$S28/text.txt" | head -1 | cut -d: -f1)" \
+  -lt "$(grep -n 'DRY-RUN/pull/0' "$S28/text.txt" | head -1 | cut -d: -f1)" ] \
+    || fail "the dry-run banner sits BELOW the stub PR links it exists to warn about"
+# the stub links really are in this message -- otherwise the assertion above is vacuous
+[ "$(grep -c 'DRY-RUN/pull/0' "$S28/text.txt")" -ge 6 ] \
+    || fail "the fixture no longer carries the six stub PR links; B proves nothing"
+
+# --- C. a lens that DIED never renders as a count, and the honest one is never dropped ---------
+# All three dead lenses, by name, in the line that claims what was audited.
+for lens in reactive-abstraction reactive-coverage reactive-maintenance; do
+    grep -q "$lens: FAILED" "$S28/text.txt" \
+        || fail "$lens is not reported as FAILED in the rendered digest: $(grep -n 'audited' "$S28/text.txt" | head -2)"
+done
+# `reactive-maintenance` wrote NO findings file, which is why the old glob dropped it entirely.
+grep -q 'reactive-maintenance' "$S28/text.txt" \
+    || fail "the one honestly-FAILED lens is still missing from the digest"
+# ...and the two salvaged placeholders must not read as clean zeros anywhere in the message.
+grep -q 'abstraction: 0' "$S28/text.txt" \
+    && fail "a lens that died at the turn cap still renders as '0' in the delivered digest"
+grep -q 'coverage: 0' "$S28/text.txt" \
+    && fail "a lens that died at the turn cap still renders as '0' in the delivered digest"
+# POSITIVE CONTROL, without which C is satisfied by a renderer that calls every scope FAILED and
+# prints no counts at all: the lens that really ran, and the eight cycle shards, keep their numbers.
+grep -q 'reactive-dead-code: 5 finding(s)' "$S28/text.txt" \
+    || fail "the lens that genuinely ran lost its finding count"
+grep -q 'compiler-core: 21 finding(s)' "$S28/text.txt" \
+    || fail "the cycle shards lost their finding counts"
+
+# --- D. ...and a REAL night carries none of B. -------------------------------------------------
+# Same renderer, a log dir with a real PR row and no DRY_RUN marker. Without this arm the banner
+# could be unconditional and every assertion above would still pass.
+mkdir -p "$S28/real"
+printf '{"number": 7301, "title": "t", "task": "dead-code", "url": "https://github.com/jaseci-labs/jac/pull/7301", "mirror": "green", "ci": "pending", "attempts": 0}\n' \
+    > "$S28/real/prs.jsonl"
+echo "$(( S28_NOW - 42 * 60 ))" > "$S28/real/first_start_epoch"
+digest_render "$S28/real" "$S28/drafts" > "$S28/real.txt"
+grep -q 'DRY.RUN' "$S28/real.txt" \
+    && fail "a real night's digest is branded a dry run; the banner means nothing"
+grep -q 'clock: 42 of 480 min' "$S28/real.txt" \
+    || fail "the clock is not read for a night with no re-fire: $(grep -n 'clock:' "$S28/real.txt" || true)"
+rm -rf .jac
+echo "the digest's clock, its dry-run banner and its audited: line all come from the night's own artifacts"
+
+echo "== 29. the selector packs against the clock it has, not a constant =="
+# 2026-07-31: eight cycle shard audits cost $38.36 and produced 95 findings. deferred.jsonl holds
+# 103 rows and ALL 103 say `over-night-budget`; not one says `no-clock-left`. The night had used 56
+# of its 480 minutes at that moment. themes_per_night truncated 105 packed themes to 6 with no
+# reference to the clock at all.
+#
+# Driven over the REAL merged findings set (logs/2026-07-31/findings-all.json, 112 findings = 95
+# fresh + 17 carried) at the REAL remaining_min, with the REAL verify_estimate_min from
+# state/state.json.
+rm -rf .jac
+S29="$(mktemp -d)"
+printf '{"verify_estimate_min": 1}\n' > "$S29/state.json"
+# Theme count comes from `selector split`, which prints one slug per theme -- the same reader
+# tier2_apply drives the night from. Counting the selection's own array would let a selection that
+# packs themes nothing can split still read as green.
+sel() {                # sel <remaining_min> [config] -> "themes=<n> clockshed=<n>"
+    local rem=$1 cfg=${2:-config/nightshift.toml} od="$S29/split-$1"
+    rm -rf "$od"; mkdir -p "$od"
+    jac run scripts/selector.jac select "$cfg" /nonexistent "$S29/state.json" "$rem" /nonexistent-repo \
+        < logs/2026-07-31/findings-all.json > "$S29/sel-$rem.json" \
+        || fail "selector failed over the real 2026-07-31 findings at remaining=$rem"
+    printf 'themes=%s clockshed=%s' \
+        "$(jac run scripts/selector.jac split "$S29/sel-$rem.json" "$od" | wc -l | tr -d ' ')" \
+        "$(jac run scripts/selector.jac dropped "$S29/sel-$rem.json" | grep -c 'no-clock-left' || true)"
+}
+# 424 = 480 - 56, the clock the cycle selector really had (start 20:43:39, merge 21:39:21).
+case "$(sel 424)" in
+    "themes=15 clockshed=0") : ;;
+    *) fail "the real night's findings no longer pack 15 themes into the 424 minutes it had: $(sel 424)" ;;
+esac
+# THE INVARIANT that keeps this safe, asserted rather than assumed: fit_clock reserves the WORST
+# CASE per theme (apply_timeout_min 25 + verify_estimate_min 1 = 26), so a selected theme can always
+# be finished even if every session runs to its box. A theme that is selected and then skipped for
+# lack of clock is LOST -- carryover.json is built from the selector's `dropped` list, so it lands in
+# neither. 15 * 26 = 390 <= 424.
+for rem in 480 424 120 60 30 20; do
+    n="$(sel "$rem")"; n="${n#themes=}"; n="${n%% *}"
+    [ "$(( n * 26 ))" -le "$rem" ] \
+        || fail "the selector packed $n themes into $rem minutes; at the 26-minute worst-case reservation that over-commits the night and silently loses the overflow"
+done
+# ...and the clock really does bind on a short night, or the assertion above is satisfied by a
+# selector that never packs anything. These are the arms that would catch a fit_clock deleted
+# alongside the raised ceiling.
+case "$(sel 120)" in
+    # clockshed=0 would mean the 101 findings it dropped were all blamed on the CONSTANT again,
+    # with the clock -- which really is the binding limit at 120 minutes -- never named.
+    "themes=4 clockshed=0") fail "a 120-minute night shed nothing for the clock; every deferral is still blamed on the constant" ;;
+    "themes=4 clockshed="*) : ;;
+    *) fail "a 120-minute night did not shed down to what fits: $(sel 120)" ;;
+esac
+case "$(sel 20)" in
+    "themes=0 "*) : ;;
+    *) fail "a 20-minute night still scheduled a 26-minute theme: $(sel 20)" ;;
+esac
+# THE REGRESSION ITSELF: the shipped config must not be back at a number the clock never reaches.
+grep -q '^themes_per_night *= *6\b' config/nightshift.toml \
+    && fail "themes_per_night is back at 6 -- the constant that deferred 103 findings with 424 of 480 minutes unspent"
+# ...proven against the old value rather than asserted: the same real inputs, the same real clock,
+# with only that one number changed, reproduce the night byte for byte.
+sed 's/^themes_per_night   = 15/themes_per_night   = 6/' config/nightshift.toml > "$S29/old.toml"
+grep -q '^themes_per_night   = 6' "$S29/old.toml" \
+    || fail "the 2026-07-31 replay config was not built; the comparison below proves nothing"
+case "$(sel 424 "$S29/old.toml")" in
+    "themes=6 clockshed=0") : ;;
+    *) fail "the old config no longer reproduces the 2026-07-31 selection (6 themes, nothing shed for the clock): $(sel 424 "$S29/old.toml")" ;;
+esac
+rm -rf .jac
+echo "the night's theme count is bounded by the clock it has, and never over-commits it"
+
 echo "ALL HARNESS TESTS PASSED"

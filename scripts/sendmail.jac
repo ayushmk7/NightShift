@@ -23,10 +23,18 @@ import from contextlib { redirect_stderr }
 import from pathlib { Path }
 import from email.mime.text { MIMEText }
 import from email.mime.multipart { MIMEMultipart }
-import from nslib { eprint, read_stdin, parse_obj, as_dict, as_list, as_int, load_config_toml, today }
+import from nslib { eprint, read_stdin, parse_obj, parse_list, as_dict, as_list, as_int, load_config_toml, today }
 import from render_draft { split_draft }
 
-"""Subject grammar (TPRD S6): Nightshift <date> · <n> ready · −<loc> LOC · <m> failed[ · DISABLED| ERROR S<k>]."""
+"""What a dry run's digest says, in the two places a reader cannot skip. On 2026-07-31 a dry run's
+artifacts were mailed as a real result -- six `#0` PR rows linking to github.com/DRY-RUN/pull/0 and
+six branch URLs for refs that were never pushed -- and the word "dry" appeared in the message ONLY
+inside those URLs. A reader gets twelve dead links presented as live work."""
+glob DRY_BANNER: str = "DRY RUN — nothing was pushed and no pull request was opened. Every PR number and every branch link below is a stub.";
+
+"""Subject grammar (TPRD S6): Nightshift <date> · <n> ready · −<loc> LOC · <m> failed[ · DISABLED| ERROR S<k>].
+A dry run is marked FIRST, before the date: the subject line is the only part of the digest a phone
+shows without opening it."""
 def subject(summary: dict) -> str {
     branches: list = as_list(summary.get("branches", []));
     added: int = sum([as_int(as_dict(b).get("added", 0)) for b in branches]);
@@ -43,6 +51,9 @@ def subject(summary: dict) -> str {
             # truncated to keep the subject scannable; plain_body and the HTML carry it in full
             s += ": " + str(reason)[:80];
         }
+    }
+    if summary.get("dry_run", False) {
+        s = "[DRY RUN] " + s;
     }
     return s;
 }
@@ -92,7 +103,11 @@ def empty_note(summary: dict, key: str, artifact: str) -> str {
 """Body order per TPRD S6: verdict → branch cards → full inline drafts → suspected bugs →
 skipped/failed → runtime/cost → warnings."""
 def plain_body(summary: dict) -> str {
-    lines: list[str] = [str(summary.get("verdict", "(no verdict)")), ""];
+    lines: list[str] = [];
+    if summary.get("dry_run", False) {
+        lines += ["*** " + DRY_BANNER + " ***", ""];
+    }
+    lines += [str(summary.get("verdict", "(no verdict)")), ""];
     # WHY the night died leads the body: on a fatal night it is the only line that matters, and
     # the operator reads this on a phone. ERROR_STAGE says WHERE, ns_die's text says WHY.
     fatal: any = summary.get("fatal_reason");
@@ -124,6 +139,22 @@ def plain_body(summary: dict) -> str {
         for item in failed {
             d2: dict = as_dict(item);
             lines.append("- " + str(d2.get("what", "?")) + ": " + str(d2.get("reason", "")));
+        }
+        lines.append("");
+    }
+    # The per-phase rollup used to exist ONLY in the html part, which is how its inverted `audited:`
+    # line survived a real delivery unnoticed. A text-only reader gets the same facts.
+    for section in as_list(summary.get("tasks", [])) {
+        s4: dict = as_dict(section);
+        lines.append("PHASE " + str(s4.get("phase", "?")) + " — " + str(s4.get("selected", 0))
+                     + " selected, " + str(s4.get("deferred", 0)) + " deferred");
+        lines.append("  audited:");
+        scopes4: list = as_list(s4.get("scopes", []));
+        if not scopes4 {
+            lines.append("    (no audit scope recorded for this phase)");
+        }
+        for sc in scopes4 {
+            lines.append("    " + scope_line(as_dict(sc)));
         }
         lines.append("");
     }
@@ -200,6 +231,13 @@ def html_body(summary: dict) -> str {
         + esc(summary.get("turns", "?")) + " · $" + esc(summary.get("cost_usd", 0)) + "</p>",
     ];
 
+    # 0. DRY RUN, above everything including the fatal box: every PR number and branch link further
+    # down is a stub, so this has to be read before any of them.
+    if summary.get("dry_run", False) {
+        out.insert(1, "<p style=\"background:#ffd;border:2px solid #a60;padding:8px;"
+                      + "font-weight:bold\">" + esc(DRY_BANNER) + "</p>");
+    }
+
     # 1. WHY the night died, first, in red. 13 ns_die sites share one stage name.
     fatal: any = summary.get("fatal_reason");
     if fatal is not None and str(fatal) != "" {
@@ -213,7 +251,20 @@ def html_body(summary: dict) -> str {
         s: dict = as_dict(section);
         out.append("<h3>" + esc(s.get("phase", "?")) + " — " + esc(s.get("selected", 0))
                    + " selected, " + esc(s.get("deferred", 0)) + " deferred</h3>");
-        out.append("<p>audited: " + esc(", ".join([str(x) for x in as_list(s.get("scopes", []))]))
+        # A FAILED scope is rendered in red and never as a number. `0` and `5` are typographically
+        # indistinguishable in this font, which is exactly how "abstraction: 0" read as a clean bill
+        # of health for a lens that had died at the turn cap.
+        audited: list[str] = [];
+        for sc in as_list(s.get("scopes", [])) {
+            oc: dict = as_dict(sc);
+            entry: str = esc(scope_line(oc));
+            if oc.get("failed", False) {
+                entry = "<b style=\"color:#c00\">" + entry + "</b>";
+            }
+            audited.append(entry);
+        }
+        out.append("<p>audited: "
+                   + ("; ".join(audited) if audited else "(no audit scope recorded for this phase)")
                    + "</p><ul>");
         for theme in as_list(s.get("themes", [])) {
             t: dict = as_dict(theme);
@@ -527,6 +578,102 @@ def read_tsv(path: str) -> list[list[str]] {
     return [line.split("\t") for line in read_lines(path)];
 }
 
+"""What each audit scope actually DID tonight, keyed by scope name (`cli`, `reactive-coverage`).
+
+THE 2026-07-31 DEFECT, and the reason this is a derivation rather than a glob. The digest's
+`audited:` line was `glob(findings-*.json)`, so the two reactive lenses that died at the turn cap --
+whose refusal-shaped placeholder `[]` had been written to disk as a findings file -- were listed as
+scopes that ran, while `reactive-maintenance`, the one lens correctly flagged FAILED, wrote no
+findings file and was dropped from the list entirely. The line was inverted with respect to the
+truth, and `abstraction: 0` sat beside `dead-code: 5` in a font that makes them indistinguishable.
+
+THREE INDEPENDENT SOURCES, deliberately, because on that night no single one of them covers all
+three dead lenses:
+  * `findings-<scope>.json` -- the count, and the only evidence a scope produced anything at all.
+  * `failed.tsv` row `audit[<scope>]` -- what lib/tier2.sh records TODAY for a session that never
+    finished. On 2026-07-31 that existed for exactly one of the three dead lenses, because the other
+    two had been salvaged into a placeholder `[]` instead of failed.
+  * `meta-audit-<scope>.json` `is_error` -- the SESSION'S OWN error flag, projected by
+    `parse_result meta` at the session and therefore independent of everything downstream. It is
+    `true` for all three lenses that died, including the two that were salvaged.
+Any source saying "failed" WINS over a findings count: a count that came out of an errored session
+is not a clean zero, and not conflating those two is this whole file's job."""
+def scope_outcomes(log_dir: str) -> dict[str, dict] {
+    out: dict[str, dict] = {};
+    for p in glob_paths(log_dir, "findings-*.json") {
+        nm: str = os.path.basename(p)[len("findings-"):-len(".json")];
+        # findings-all.json / findings-reactive.json are MERGED outputs, not scopes: listing them
+        # would report the merge as a shard that ran.
+        if nm == "all" or nm == "reactive" {
+            continue;
+        }
+        n: int = -1;
+        with open(p, "r") as f {
+            text: str = f.read();
+        }
+        if text.strip() {
+            try {
+                n = len(parse_list(text));
+            } except Exception {
+                n = -1;
+            }
+        }
+        out[nm] = {"name": nm, "findings": n, "failed": False, "reason": ""};
+    }
+    for line in read_lines(os.path.join(log_dir, "failed.tsv")) {
+        parts: list[str] = line.split("\t");
+        what: str = parts[0];
+        if what.startswith("audit[") and what.endswith("]") {
+            nm2: str = what[len("audit["):-1];
+            row: dict = as_dict(out.get(nm2, {"name": nm2, "findings": -1}));
+            row["name"] = nm2;
+            row["failed"] = True;
+            row["reason"] = parts[1] if len(parts) > 1 else "recorded in failed.tsv";
+            out[nm2] = row;
+        }
+    }
+    for p2 in glob_paths(log_dir, "meta-audit-*.json") {
+        nm3: str = os.path.basename(p2)[len("meta-audit-"):-len(".json")];
+        with open(p2, "r") as f2 {
+            text2: str = f2.read();
+        }
+        if not text2.strip() {
+            continue;
+        }
+        meta: dict = {};
+        try {
+            meta = parse_obj(text2);
+        } except Exception {
+            continue;
+        }
+        if not meta.get("is_error", False) {
+            continue;
+        }
+        row2: dict = as_dict(out.get(nm3, {"name": nm3, "findings": -1}));
+        row2["name"] = nm3;
+        row2["failed"] = True;
+        if not str(row2.get("reason", "")) {
+            row2["reason"] = "the audit session itself ended in error (is_error) — whatever it wrote is not a clean zero";
+        }
+        out[nm3] = row2;
+    }
+    return out;
+}
+
+"""One `audited:` entry, in the words the reader needs. A scope that FAILED never renders as a
+number; a scope that genuinely ran and found nothing renders as an explicit 0, and says so."""
+def scope_line(oc: dict) -> str {
+    nm: str = str(oc.get("name", "?"));
+    if oc.get("failed", False) {
+        return nm + ": FAILED — " + str(oc.get("reason", "no reason recorded"));
+    }
+    n: int = as_int(oc.get("findings", -1));
+    if n < 0 {
+        return nm + ": ran, but its findings file could not be read";
+    }
+    return nm + ": " + str(n) + " finding(s)";
+}
+
 """Per-phase rollup, derived entirely from files S3 already writes -- no new writer anywhere in the
 pipeline. findings-*.json are the audit outputs (one per shard, one per reactive lens);
 selection*.json record what was packed.
@@ -536,6 +683,7 @@ those filenames: `selection.json` is the cycle phase (that literal name is what 
 scripts/dataset.jac read) and `selection-<phase>.json` is everything else. ponytail: a derivation,
 not a schema."""
 def task_sections(log_dir: str) -> list[dict] {
+    outcomes: dict[str, dict] = scope_outcomes(log_dir);
     sections: list[dict] = [];
     for path in glob_paths(log_dir, "selection*.json") {
         base: str = os.path.basename(path);
@@ -554,16 +702,13 @@ def task_sections(log_dir: str) -> list[dict] {
                 eprint("sendmail: unparseable " + path);
             }
         }
-        # The audit scopes that fed THIS phase. findings-all.json and findings-reactive.json are
-        # merged outputs, not scopes, and listing them would report the merge as a shard.
-        scopes: list[str] = [];
-        for p in glob_paths(log_dir, "findings-*.json") {
-            nm: str = os.path.basename(p)[len("findings-"):-len(".json")];
-            if nm == "all" or nm == "reactive" {
-                continue;
-            }
+        # The audit scopes that fed THIS phase, with what each of them DID -- read off outcomes,
+        # never off the presence of a file. The reactive lenses are named `reactive-<task>`, which
+        # is the one thing that separates the two phases' scopes by name.
+        scopes: list[dict] = [];
+        for nm in sorted(outcomes.keys()) {
             if nm.startswith("reactive-") == (phase == "reactive") {
-                scopes.append(nm);
+                scopes.append(as_dict(outcomes[nm]));
             }
         }
         themes: list = as_list(sel.get("themes", []));
@@ -617,8 +762,20 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
         turns += as_int(m.get("num_turns", 0) or 0);
         cost += float(str(m.get("total_cost_usd", 0) or 0));
     }
+    # THE NIGHT'S origin, not this process's. bin/nightshift.sh rewrites start_epoch on every run --
+    # deliberately, because the watchdog sleeps from process start and the budget clock must share
+    # that origin -- and writes first_start_epoch exactly once per (date-keyed) log dir. Reading
+    # start_epoch here is what made the 2026-07-31 digest describe a 97-minute night as
+    # `clock: 0 of 480 min consumed (480 left)`: the 23:00 launchd re-fire had reset it five seconds
+    # before S6 ran, from the EXIT trap, having skipped every already-.done stage. The digest reports
+    # on a NIGHT, so its clock has to be measured from when that night began.
+    # Fall back to start_epoch: every log dir written before this change has only that file, and a
+    # digest that cannot find its origin must still render.
     runtime: int = 0;
-    start_lines: list[str] = read_lines(os.path.join(log_dir, "start_epoch"));
+    start_lines: list[str] = read_lines(os.path.join(log_dir, "first_start_epoch"));
+    if not start_lines {
+        start_lines = read_lines(os.path.join(log_dir, "start_epoch"));
+    }
     if start_lines {
         runtime = int((time.time() - float(start_lines[0])) / 60.0);
     }
@@ -634,6 +791,19 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
             lenses[row[0]] = row[1];
         }
     }
+    # SECOND, INDEPENDENT GUARD on the same fact, over a different input. The tsv is written by
+    # lib/reactive.sh from whether a findings file EXISTS, so on 2026-07-31 the two lenses whose
+    # placeholder `[]` had been salvaged out of a dead session were tallied `0` there -- and `0`
+    # beside `dead-code: 5` reads as "this lens looked and the code is clean". scope_outcomes knows
+    # they errored (from the session's own is_error), so a lens it calls failed can never render as
+    # a count here, whatever the tsv says.
+    outcomes: dict[str, dict] = scope_outcomes(log_dir);
+    for nm in sorted(outcomes.keys()) {
+        oc: dict = as_dict(outcomes[nm]);
+        if nm.startswith("reactive-") and oc.get("failed", False) {
+            lenses[nm[len("reactive-"):]] = "FAILED — " + str(oc.get("reason", "audit failed"));
+        }
+    }
     window: int = as_int(as_dict(cfg.get("budgets", {})).get("wallclock_min", 0));
 
     # RECONCILIATION B3. Which artifacts were actually on disk, so the renderer can say "S5 never
@@ -641,6 +811,22 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
     artifacts: dict = {};
     for name in ["prs.jsonl", "pr-inventory.jsonl", "reactive-summary.tsv", "deferred.jsonl"] {
         artifacts[name] = os.path.exists(os.path.join(log_dir, name));
+    }
+
+    # WAS THIS A DRY RUN? Answered from the ARTIFACTS, never from this process's NS_DRY_RUN -- the
+    # process that renders the digest is not necessarily the process that produced what it is
+    # describing. On 2026-07-31 the dry run rendered at 22:20 and a LATER launchd fire at 23:00, with
+    # NS_DRY_RUN unset, re-entered S6 and mailed the same artifacts for real.
+    # TWO INDEPENDENT SOURCES, so deleting either one still catches that night:
+    #   * DRY_RUN, a marker file bin/nightshift.sh touches into the log dir under NS_DRY_RUN;
+    #   * the stub PR URLs themselves (ns_gh_write prints github.com/DRY-RUN/pull/0), which are the
+    #     thing the reader would otherwise click.
+    prs_rows: list[dict] = read_jsonl(os.path.join(log_dir, "prs.jsonl"));
+    dry: bool = os.path.exists(os.path.join(log_dir, "DRY_RUN"));
+    for pr_row in prs_rows {
+        if "DRY-RUN" in str(as_dict(pr_row).get("url", "")) {
+            dry = True;
+        }
     }
     return {
         "date": date_s,
@@ -668,7 +854,8 @@ def summarize(log_dir: str, drafts_dir: str, date_s: str, cfg: dict) -> dict {
             # one already-existing reader.
             "merged_prs": read_tsv(os.path.join(log_dir, "reactive-prs.tsv")),
         },
-        "prs": read_jsonl(os.path.join(log_dir, "prs.jsonl")),
+        "dry_run": dry,
+        "prs": prs_rows,
         "inventory": read_jsonl(os.path.join(log_dir, "pr-inventory.jsonl")),
         "deferred": read_jsonl(os.path.join(log_dir, "deferred.jsonl")),
         "artifacts": artifacts,
@@ -969,11 +1156,145 @@ test "task_sections separates the two phases and never reports a merge as a scop
         by_phase[str(s["phase"])] = s;
     }
     cyc: dict = as_dict(by_phase["cycle"]);
-    assert sorted([str(x) for x in as_list(cyc["scopes"])]) == ["cli", "scale"];
+    assert sorted([str(as_dict(x)["name"]) for x in as_list(cyc["scopes"])]) == ["cli", "scale"];
     assert cyc["selected"] == 1 and cyc["deferred"] == 2;
     rea: dict = as_dict(by_phase["reactive"]);
-    assert [str(x) for x in as_list(rea["scopes"])] == ["reactive-dead-code"];
+    assert [str(as_dict(x)["name"]) for x in as_list(rea["scopes"])] == ["reactive-dead-code"];
     assert rea["selected"] == 0;
+}
+
+test "a scope that DIED never renders as a count, from any of the three sources" {
+    # 2026-07-31: `audited: reactive-abstraction, reactive-coverage, reactive-dead-code` -- the two
+    # lenses that died at the turn cap listed as scopes that ran, and `reactive-maintenance`, the one
+    # honestly-FAILED lens, dropped from the line entirely. Each of the three sources below is on its
+    # own here, so deleting any one of them fails this test rather than silently narrowing the guard.
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    with open(os.path.join(d, "selection-reactive.json"), "w") as f {
+        f.write("{\"themes\": [], \"dropped\": []}");
+    }
+    # 1. the honest lens: ran, found things
+    with open(os.path.join(d, "findings-reactive-dead-code.json"), "w") as f {
+        f.write("[{\"file\": \"a.jac\"}, {\"file\": \"b.jac\"}]");
+    }
+    # 2. a lens that wrote a placeholder [] AND whose session reports is_error -- the exact 07-31
+    #    shape. Only the meta file knows.
+    with open(os.path.join(d, "findings-reactive-abstraction.json"), "w") as f {
+        f.write("[]");
+    }
+    with open(os.path.join(d, "meta-audit-reactive-abstraction.json"), "w") as f {
+        f.write("{\"num_turns\": 46, \"total_cost_usd\": 7.89, \"is_error\": true}");
+    }
+    # 3. a lens with NO findings file at all, recorded in failed.tsv -- the one 07-31 dropped
+    with open(os.path.join(d, "failed.tsv"), "w") as f {
+        f.write("audit[reactive-maintenance]\tsession never finished (max_turns)\n");
+        f.write("theme dead-code-x\tagent made no committed changes\n");
+    }
+    sec: dict = as_dict(task_sections(d)[0]);
+    rendered: list[str] = [scope_line(as_dict(x)) for x in as_list(sec["scopes"])];
+    assert "reactive-dead-code: 2 finding(s)" in rendered;
+    # the two that died: FAILED, never a number, and BOTH present in the line
+    assert any([r.startswith("reactive-abstraction: FAILED") for r in rendered]);
+    assert any([r.startswith("reactive-maintenance: FAILED") for r in rendered]);
+    for r in rendered {
+        assert r != "reactive-abstraction: 0 finding(s)";
+    }
+    # ...and a theme failure is not an audit failure: only `audit[...]` rows name a scope
+    assert not any(["dead-code-x" in r for r in rendered]);
+    # a genuine clean lens still reads as an explicit zero, or this guard is satisfied by calling
+    # everything failed
+    with open(os.path.join(d, "findings-reactive-cli.json"), "w") as f {
+        f.write("[]");
+    }
+    sec2: dict = as_dict(task_sections(d)[0]);
+    assert "reactive-cli: 0 finding(s)" in [scope_line(as_dict(x)) for x in as_list(sec2["scopes"])];
+}
+
+test "a FAILED lens can never be tallied as 0 in the reactive section either" {
+    # The tsv is written from whether a findings file EXISTS, so the salvaged placeholder [] tallied
+    # `abstraction 0` on 2026-07-31. summarize crosses it against the session's own is_error.
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    with open(os.path.join(d, "reactive-summary.tsv"), "w") as f {
+        f.write("dead-code\t5\nabstraction\t0\ncoverage\tskipped (no coverage evidence)\n");
+    }
+    with open(os.path.join(d, "meta-audit-reactive-abstraction.json"), "w") as f {
+        f.write("{\"is_error\": true, \"num_turns\": 46}");
+    }
+    cfg: dict = {"repo": {"fork": "me/jaseci"}, "budgets": {"wallclock_min": 480}};
+    s: dict = summarize(d, tempfile.mkdtemp(), "2026-07-31", cfg);
+    lens_map: dict = as_dict(as_dict(s["reactive"])["lenses"]);
+    assert str(lens_map["abstraction"]).startswith("FAILED");
+    # the honest ones are untouched -- a guard that rewrites everything proves nothing
+    assert str(lens_map["dead-code"]) == "5";
+    assert str(lens_map["coverage"]) == "skipped (no coverage evidence)";
+    assert "abstraction: 0" not in html_body(s);
+    assert "abstraction: 0" not in plain_body(s);
+}
+
+test "the digest's clock measures the NIGHT, not the process that renders it" {
+    # 2026-07-31: the 23:00 launchd fire re-entered a completed night's log dir, rewrote start_epoch
+    # to 23:00:05, skipped every .done stage and mailed `clock: 0 of 480 min consumed (480 left)`
+    # for a night that had run 97 minutes.
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    now: int = int(time.time());
+    with open(os.path.join(d, "first_start_epoch"), "w") as f {
+        f.write(str(now - 97 * 60) + "\n");
+    }
+    with open(os.path.join(d, "start_epoch"), "w") as f {
+        f.write(str(now) + "\n");            # the re-fire, five seconds old
+    }
+    cfg: dict = {"repo": {"fork": "me/jaseci"}, "budgets": {"wallclock_min": 480}};
+    s: dict = summarize(d, tempfile.mkdtemp(), "2026-07-31", cfg);
+    assert as_int(s["runtime_min"]) == 97;
+    assert as_int(as_dict(s["clock"])["consumed_min"]) == 97;
+    assert as_int(as_dict(s["clock"])["remaining_min"]) == 383;
+    assert "clock: 97 of 480 min" in plain_body(s);
+    # ...and a log dir from before first_start_epoch existed still renders, off start_epoch
+    old: str = tempfile.mkdtemp();
+    with open(os.path.join(old, "start_epoch"), "w") as f {
+        f.write(str(now - 42 * 60) + "\n");
+    }
+    assert as_int(summarize(old, tempfile.mkdtemp(), "2026-07-31", cfg)["runtime_min"]) == 42;
+}
+
+test "a dry run is unmistakable in the subject and in both bodies" {
+    import tempfile;
+    cfg: dict = {"repo": {"fork": "me/jaseci"}, "budgets": {"wallclock_min": 480}};
+    # 1. the marker file bin/nightshift.sh touches under NS_DRY_RUN
+    marked: str = tempfile.mkdtemp();
+    with open(os.path.join(marked, "DRY_RUN"), "w") as f {
+        f.write("");
+    }
+    s1: dict = summarize(marked, tempfile.mkdtemp(), "2026-07-31", cfg);
+    assert s1["dry_run"] == True;
+    # 2. INDEPENDENTLY, the stub PR urls -- which is what survives when a LATER process with no
+    #    NS_DRY_RUN set mails the dry run's artifacts, exactly as happened on 2026-07-31
+    stubbed: str = tempfile.mkdtemp();
+    with open(os.path.join(stubbed, "prs.jsonl"), "w") as f {
+        f.write("{\"number\": 0, \"title\": \"t\", \"task\": \"dead-code\","
+                + " \"url\": \"https://github.com/DRY-RUN/pull/0\", \"mirror\": \"green\","
+                + " \"ci\": \"pending\", \"attempts\": 0}\n");
+    }
+    s2: dict = summarize(stubbed, tempfile.mkdtemp(), "2026-07-31", cfg);
+    assert s2["dry_run"] == True;
+    assert subject(s2).startswith("[DRY RUN] ");
+    assert "DRY RUN" in plain_body(s2) and "nothing was pushed" in plain_body(s2);
+    assert "DRY RUN" in html_body(s2) and "nothing was pushed" in html_body(s2);
+    # the banner is ABOVE the PR table it is warning about
+    assert html_body(s2).index("nothing was pushed") < html_body(s2).index("DRY-RUN/pull/0");
+    # ...and a REAL night carries none of it, or the banner means nothing
+    real: str = tempfile.mkdtemp();
+    with open(os.path.join(real, "prs.jsonl"), "w") as f {
+        f.write("{\"number\": 7301, \"title\": \"t\", \"task\": \"dead-code\","
+                + " \"url\": \"https://github.com/jaseci-labs/jac/pull/7301\","
+                + " \"mirror\": \"green\", \"ci\": \"pending\", \"attempts\": 0}\n");
+    }
+    s3: dict = summarize(real, tempfile.mkdtemp(), "2026-07-31", cfg);
+    assert s3["dry_run"] == False;
+    assert "DRY RUN" not in subject(s3);
+    assert "DRY RUN" not in plain_body(s3) and "DRY RUN" not in html_body(s3);
 }
 
 test "the html digest carries every section and escapes agent-authored text" {
@@ -985,7 +1306,10 @@ test "the html digest carries every section and escapes agent-authored text" {
         "branches": [{"theme": "dead render path", "branch": "nightshift/2026-07-30/dead-code-x",
                       "files": 3, "added": 4, "removed": 212, "tests": "green", "risk": "low",
                       "url": "https://github.com/x", "draft_text": "# refactor: kill dead code"}],
-        "tasks": [{"phase": "reactive", "scopes": ["reactive-dead-code"], "selected": 1,
+        "tasks": [{"phase": "reactive",
+                   "scopes": [{"name": "reactive-dead-code", "findings": 3, "failed": False,
+                               "reason": ""}],
+                   "selected": 1,
                    "deferred": 2,
                    "themes": [{"name": "dead render path",
                                "summary": "<script>alert(1)</script> & a real finding"}]}],
