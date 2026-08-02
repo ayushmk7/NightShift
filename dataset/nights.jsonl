@@ -8,3 +8,4 @@
 {"date": "2026-07-23", "package": "jac", "findings_count": 26, "themes_selected": 6, "cost_usd": 26.41963245000001, "turns": 86}
 {"date": "2026-07-24", "package": "jac-byllm", "findings_count": 4, "themes_selected": 2, "cost_usd": 3.3460032, "turns": 79}
 {"date": "2026-07-30", "package": "jac-byllm", "findings_count": 22, "themes_selected": 6, "cost_usd": 12.82258005, "turns": 239}
+{"date": "2026-07-31", "package": "repo", "dry_run": true, "phases": ["cycle", "reactive"], "findings_count": 117, "findings_carryover": 17, "findings_fresh": 100, "themes_selected": 11, "themes_deferred": 103, "declines": 5, "sessions": 27, "session_rows": 27, "cost_usd": 76.5503646, "turns": 1054, "cost_source": "envelopes"}

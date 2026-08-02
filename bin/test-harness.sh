@@ -3069,4 +3069,165 @@ jac run scripts/dataset.jac record-audit "$S36/night" "$S36/ds" 2026-07-31 repo 
 rm -rf .jac
 echo "both phases are recorded, the counts are the night's own, and a refusal is kept as data"
 
+echo "== 37. backfill recovers a branch the fork never saw, and claims nothing it cannot show =="
+# dataset_backfill resolved every green branch with `git fetch origin <branch> || continue`. On
+# 2026-07-31 -- a rehearsal, so ns_git_push was stubbed -- not one of the six green branches ever
+# reached the fork, every fetch failed, every branch was skipped, and the backfill recovered the
+# audit half while losing 100% of the refactor half. Every commit was in work/repo the whole time.
+# Three claims are pinned here, because the fix has to recover the rows WITHOUT inventing fields:
+#   the local ref is used; a local-only branch gets url null, not a dead fork link; and the two
+#   fallbacks on that path (package, tests line) stop asserting things they have no evidence for.
+rm -rf .jac
+S37="$T/backfill"
+mkdir -p "$S37/logs/2026-07-31" "$S37/work/repo"
+# A FAKE NS_ROOT. dataset_backfill sweeps "$NS_ROOT"/logs/20*, so the fixture night has to be the
+# only night it can see; scripts/ and config/ are symlinked back so ns_jac still runs the real code.
+ln -s "$NS_ROOT/scripts" "$S37/scripts"
+ln -s "$NS_ROOT/config" "$S37/config"
+ln -s "$NS_ROOT/lib" "$S37/lib"
+N37="$S37/logs/2026-07-31"
+
+# Two branches, one of each kind. The fork half is not decoration: without it every assertion about
+# the local half is also satisfied by a fix that simply stopped consulting the fork at all.
+git -C "$S37/work/repo" init -q
+git -C "$S37/work/repo" config user.email t@t.com
+git -C "$S37/work/repo" config user.name t
+printf 'def old() -> int { return 1; }\n' > "$S37/work/repo/x.jac"
+git -C "$S37/work/repo" add -A && git -C "$S37/work/repo" commit -qm base
+git -C "$S37/work/repo" checkout -q -B main
+git -C "$S37/work/repo" checkout -q -B nightshift/2026-07-31/dead-code-local-only
+printf 'def new() -> int { return 1; }\n' > "$S37/work/repo/x.jac"
+git -C "$S37/work/repo" commit -qam local
+git -C "$S37/work/repo" checkout -q -B nightshift/2026-07-31/dead-code-on-the-fork main
+printf 'def pushed() -> int { return 1; }\n' > "$S37/work/repo/x.jac"
+git -C "$S37/work/repo" commit -qam pushed
+git -C "$S37/work/repo" checkout -q main
+git init -q --bare "$S37/origin.git"
+git -C "$S37/work/repo" remote add origin "$S37/origin.git"
+git -C "$S37/work/repo" push -q origin nightshift/2026-07-31/dead-code-on-the-fork
+# ...and the local-only branch is genuinely absent from the "fork", or the fix proves nothing.
+[ -z "$(git -C "$S37/origin.git" for-each-ref --format='%(refname)' 'refs/heads/nightshift/2026-07-31/dead-code-local-only')" ] \
+    || fail "section 37's fixture pushed the local-only branch; the local-ref fallback is untested"
+
+# A parseable night, so record-audit runs and its dry-run flag can be read off nights.jsonl.
+cp logs/2026-07-31/findings-reactive.json "$N37/findings.json"
+cp logs/2026-07-31/selection-reactive.json "$N37/selection.json"
+for s37slug in dead-code-local-only dead-code-on-the-fork; do
+    # NO `package` KEY. Themes have carried none since the audit went whole-repo/sharded, so this
+    # is the real shape, and it is exactly what made the un-fixed reader return "".
+    printf '{"slug": "%s", "task": "dead-code", "complexity": "mechanical", "findings": []}\n' \
+        "$s37slug" > "$N37/theme-$s37slug.json"
+    printf '{"summary": "s", "risk": "low", "files": ["x.jac"]}\n' > "$N37/report-$s37slug.json"
+    printf 'nightshift/2026-07-31/%s\t%s\t%s\n' "$s37slug" "$N37/theme-$s37slug.json" \
+        "$N37/report-$s37slug.json" >> "$N37/green.tsv"
+    printf 'nightshift/2026-07-31/%s\t%s\t%s\n' "$s37slug" "$N37/theme-$s37slug.json" \
+        "$N37/report-$s37slug.json" >> "$N37/queue.tsv"
+done
+# ONE of the two has its gate summary on disk. The other does not -- which is the case the bare
+# string "verified" used to answer with a green gate it had no evidence for.
+printf '3 suites green, 1878 collected\n' > "$N37/tests-dead-code-on-the-fork.txt"
+# lib/email.sh:24's own line. This log dir predates bin/nightshift.sh's DRY_RUN marker, exactly like
+# the real 2026-07-31 one, so the marker cannot be the only signal.
+printf '22:20:20 [S6] dry-run: digest rendered, not sent\n' > "$N37/run.log"
+
+# Drives the REAL dataset_backfill out of a NAMED copy of lib/dataset.sh, so the mutation below
+# swaps that one file and nothing else. $1 is the library; $2 is the dataset dir.
+#
+# A SEPARATE `bash` PROCESS, not a `( … ) || fail` subshell, and that is load-bearing. bash
+# disables errexit inside a compound command whose status is tested by `||`, so a subshell probe
+# runs with `set -e` OFF -- while bin/nightshift.sh's `dataset-backfill` arm calls dataset_backfill
+# untested, with errexit LIVE. A probe that cannot see errexit cannot see the failure mode that
+# actually shipped: `grep -m1 "tonight's package:"` exits 1 on every sharded night, pipefail made
+# that the assignment's rc, and the real command died on the first log dir having recorded nothing.
+# The child process sets its own `set -euo pipefail`, so the parent's tested context cannot mask it.
+backfill_probe() {   # backfill_probe <lib/dataset.sh> <dataset_dir>
+    cat > "$S37/probe.sh" <<PROBE
+set -euo pipefail
+NS_ROOT="$S37"
+. "\$NS_ROOT/lib/common.sh"
+. "$1"
+ns_load_config
+DATASET_DIR="$2"
+mkdir -p "\$DATASET_DIR"
+dataset_backfill
+PROBE
+    bash "$S37/probe.sh" >/dev/null 2>&1
+}
+backfill_probe "$NS_ROOT/lib/dataset.sh" "$S37/ds" \
+    || fail "dataset_backfill exited nonzero over the fixture night"
+
+# BOTH branches recovered. One file each; the un-fixed reader produced one row, for the fork half.
+[ "$(wc -l < "$S37/ds/refactors.jsonl" | tr -d ' ')" = "2" ] \
+    || fail "the backfill recorded $(wc -l < "$S37/ds/refactors.jsonl" | tr -d ' ') refactor rows, not 2 -- a branch the fork never saw is still being dropped"
+# Isolate each row. A file-wide grep here is the vacuous-assertion trap section 33 already fell
+# into once: the fork row legitimately carries a URL and the local row legitimately carries null,
+# so either literal is satisfied by the wrong row.
+grep '"branch": "nightshift/2026-07-31/dead-code-local-only"' "$S37/ds/refactors.jsonl" > "$S37/local-row.json" \
+    || fail "the local-only branch produced no refactor row; its six real siblings are the 2026-07-31 loss"
+grep '"branch": "nightshift/2026-07-31/dead-code-on-the-fork"' "$S37/ds/refactors.jsonl" > "$S37/fork-row.json" \
+    || fail "the branch that IS on the fork produced no refactor row"
+[ "$(wc -l < "$S37/local-row.json" | tr -d ' ')" = "1" ] || fail "expected exactly one local-only row"
+[ "$(wc -l < "$S37/fork-row.json" | tr -d ' ')" = "1" ] || fail "expected exactly one fork row"
+# THE COMMIT ITSELF, not just a row. The whole point of the fallback is the diff.
+grep -q '"before": "def old' "$S37/local-row.json" \
+    || fail "the local-only row has no before-content; the local ref was not actually read"
+grep -q '"after": "def new' "$S37/local-row.json" \
+    || fail "the local-only row has no after-content; the local ref was not actually read"
+# NO DEAD LINK. Nothing was pushed, so github.com/<fork>/tree/<branch> resolves to nothing --
+# the same claim lib/dataset.sh nulls on the live dry-run path, arriving by the back door.
+grep -q '"url": null' "$S37/local-row.json" \
+    || fail "a branch the fork has never seen was given a fork URL: $(grep -o '"url": [^,]*' "$S37/local-row.json")"
+# ...and the branch that IS on the fork keeps its real one, or the assertion above is satisfied by
+# a recorder that never writes a URL at all.
+grep -q '"url": "https://github.com/ayushmk7/jaseci/tree/nightshift/2026-07-31/dead-code-on-the-fork"' "$S37/fork-row.json" \
+    || fail "a branch that IS on the fork lost its URL: $(grep -o '"url": [^,]*' "$S37/fork-row.json")"
+# THE JOIN KEY. dataset_record_night and lib/ship.sh both write "repo"; a themeless read here gave
+# "" and split refactors.jsonl from nights.jsonl for the very night this function recovers.
+grep -q '"package": "repo"' "$S37/local-row.json" \
+    || fail "the backfilled row's package is not repo, so it will not join nights.jsonl: $(grep -o '"package": [^,]*' "$S37/local-row.json")"
+# THE GATE CLAIM. tests-dead-code-local-only.txt does not exist, and the old fallback answered that
+# with the bare word "verified" -- an assertion of a green gate from a missing file.
+grep -q '"verify": "gate result unavailable' "$S37/local-row.json" \
+    || fail "a missing tests-*.txt still yields a verify line that claims a gate: $(grep -o '"verify": "[^"]*"' "$S37/local-row.json")"
+grep -q '"verify": "3 suites green, 1878 collected"' "$S37/fork-row.json" \
+    || fail "the branch WITH a gate summary lost it; the fallback is firing unconditionally"
+# THE NIGHT'S OWN FLAG, not this process's. Backfill passed a hardcoded false, so the one rehearsal
+# night in the corpus would have been labelled live in tracked training data.
+grep -q '"dry_run": true' "$S37/ds/nights.jsonl" \
+    || fail "the backfilled nights row is not flagged as the rehearsal it was: $(cat "$S37/ds/nights.jsonl")"
+grep -q '"dry_run": true' "$S37/local-row.json" \
+    || fail "the backfilled refactor row is not flagged as coming from a rehearsal"
+
+# dataset_night_was_dry directly, on each signal alone AND on a night carrying none of them. Without
+# the last arm every arm above is satisfied by a function that always says true.
+dry_of() { ( NS_ROOT="$S37"; . "$NS_ROOT/lib/common.sh"; . "$NS_ROOT/lib/dataset.sh"; dataset_night_was_dry "$1" ); }
+mkdir -p "$S37/sig-marker" "$S37/sig-prs" "$S37/sig-log" "$S37/sig-live"
+touch "$S37/sig-marker/DRY_RUN"
+printf '{"number": 0, "url": "https://github.com/DRY-RUN/pull/0"}\n' > "$S37/sig-prs/prs.jsonl"
+printf '22:20:20 [S6] dry-run: digest rendered, not sent\n' > "$S37/sig-log/run.log"
+printf '{"number": 7301, "url": "https://github.com/jaseci-labs/jac/pull/7301"}\n' > "$S37/sig-live/prs.jsonl"
+printf '22:20:20 [S6] digest sent to community@jaseci.org\n' > "$S37/sig-live/run.log"
+for s37sig in sig-marker sig-prs sig-log; do
+    [ "$(dry_of "$S37/$s37sig")" = "true" ] \
+        || fail "$s37sig: a rehearsal night reads as live, so its stub PR links go into the dataset as real"
+done
+[ "$(dry_of "$S37/sig-live")" = "false" ] \
+    || fail "a night with a real PR and a real digest is branded a rehearsal; the flag means nothing"
+
+# MUTATION. Restore the exact `fetch || continue` that lost the refactor half, in a copy, and
+# require the local-only branch to disappear. Without this every assertion above is satisfied by a
+# fixture that happened to record two rows for some other reason.
+sed 's|^            ref=""$|            git -C "$REPO" fetch origin "$branch" -q 2>/dev/null \|\| continue\n            ref=""|' \
+    "$NS_ROOT/lib/dataset.sh" > "$S37/mutant.sh"
+[ "$(grep -c 'fetch origin "\$branch" -q 2>/dev/null || continue' "$S37/mutant.sh")" = "1" ] \
+    || fail "the section-37 mutant was not built; the mutation proves nothing"
+backfill_probe "$S37/mutant.sh" "$S37/ds-mutant" \
+    || fail "the section-37 mutant exited nonzero"
+grep -q '"branch": "nightshift/2026-07-31/dead-code-local-only"' "$S37/ds-mutant/refactors.jsonl" \
+    && fail "the mutant with the fork-only resolution restored STILL recovered the local branch -- section 37 cannot fail"
+grep -q '"branch": "nightshift/2026-07-31/dead-code-on-the-fork"' "$S37/ds-mutant/refactors.jsonl" \
+    || fail "the section-37 mutant dropped BOTH branches, so its red says nothing about the local one"
+rm -rf .jac
+echo "a branch that only ever existed locally is recovered, with no URL and no gate claim invented"
+
 echo "ALL HARNESS TESTS PASSED"
