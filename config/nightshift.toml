@@ -34,33 +34,232 @@ periphery       = ["jac/jaclang/langserve", "jac/jaclang/lsp", "jac/jaclang/proj
 [shards.exclude]                             # subtracted from the shard's own paths in the prompt
 compiler-core   = ["jac/jaclang/compiler/passes", "jac/jaclang/compiler/tests"]
 
+[tasks]                                      # ONE task per night, cycling in the order these
+# tables appear below. scripts/tasks.jac reads that order straight from the file (tomllib
+# preserves it) and bin/test-harness.sh section 11 pins the sequence, so there is deliberately
+# no `order = N` key: two sources of truth for one ordering is a drift bug waiting to happen.
+#
+# The order IS the design. Delete first (every later task then audits a smaller surface), then
+# simplify what survives, then fix drift in what remains, then write tests against the settled
+# shape. Writing coverage first means testing code that is about to be deleted.
+#
+# There is deliberately no per-task `model` either: the audit is always Opus and the apply
+# session routes on the finding's own `complexity` tag ([agent] below). Upgrade path: add
+# `model = ...` here the day one task genuinely needs a different one.
+
+[tasks.dead-code]
+ponytail = "full"
+scoring  = "loc_saved"
+fragment = "refactor"
+
+[tasks.abstraction]
+ponytail = "full"
+scoring  = "loc_saved"
+fragment = "refactor"
+
+[tasks.maintenance]
+ponytail = "full"
+scoring  = "loc_saved"
+fragment = "auto"        # the agent returns the kind; fragment_path clamps an invalid one
+
+[tasks.coverage]
+ponytail = "lite"        # so it actually writes a test instead of YAGNI-ing it away
+scoring  = "risk_weighted"
+fragment = ""            # tests-only changes need no release-note fragment
+# The ONLY task permitted to write inside a protected glob, and the permission lives HERE --
+# in the config file, keyed by task name -- never in a theme. See scripts/check_scope.jac.
+# Presence of this key ALSO means "this task may write nothing else": every changed path on a
+# coverage branch must match one of these globs.
+#
+# WHAT KEEPS THIS OUT OF THE AGENT'S REACH, stated precisely because the obvious version of this
+# sentence is wrong: it is NOT that the value never leaves this file. scripts/config.jac:15-26
+# flattens every [section].key pair into a flat NS_* assignment, and a sub-table becomes one
+# JSON-valued assignment -- so `NS_TASKS_COVERAGE='{"ponytail": "lite", ..., "protect_unless":
+# [...]}'` really is produced on every run. What holds the property is that lib/common.sh's
+# ns_load_config `eval`s those lines BARE: no `export`, no `set -a`. They are shell variables of
+# the orchestrator process only, so no child -- and in particular no `claude` session -- ever
+# inherits them. Adding `set -a` around that eval would silently put this list in the agent's
+# environment. scripts/tasks.jac's `env` verb separately refuses to emit it, so neither route
+# leaks it.
+protect_unless = ["**/tests/**", "**/*.test.jac"]
+
 [budgets]                                    # PRD 9 guardrails — no step may violate these
-themes_per_night   = 6                       # was 3 -- real data: 85% of real findings were being
-                                              # dropped for pure over-night-budget reasons while
-                                              # verify_estimate_min sat at 3 (180min budget, huge
-                                              # unused headroom). Revisit if a night's real
-                                              # runtime/cost grows uncomfortable.
+themes_per_night   = 15                      # A CEILING ON OUTPUT VOLUME, not an estimate of what
+                                              # fits the clock. Read that sentence before changing it:
+                                              # scripts/selector.jac has TWO limits and they answer
+                                              # different questions. fit_clock() reserves
+                                              # apply_timeout_min + verify_estimate_min per theme
+                                              # against the clock actually left, and sheds what does
+                                              # not fit (reason `no-clock-left`). THIS number is the
+                                              # separate, unconditional truncation applied first
+                                              # (reason `over-night-budget`), and its job is to bound
+                                              # how many draft PRs land upstream in one night and how
+                                              # much apply spend goes with them -- neither of which
+                                              # the wallclock knows anything about.
+                                              #
+                                              # WAS 6, AND 6 WAS THE SINGLE LARGEST WASTE OF THE
+                                              # 2026-07-31 RUN. The cycle audits cost $38.36 and
+                                              # produced 95 findings; deferred.jsonl holds 103 rows
+                                              # and ALL 103 say `over-night-budget` -- not one says
+                                              # `no-clock-left`. The clock was never consulted: the
+                                              # night had used 56 of its 480 minutes when the selector
+                                              # ran (start 20:43:39, audit merge 21:39:21), and at the
+                                              # per-theme reservation then in force (25 + 1) fit_clock
+                                              # would have admitted 16 themes. Even at the 30-minute
+                                              # default verify estimate it admits 7. This constant,
+                                              # alone, threw away 99 of 105 packed themes.
+                                              #
+                                              # WHY 15 AND NOT "AS MANY AS THE CLOCK HOLDS": 15 is
+                                              # under the 16 that night's clock allowed, so the
+                                              # invariant that makes over-commitment impossible still
+                                              # holds -- fit_clock reserves the WORST CASE
+                                              # (apply_timeout_min is a TIMEOUT, not a mean; measured
+                                              # apply+verify was ~6.6 min/theme, 4x under it), so no
+                                              # theme is ever scheduled that the night could not
+                                              # finish even if every session ran to its box. That
+                                              # matters because a theme selected and then skipped for
+                                              # lack of clock is LOST: carryover.json is built from
+                                              # the selector's `dropped` list, so a theme that was
+                                              # selected and never applied is in neither.
+                                              # 15 themes cost ~$12.6 of apply spend at the measured
+                                              # $0.84/session and ~8 draft PRs at the measured 6/11
+                                              # conversion. RE-MEASURE AFTER ONE NIGHT before going
+                                              # further: above ~18 the binding constraint is a human's
+                                              # PR review queue, not this harness.
 files_per_theme    = 10
 loc_per_theme      = 600                     # was 300 -- was silently dropping confirmed, single-
                                               # file, high-confidence dead-code finds outright (a
                                               # real 492-line dead file never even got considered:
                                               # 0 + 492 > 300 killed it before packing tried).
-wallclock_min      = 180                     # hard ceiling for the whole night
-audit_timeout_min  = 20                      # 15 was too tight for the jac core package: 07-18 hit the wall twice, 0-byte envelope both times
+wallclock_min      = 480                     # 23:00 -> 07:00, an 8h ceiling (spec section 4; was 180
+                                              # with an 02:00 fire). THIS NUMBER AND THE PLIST'S
+                                              # StartCalendarInterval ARE ONE WINDOW STATED TWICE:
+                                              # bin/nightshift.sh's watchdog sleeps wallclock_min*60
+                                              # from process start and TERMs the run, so a plist that
+                                              # fires at 23:00 against a stale 180 kills the night at
+                                              # 02:00 and it looks like a clean timeout. Change both
+                                              # or neither; bin/test-harness.sh section 24 checks it.
+inventory_min      = 120                     # ceiling for S1.6. Re-gating one open PR costs what S4
+                                              # costs (~40min worst case), so N open PRs can eat the
+                                              # whole night and ship nothing new. When this is spent
+                                              # the remaining PRs are left for the next night -- the
+                                              # inventory converges over nights, not within one.
+                                              # Raise it once the steady state is known. NOTE it is
+                                              # deliberately NOT clamped to wallclock_min: the
+                                              # watchdog in bin/nightshift.sh is the hard stop, and
+                                              # two ceilings that can disagree is a drift bug.
+audit_timeout_min  = 20                      # 15 was too tight for the jac core package: 07-18 hit the
+                                              # wall twice, 0-byte envelope both times. DELIBERATELY NOT
+                                              # RAISED for the new task lenses: the brief said
+                                              # compiler-core and compiler-passes came back 0 bytes at
+                                              # 20, and the artifacts say otherwise -- both envelopes
+                                              # are 35 KB and 18 KB, both is_error=false, and both
+                                              # produced findings (21 and 9). NOT ONE session on
+                                              # 2026-07-31 was killed by this timebox; the longest audit
+                                              # in the run was 8.0 min. compiler-passes failed SCHEMA
+                                              # VALIDATION, not the clock. The raised audit_max_turns
+                                              # below still fits: at the heaviest measured turn rate
+                                              # (46 turns in 5.6 min = 7.3 s/turn) 130 turns is ~16 min,
+                                              # inside this box. Raise it when a session is actually
+                                              # killed here, and not before.
 apply_timeout_min  = 25                      # per theme session
-audit_max_turns    = 45                      # audit is read-only investigation (grep/read heavy,
-                                              # no edits); 25 was too tight once the prompt started
-                                              # demanding real evidence per finding -- confirmed
-                                              # live: a real audit hit terminal_reason=max_turns
-max_turns          = 80                      # apply session cap; the real cost brake on a subscription
-max_budget_usd     = 5                       # inert on subscription; belt if ever on an API key
+audit_max_turns    = 130                     # audit is read-only investigation (grep/read heavy, no
+                                              # edits). 25, then 45, were both too tight. 2026-07-31
+                                              # settles it: THREE reactive lenses died at exactly
+                                              # num_turns=46 (subtype=error_max_turns) and contributed
+                                              # nothing, while the audits that FINISHED took 39, 50, 65,
+                                              # 66, 69, 73, 80, 113 and 115 turns. 115 is the observed
+                                              # ceiling for a completed audit, so anything under it
+                                              # truncates work that was going to succeed; 130 is that
+                                              # plus margin, and ~16 min at the heaviest measured turn
+                                              # rate, so it still fits audit_timeout_min above.
+                                              # MORE TURNS COST MORE MONEY -- what keeps that bounded
+                                              # is night_budget_usd below, not this number.
+max_turns          = 80                      # apply session cap
+max_budget_usd     = 5                       # per APPLY session. NOT inert: every session envelope
+                                              # from 2026-07-31 reports a real total_cost_usd, and the
+                                              # night really cost $76.55. Applies are cheap ($0.28-$2.13
+                                              # each, $9.19 for all eleven), so 5 is genuine headroom.
+audit_max_budget_usd = 12                    # per SHARD audit session (the cycle fan-out).
+                                              # NOT 5: the audits that succeeded cost up to $9.77
+                                              # (reactive-dead-code, 69 turns, 5 findings), so a 5 here
+                                              # would convert five of the nine successful audits into
+                                              # the truncated-session failure this same fix teaches the
+                                              # harness to report instead of salvage. 12 = the observed
+                                              # ceiling plus headroom for the raised turn cap.
+                                              # Eight shards at the measured $0.0638/turn and a 130-turn
+                                              # cap is $8.29 worst case, so 12 is never the binding
+                                              # limit for a shard -- night_budget_usd is.
+reactive_audit_max_budget_usd = 8            # per REACTIVE LENS session. A SEPARATE NUMBER, and the
+                                              # reason is arithmetic, not tidiness: the two callers of
+                                              # tier2_audit_shard have 2.2x different per-turn costs.
+                                              # Measured 2026-07-31: the four reactive lenses cost
+                                              # $28.72 over 207 turns ($0.139/turn); the eight cycle
+                                              # shards cost $38.36 over 601 turns ($0.0638/turn). A
+                                              # reactive lens therefore reaches a shared 12 at ~turn 86,
+                                              # inside the raised 130-turn cap, so four lenses could
+                                              # bill $48 of the $50 night_budget_usd and leave ~2 of 8
+                                              # shards schedulable -- moving money from the shards that
+                                              # produced 95 findings for $38.36 to the reactive lenses
+                                              # that produced 5 for $28.72. That is a REGRESSION the
+                                              # raised turn cap introduced, not a pre-existing one.
+                                              # WHY 8 AND NOT 6: a truncated audit still bills its full
+                                              # cap and returns nothing, so this must sit ABOVE the cost
+                                              # of a lens that finishes, not at it. The one reactive
+                                              # lens that produced findings cost $9.77 at 69 turns; with
+                                              # the scope filter in scripts/merges.jac the same window
+                                              # drops from 2,168,503 to 1,324,887 bytes (-38.9%), and at
+                                              # the measured 93% ingestion share that projects to ~$6.2.
+                                              # 6 would truncate it at ~turn 62 and pay $6 for nothing --
+                                              # manufacturing the exact failure the row above refuses.
+                                              # 8 is that projection plus ~30% headroom, and four lenses
+                                              # at 8 is $32 of 50, which still leaves the fan-out room.
+                                              # RE-MEASURE after the first filtered night.
+night_budget_usd   = 50                      # WHOLE-NIGHT ceiling, and the only thing that actually
+                                              # bounds spend: a per-session cap times fifty sessions is
+                                              # not a brake. lib/common.sh sums the total_cost_usd the
+                                              # harness already parses out of every envelope, and the
+                                              # two audit fan-outs (tier2_audit_all, reactive_main) stop
+                                              # SCHEDULING once the sum reaches this, loudly.
+                                              # WHAT IT PROTECTS AGAINST, with the arithmetic: on
+                                              # 2026-07-31 one unattended night spent $76.55 in 97
+                                              # minutes of a 480-minute window -- 27 UNIQUE session_ids,
+                                              # $67.36 of it audits ($28.72 on four reactive lenses of
+                                              # which three produced nothing, $38.36 on eight cycle
+                                              # shards), and only $9.19 on the eleven apply sessions that
+                                              # produced all six shipped branches. $76.55 is a FLOOR, not
+                                              # the total: two attempt-1 Opus audits were overwritten in
+                                              # place by their own retries and survive in no envelope, so
+                                              # the night was nearer $86. (It is NOT $152.82 across 50
+                                              # sessions, which is that same run counted twice -- every
+                                              # meta-<name>.json is a byte-twin of the <name>.json it was
+                                              # projected from. Hence the session_id dedupe in
+                                              # parse_result.spend_total.)
+                                              # 50 fires part-way through the cycle fan-out on that
+                                              # night, so it would have caught it; it still clears the
+                                              # whole reactive pass and it is five times the entire apply
+                                              # phase, so the value-producing half of the night survives
+                                              # the brake.
+                                              # DELIBERATELY NOT CHECKED IN tier2_apply: audits are 88%
+                                              # of the spend and the applies are what ship. Gating them
+                                              # on the same number would mean a night that spent its
+                                              # ceiling auditing throws that work away instead of
+                                              # shipping it. Apply spend is still ACCUMULATED here (so
+                                              # the number is the night's real total); it is the audit
+                                              # scheduling that is gated on it.
 
 [agent]
-model         = "sonnet"                     # empty = account default, which silently drifts with
-                                              # whatever the interactive session's default is at
-                                              # 2am -- confirmed live, unnoticed model change between
-                                              # two real runs. Pin explicitly; change here, not in code.
-ponytail_mode = "full"                       # PRD 14-Q5
+# Two models, both pinned. An empty value means "account default", which silently drifts with
+# whatever the interactive session default is at 2am -- confirmed live, an unnoticed model change
+# between two real runs.
+model        = "opus"                        # the audit is always judgement work (spec 13), and
+                                              # it is also the escalation target for a failed
+                                              # apply. Costs more per night than the old sonnet
+                                              # default; that is the deliberate trade.
+model_simple = "sonnet"                       # apply sessions for `trivial`/`mechanical` findings,
+                                              # plus every mechanical re-prompt
+# [agent].ponytail_mode is GONE: every task now sets its own `ponytail` (coverage needs "lite" or
+# it YAGNIs its own test away), so a global default would only ever be the value nobody uses.
 
 [protect]                                    # glob deny-list; enforced twice (prompt + S4 gate)
 # release_notes/ is NOT listed: fragments live outside docs/ since the restructure, so they need
@@ -74,7 +273,9 @@ globs = [
 
 [email]
 to        = "contactayushmadhav@gmail.com"
-from      = "nightshift@localhost"
+# `from` deleted 2026-07-30: Gmail rewrites any From that is not the authenticated user, so
+# sendmail.jac uses $SMTP_USER directly. A knob that can only ever hold one correct value is
+# not a knob.
 smtp_host = "smtp.gmail.com"
 smtp_port = 465                              # SSL; creds live in ~/.nightshift.env, never here
 
@@ -83,7 +284,9 @@ smtp_port = 465                              # SSL; creds live in ~/.nightshift.
 # `jac_repo` is the target repo's dev binary (built by fresh_env.sh) used for the jaseci
 # gates (jac check/test/format) and the agent sessions — it tracks the repo's version.
 jac      = "/Users/ayush/.local/bin/jac"
-jac_repo = "/Volumes/ExtremePro/JaseciLabs/NightShift/work/repo/jac/zig-out/bin/jac"
+# Literal /Users/..., never `~` or `$HOME`: this file is read by scripts/config.jac and by
+# ns_bootstrap_jac's `sed` (lib/common.sh:21), neither of which expands shell metacharacters.
+jac_repo = "/Users/ayush/nightshift/work/repo/jac/zig-out/bin/jac"
 claude   = "/Users/ayush/.local/bin/claude"
 gh       = "/opt/homebrew/bin/gh"
 precommit = "/Users/ayush/.local/bin/pre-commit"

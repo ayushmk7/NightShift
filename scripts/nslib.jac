@@ -81,10 +81,17 @@ def fingerprint(relpath: str, rule: str) -> str {
     return sha1((relpath + "\x1f" + rule).encode("utf-8")).hexdigest();
 }
 
-"""Selection score (TPRD S3-B step 3): expected LOC saved, weighted by the model's own
-confidence, discounted by its risk. Shared by selector (packing) and dataset (capture)."""
+"""Selection score (TPRD S3-B step 3, design spec 3.2): weight * confidence / risk. Shared by
+selector (packing) and dataset (capture).
+
+The WEIGHT is read off the finding itself rather than passed in, because the finding already says
+which mode it is: parse_result.validate_finding requires gap_severity for risk_weighted tasks and
+est_loc_saved for loc_saved ones, and DELETES the other. Passing a mode instead would mean
+plumbing it through selector, dataset, and every caller that only ever has one finding in hand --
+and a carry-over night legitimately holds findings of two different modes at once."""
 def score_of(f: dict) -> float {
-    return float(int(f["est_loc_saved"]) * int(f["confidence"])) / float(int(f["risk"]));
+    weight: int = int(f["gap_severity"]) if "gap_severity" in f else int(f["est_loc_saved"]);
+    return float(weight * int(f["confidence"])) / float(int(f["risk"]));
 }
 
 def today() -> str {
@@ -188,6 +195,12 @@ in fragcheck.is_gated_change; they must stay in lockstep."""
 glob VALID_FRAGMENT_KINDS: list[str] = ["feature", "bugfix", "breaking", "refactor", "docs"];
 
 def fragment_path(paths: list[str], kind: str) -> str {
+    # "" means the TASK declares it needs no fragment ([tasks.coverage].fragment). Checked before
+    # the validity clamp below, which would otherwise turn it into "refactor" and write a release
+    # note for a tests-only change.
+    if kind == "" {
+        return "";
+    }
     safe_kind: str = kind if kind in VALID_FRAGMENT_KINDS else "refactor";
     for p in paths {
         if str(p).startswith("jac/jaclang/") and "/tests/" not in str(p) {
@@ -219,6 +232,17 @@ test "fingerprint is stable per (file, rule) and sensitive to both" {
     assert fingerprint("f.jac", "dup") == fingerprint("f.jac", "dup");
     assert fingerprint("f.jac", "dup") != fingerprint("g.jac", "dup");
     assert fingerprint("f.jac", "dup") != fingerprint("f.jac", "dead-code");
+}
+
+test "score_of reads gap_severity for coverage findings and est_loc_saved otherwise" {
+    shrink: dict = {"est_loc_saved": 30, "confidence": 4, "risk": 2};
+    grow: dict = {"gap_severity": 30, "est_loc_added": 90, "confidence": 4, "risk": 2};
+    assert score_of(shrink) == 60.0;
+    assert score_of(grow) == 60.0;
+    # est_loc_added is NOT the weight -- it is what the theme budgets. A score_of that reached for
+    # it would rank a coverage theme by how much test code it writes rather than by how much
+    # untested behaviour it protects.
+    assert score_of({"gap_severity": 10, "est_loc_added": 900, "confidence": 1, "risk": 1}) == 10.0;
 }
 
 test "protected globs with negation" {
@@ -260,6 +284,19 @@ test "fragment_path maps only jac/jaclang changes, and validates the kind" {
     # an invalid kind falls back to refactor rather than emitting a path CI will reject
     assert fragment_path(["jac/jaclang/cli/b.jac"], "nonsense")
         == "release_notes/unreleased/jaclang/0000.refactor.md";
+}
+
+test "an empty kind means the TASK needs no fragment at all" {
+    # Distinct from "these paths need none": the coverage task sets fragment = "" in config, and
+    # without this branch the empty string would fall through the validity check and be clamped
+    # to `refactor` -- writing a release note for a tests-only change.
+    assert fragment_path(["jac/jaclang/cli/b.jac"], "") == "";
+    # ...and it is the KIND that is empty, not the answer: the same paths at any other kind still
+    # produce a fragment, so an implementation that returned "" unconditionally fails here.
+    assert fragment_path(["jac/jaclang/cli/b.jac"], "auto")
+        == "release_notes/unreleased/jaclang/0000.refactor.md";
+    assert fragment_path(["jac/jaclang/cli/b.jac"], "bugfix")
+        == "release_notes/unreleased/jaclang/0000.bugfix.md";
 }
 
 test "normalize_fragment_body bullets a bare sentence, leaves an already-bulleted one alone" {

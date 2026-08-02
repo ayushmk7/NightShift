@@ -4,9 +4,9 @@ argv:
   render <report.json> [k=v ...]   report from parse_result.jac plus string overrides
                                    (branch=, package=, date=, tests=) so bash never
                                    composes JSON; stdout: full draft (frontmatter + body)
-  frag <report.json>              stdout: release-note fragment path for this report's files
-                                   ("" if none of them touch jac/jaclang/)
-                                   (used for the tier-1 autofix branch, which has no agent report)
+  frag <report.json> <kind>        stdout: release-note fragment path for this report's files at
+                                   the task's declared fragment kind ("" if none of them touch
+                                   jac/jaclang/, or if the kind itself is "")
   meta <draft.md>                  stdout: frontmatter as JSON (machine side of the draft)
   body <draft.md>                  stdout: body only (verbatim `gh pr create --body-file` payload)
 """
@@ -86,18 +86,23 @@ def render(d: dict) -> str {
     return "\n".join(frontmatter_lines(d) + [""] + body_lines(d)) + "\n";
 }
 
-"""What `frag <report.json>` prints: the fragment path implied by the files the agent actually
-edited (the report's `files`, not the theme's -- the theme lists what was planned).
+"""The fragment path implied by the files the agent actually touched (the report's `files`, not
+the theme's -- the theme lists what was planned), at the kind the TASK declares.
 
-LATENT COUPLING: the kind is hardcoded "refactor" here, while the S4 scope gate
-(check_scope.jac:23) honors `theme.get("fragment_kind", "refactor")`. Identical today because
-nothing emits `fragment_kind`. The day a theme carries e.g. "bugfix", the gate will allow
-0000.bugfix.md while this writes 0000.refactor.md -- both sites must change together."""
-def frag_for_report(report_path: str) -> str {
+`auto` (maintenance) resolves from the agent's own reported fragment_kind, which fragment_path
+then clamps to a valid name -- so an agent cannot invent a filename CI will reject. `""`
+(coverage) means the task needs no fragment at all. This was one of three sites that hardcoded
+`refactor` while check_scope.jac already honoured theme.fragment_kind; the LATENT COUPLING note
+that used to live here is gone with the coupling."""
+def frag_for_report(report_path: str, kind: str) -> str {
     with open(report_path, "r") as f {
         rep: dict = parse_obj(f.read());
     }
-    return fragment_path([str(p) for p in as_list(rep["files"])], "refactor");
+    resolved: str = kind;
+    if kind == "auto" {
+        resolved = str(rep.get("fragment_kind", "refactor"));
+    }
+    return fragment_path([str(p) for p in as_list(rep["files"])], resolved);
 }
 
 """Inverse of render: (frontmatter dict, body string)."""
@@ -121,8 +126,8 @@ def split_draft(text: str) -> (dict, str) {
 with entry:__main__ {   # only dispatch the CLI on direct `jac run`; sendmail.jac imports split_draft
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
-    if cmd == "frag" and len(args) == 3 {
-        print(frag_for_report(args[2]));
+    if cmd == "frag" and len(args) == 4 {
+        print(frag_for_report(args[2], args[3]));
     } elif cmd == "render" and len(args) >= 3 {
         with open(args[2], "r") as f {
             d: dict = parse_obj(f.read());
@@ -144,7 +149,7 @@ with entry:__main__ {   # only dispatch the CLI on direct `jac run`; sendmail.ja
         }
     } elif cmd != "" and cmd != "test" {
         eprint("usage: jac run render_draft.jac render <report.json> [branch=... package=... date=... tests=... url=...]");
-        eprint("       jac run render_draft.jac frag <report.json>");
+        eprint("       jac run render_draft.jac frag <report.json> <fragment_kind>");
         eprint("       jac run render_draft.jac meta <draft.md>");
         eprint("       jac run render_draft.jac body <draft.md>");
     }
@@ -189,8 +194,33 @@ test "frag returns a jaclang path for core changes and empty for jac-mcp only" {
                             "loc_before": 10, "loc_after": 2, "risk": "low",
                             "release_note_md": "note"}));
     }
-    assert frag_for_report(core_path) == "release_notes/unreleased/jaclang/0000.refactor.md";
-    assert frag_for_report(mcp_path) == "";
+    assert frag_for_report(core_path, "refactor") == "release_notes/unreleased/jaclang/0000.refactor.md";
+    assert frag_for_report(mcp_path, "refactor") == "";
+}
+
+test "auto resolves the kind from the agent's report and clamps an invented one" {
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    p: str = d + "/r.json";
+    with open(p, "w") as f {
+        f.write(json.dumps({"files": ["jac/jaclang/cli/a.jac"], "fragment_kind": "bugfix"}));
+    }
+    assert frag_for_report(p, "auto") == "release_notes/unreleased/jaclang/0000.bugfix.md";
+    # a NON-auto task ignores whatever the agent reported: the task's declared kind wins, so an
+    # implementation that always read rep["fragment_kind"] fails here.
+    assert frag_for_report(p, "refactor") == "release_notes/unreleased/jaclang/0000.refactor.md";
+    assert frag_for_report(p, "") == "";
+    q: str = d + "/q.json";
+    with open(q, "w") as f {
+        f.write(json.dumps({"files": ["jac/jaclang/cli/a.jac"], "fragment_kind": "chore"}));
+    }
+    assert frag_for_report(q, "auto") == "release_notes/unreleased/jaclang/0000.refactor.md";
+    # an auto task whose agent reported nothing at all still gets a valid name
+    r: str = d + "/s.json";
+    with open(r, "w") as f {
+        f.write(json.dumps({"files": ["jac/jaclang/cli/a.jac"]}));
+    }
+    assert frag_for_report(r, "auto") == "release_notes/unreleased/jaclang/0000.refactor.md";
 }
 
 test "render leaves release_note empty when no file touches jac/jaclang/" {

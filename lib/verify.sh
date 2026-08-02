@@ -158,7 +158,16 @@ assert_suite_ran() {
     esac
     case "$sessions" in
         "$want") : ;;
-        *) ns_die "$EX_BUG" "$where $suite: expected $want test-runner session(s), one per test command in [jobs.$suite], but $(basename "$raw") has $sessions. Refusing to score a suite that did not run as a pass -- check that job's command paths and cwd in config/ci-mirror.toml." ;;
+        # The last failing command is NAMED here, and that wording is load-bearing (followups 4.2).
+        # suite_test_raw classifies a failed command as setup-vs-test by the substring `jac test`,
+        # and [jobs.compiler]/[jobs.runtime] register `cd jac && … jac test …` as ONE command -- so
+        # a failing `cd jac` matches, is classified as a TEST failure, converts to `return 0`, and
+        # arrives here rather than at the EX_MIRROR_SETUP arm above. Not a false green (the session
+        # count still aborts), but the operator was told the wrong thing. The honest fix is the
+        # message, not the classification: reclassifying would need suite_test_raw to parse compound
+        # commands, and being wrong in the other direction turns a real test failure into a
+        # night-wide abort.
+        *) ns_die "$EX_BUG" "$where $suite: expected $want test-runner session(s), one per test command in [jobs.$suite], but $(basename "$raw") has $sessions. Refusing to score a suite that did not run as a pass -- check that job's command paths and cwd in config/ci-mirror.toml. The last failing command in this job was: ${CIMIRROR_FAILED_CMD:-(none -- every command exited 0, so the runner started fewer times than there are test commands)}. Note that a compound command like 'cd jac && … jac test …' is classified as a TEST command by substring, so a failing 'cd jac' arrives here rather than as a setup failure." ;;
     esac
     # A session banner is not proof the run COLLECTED anything: a collection-error run prints
     # `collected 0 items / 1 error` under a perfectly normal banner. Left unchecked on the baseline
@@ -270,7 +279,15 @@ verify_main() {
 # section 8 asserts that ordering, because getting it backwards is silently expensive rather than
 # visibly broken.
 verify_branch() {
-    local branch=$1 theme=$2 t0 t1
+    # on_red: `demote` (default) is the S4 behavior -- a red branch is failed_verify'd (attempts++,
+    # auto-rejected at 2) and deleted. `report` is for S1.6's re-gate of an ALREADY-OPEN PR, where
+    # the branch is upstream and the red may not be its fault at all: [jobs.contribution] validates
+    # whole-repo state (validate_docs_code.jac's 852 blocks, the bun/zig BUN_VERSION lockstep), so
+    # an upstream-introduced breakage reds every open PR identically and would auto-reject the
+    # entire ledger in two nights over something no branch caused. Passed EXPLICITLY to every
+    # verify_red below rather than read out of dynamic scope, because bash's dynamic scoping would
+    # make this work by accident and then break silently the day a call site moves.
+    local branch=$1 theme=$2 on_red="${3:-demote}" t0 t1
     t0="$(date +%s)"
     cd "$REPO"
     # `|| ns_die`, NOT bare. verify_branch is only ever invoked as an `if` CONDITION
@@ -287,12 +304,42 @@ verify_branch() {
     # 1. scope containment FIRST — reject before spending a second on tests (anti-injection, T1).
     # --name-status (not --name-only): a vestigial test deletion must be a clean delete, never a
     # modification -- the gate needs to see which each changed path actually is.
+    # The TASK comes from the branch name, not the theme: [tasks.<task>].protect_unless decides
+    # whether this branch may write inside a protected glob, and the theme is agent-derived.
     if [ "$theme" != "-" ]; then
+        local btask
+        btask="$(ns_task_of_branch "$branch")" || ns_die "$EX_BUG" "cannot derive a task from branch '$branch': its slug matches no name in [tasks.*]. Refusing to gate it -- with no task there is no permission set to apply, and defaulting to one would either reject every coverage branch or hand every branch the coverage exemption."
         if ! git diff --name-status "$NS_REPO_DEFAULT_BRANCH...HEAD" \
-                | ns_jac check_scope check "$theme" "$CONFIG" > "$LOG_DIR/scope-violations.txt"; then
-            verify_red "$branch" "scope violation (possible prompt injection): $(head -3 "$LOG_DIR/scope-violations.txt" | tr '\n' ' ')"
+                | ns_jac check_scope check "$theme" "$CONFIG" "$btask" > "$LOG_DIR/scope-violations.txt"; then
+            verify_red "$branch" "scope violation (possible prompt injection): $(head -3 "$LOG_DIR/scope-violations.txt" | tr '\n' ' ')" "$on_red"
             return 1
         fi
+
+        # 1b. TEST-WEAKENING guard. The coverage task may modify an existing test file; weakening
+        #     one is how this task fails while gating green, so it is checked before anything
+        #     expensive. Applied to EVERY task, not just coverage: the cheapest way for any theme
+        #     to turn a red suite green is to delete the assertion.
+        local tw_files tw_rc=0 tw_checked=0 tw_f tw_old
+        tw_files="$(git diff --name-status "$NS_REPO_DEFAULT_BRANCH...HEAD" | awk '$1 == "M" { print $2 }')" || tw_rc=$?
+        case "$tw_rc" in
+            0) : ;;
+            *) ns_die "$EX_BUG" "could not list modified files for the test-weakening guard (rc=$tw_rc). An empty list here is indistinguishable from 'this branch modified nothing', which is exactly how a weakened test would sail through." ;;
+        esac
+        : > "$LOG_DIR/test-weakening.txt"
+        # word-split is deliberate; repo paths contain no spaces (same assumption as the shard
+        # findings list in lib/tier2.sh, and a violation of it fails loudly on the git show below)
+        for tw_f in $tw_files; do
+            git -C "$REPO" cat-file -e "$NS_REPO_DEFAULT_BRANCH:$tw_f" 2>/dev/null || continue
+            tw_old="$LOG_DIR/tw-old-$(printf '%s' "$tw_f" | tr / _)"
+            git -C "$REPO" show "$NS_REPO_DEFAULT_BRANCH:$tw_f" > "$tw_old" \
+                || ns_die "$EX_BUG" "git show $NS_REPO_DEFAULT_BRANCH:$tw_f failed; the test-weakening guard cannot compare what it cannot read, and skipping it silently is how a weakened test ships."
+            if ! ns_jac check_scope weakened "$tw_f" "$tw_old" "$REPO/$tw_f" >> "$LOG_DIR/test-weakening.txt"; then
+                verify_red "$branch" "test weakened: $(grep VIOLATION "$LOG_DIR/test-weakening.txt" | head -2 | tr '\n' ' ')" "$on_red"
+                return 1
+            fi
+            tw_checked=$((tw_checked + 1))
+        done
+        ns_log S4 "test-weakening guard: compared $tw_checked modified file(s) against $NS_REPO_DEFAULT_BRANCH"
     fi
 
     # 2. type-check changed .jac files, BASELINE-DIFF style. The repo is not clean under
@@ -308,7 +355,10 @@ verify_branch() {
     #    entire jac-check stage silently. Same shape as the reader bugs already fixed in
     #    lib/cimirror.sh; found in the same code review. The `|| true` on the grep itself is
     #    legitimate and stays: grep exits 1 when a branch genuinely touches no .jac file.
-    local changed_jac changed_all changed_rc=0 main_jac f br mr
+    # branch_jac/deleted_jac are initialised HERE, not just inside the `if` below: the PR-body line
+    # near the end of this function reads them, and `local x` leaves x UNSET, which `set -u` turns
+    # into an immediate shell exit rather than a catchable failure.
+    local changed_jac changed_all changed_rc=0 main_jac branch_jac="" deleted_jac="" f br mr
     changed_all="$(git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD")" || changed_rc=$?
     case "$changed_rc" in
         0) : ;;
@@ -318,17 +368,67 @@ verify_branch() {
     if [ -n "$changed_jac" ]; then
         br="$LOG_DIR/check-branch-$(basename "$branch").txt"
         mr="$LOG_DIR/check-main-$(basename "$branch").txt"
-        # branch side (the branch is checked out)
-        rm -rf "$REPO/.jac"
-        # shellcheck disable=SC2086  # word-split into per-file args; jac paths have no spaces
-        ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $changed_jac ) > "$br" 2>&1 || true
-        # main side: only files that exist on main (new-on-branch files have no baseline -> their
-        # errors all count as new). Restore just those files to main content, check, then put back.
-        main_jac=""
+        # 2a. Partition the changed .jac files by whether they STILL EXIST on the branch. Deleting
+        #     dead code is the dead-code task's happy path, not an edge case, and a deletion breaks
+        #     the batch swap this stage used to do:
+        #       * `$NS_PATHS_JAC_REPO check <path that no longer exists>` is not a branch-side type
+        #         error, it is a could-not-open error, and it would be counted as one; and
+        #       * `git checkout HEAD -- <deleted path>` cannot express "delete it again" -- it exits
+        #         1 with "pathspec ... did not match any file(s) known to git". The restore guard
+        #         below is right to be fatal (a half-restored tree gates main's content as if it
+        #         were the branch's), so the whole night died on every such branch. Reproduced.
+        #
+        #     What the baseline comparison MEANS for a deleted file: the branch does not contain it,
+        #     so the branch side has no errors for it, so it cannot introduce a NEW one. It is
+        #     un-gateable by construction and belongs on NEITHER side of the diff -- putting it on
+        #     the main side only would report its pre-existing errors as errors the branch REMOVED,
+        #     which checkgate ignores anyway, at the cost of a swap that cannot be undone.
+        #
+        #     The file's ABSENCE can of course introduce errors -- in the files that referenced it.
+        #     Those are different files. If the agent updated them they are already in $changed_jac
+        #     and are gated here on their own merits; if it did NOT update them, they are unchanged,
+        #     invisible to this baseline-diff stage by design, and caught downstream by the CI-mirror
+        #     [jobs.check] and [jobs.jir] jobs, which run over the repo rather than the diff.
+        #
+        #     Partitioned PER FILE, and swapped/restored per file below, so a theme that mixes
+        #     deletions with modifications gates the modifications normally instead of dying on the
+        #     batch. `${var:+$var }` rather than `$var $f` so the lists carry no leading space --
+        #     the old form put one into the ns_die message and into every `check` argv.
+        branch_jac=""
+        deleted_jac=""
         for f in $changed_jac; do
-            git -C "$REPO" cat-file -e "$NS_REPO_DEFAULT_BRANCH:$f" 2>/dev/null && main_jac="$main_jac $f"
+            if git -C "$REPO" cat-file -e "HEAD:$f" 2>/dev/null; then
+                branch_jac="${branch_jac:+$branch_jac }$f"
+            else
+                deleted_jac="${deleted_jac:+$deleted_jac }$f"
+            fi
         done
-        if [ -n "$main_jac" ]; then
+        case "$deleted_jac" in
+            "") : ;;
+            *)  ns_log S4 "jac check: deleted on this branch, so excluded from both sides of the baseline diff: $deleted_jac" ;;
+        esac
+        # branch side (the branch is checked out). Deliberately truncated first: a branch whose ONLY
+        # .jac change is a deletion has nothing to check, and $br must then be empty rather than
+        # stale from a previous branch in the same night's $LOG_DIR.
+        rm -rf "$REPO/.jac"
+        : > "$br"
+        case "$branch_jac" in
+            "") : ;;
+            # shellcheck disable=SC2086  # word-split into per-file args; jac paths have no spaces
+            *)  ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $branch_jac ) > "$br" 2>&1 || true ;;
+        esac
+        # main side: of the files that still exist on the branch, only those that also exist on main
+        # (new-on-branch files have no baseline -> their errors all count as new). Restore just those
+        # files to main content, check, then put back.
+        main_jac=""
+        for f in $branch_jac; do
+            if git -C "$REPO" cat-file -e "$NS_REPO_DEFAULT_BRANCH:$f" 2>/dev/null; then
+                main_jac="${main_jac:+$main_jac }$f"
+            fi
+        done
+        case "$main_jac" in
+            "") : > "$mr" ;;
+            *)
             # Both checkouts are `|| ns_die` for the same errexit-is-suspended reason as the branch
             # checkout at the top of this function, and each has its own did-not-run failure mode:
             #   * a failed SWAP-TO-MAIN leaves branch content in place, so `$mr` is captured from
@@ -337,18 +437,22 @@ verify_branch() {
             #   * a failed RESTORE leaves MAIN's content for those files in the working tree, so
             #     every stage below (fmt/check/jir, the test suites, pre-commit, contribution)
             #     gates main instead of the branch, and the branch ships ungated.
-            # shellcheck disable=SC2086
-            git -C "$REPO" checkout "$NS_REPO_DEFAULT_BRANCH" -- $main_jac \
-                || ns_die "$EX_BUG" "could not restore $NS_REPO_DEFAULT_BRANCH content for the jac-check baseline side ($main_jac) in $REPO. The main-side capture would have been taken from BRANCH content, making 'no NEW type errors' impossible to violate."
+            # Per file, so the message names the ONE path that failed instead of the whole batch.
+            # Every path in $main_jac exists on both sides by construction (the two cat-file probes
+            # above), so neither checkout has a "cannot express this" case left.
+            for f in $main_jac; do
+                git -C "$REPO" checkout "$NS_REPO_DEFAULT_BRANCH" -- "$f" \
+                    || ns_die "$EX_BUG" "could not swap $f to $NS_REPO_DEFAULT_BRANCH content for the jac-check baseline side in $REPO. The main-side capture would have been taken from BRANCH content, making 'no NEW type errors' impossible to violate."
+            done
             rm -rf "$REPO/.jac"
             # shellcheck disable=SC2086
             ( cd "$REPO" && "$NS_PATHS_JAC_REPO" check $main_jac ) > "$mr" 2>&1 || true
-            # shellcheck disable=SC2086
-            git -C "$REPO" checkout HEAD -- $main_jac \
-                || ns_die "$EX_BUG" "could not restore BRANCH content for $main_jac in $REPO after the jac-check baseline side. Every remaining gate stage would have run against $NS_REPO_DEFAULT_BRANCH's version of those files."
-        else
-            : > "$mr"
-        fi
+            for f in $main_jac; do
+                git -C "$REPO" checkout HEAD -- "$f" \
+                    || ns_die "$EX_BUG" "could not restore BRANCH content for $f in $REPO after the jac-check baseline side. Every remaining gate stage would have run against $NS_REPO_DEFAULT_BRANCH's version of those files."
+            done
+            ;;
+        esac
         # Same did-not-run hole as the test gate, on this stage. Both `jac check` invocations above
         # end in `|| true` -- legitimately, since the checker exits 1 whenever the file has any
         # error -- which discards the difference between "ran, exit 1, found errors" and "never
@@ -358,10 +462,15 @@ verify_branch() {
         # an `N passed|failed in Xs` summary, a missing binary exits 127 and prints none.
         # The main side is asserted only when it actually ran: `$mr` is deliberately left EMPTY
         # when no changed file exists on main (every branch error is then correctly new).
-        assert_check_ran "$branch" "$br" "branch"
+        # The BRANCH side is asserted on the same terms, for the same reason: a branch whose only
+        # .jac change is a DELETION has an empty $branch_jac, so `check` was correctly never
+        # invoked and `$br` is legitimately empty. Asserting it there would kill exactly the night
+        # this stage was fixed to survive; NOT asserting it whenever $branch_jac is non-empty would
+        # re-open the did-not-run hole the guard exists for. Keyed off the argv, never off the file.
+        case "$branch_jac" in "") : ;; *) assert_check_ran "$branch" "$br" "branch" ;; esac
         case "$main_jac" in "") : ;; *) assert_check_ran "$branch" "$mr" "main" ;; esac
         if ! ns_jac checkgate gate "$mr" "$br"; then
-            verify_red "$branch" "jac check: new type errors vs main (see $(basename "$br"))"
+            verify_red "$branch" "jac check: new type errors vs main (see $(basename "$br"))" "$on_red"
             return 1
         fi
     fi
@@ -409,7 +518,7 @@ verify_branch() {
             0) : ;;
             "$EX_MIRROR_READ")
                 ns_die "$EX_BUG" "CI mirror job '$fastjob' returned $EX_MIRROR_READ: either config/ci-mirror.toml could not be read, or the job could not compute a merge-base against '$NS_REPO_DEFAULT_BRANCH'. Both are harness faults that would fail identically for every queued branch, so $branch is not being blamed for it (see $(basename "$mrr"))." ;;
-            *)  verify_red "$branch" "CI mirror job '$fastjob' red (see $(basename "$mrr"))"
+            *)  verify_red "$branch" "CI mirror job '$fastjob' red (see $(basename "$mrr"))" "$on_red"
                 return 1 ;;
         esac
     done
@@ -476,7 +585,7 @@ verify_branch() {
                 continue
             fi
             if [ "$rc" -ne 0 ]; then
-                verify_red "$branch" "$suite: new test failures vs baseline (2 runs; see $(basename "$raw"))"
+                verify_red "$branch" "$suite: new test failures vs baseline (2 runs; see $(basename "$raw"))" "$on_red"
                 return 1
             fi
         fi
@@ -504,7 +613,7 @@ verify_branch() {
             assert_suite_ran "$suite" "$raw" "$srr" "collection retry"
             ns_jac testgate collection-check "$suite" "$raw" "$BASELINE_DIR"; rc=$?
             if [ "$rc" -eq 1 ]; then
-                verify_red "$branch" "$suite: collected far fewer tests than the baseline on 2 runs — the suite did not run to completion, so its unreached tests cannot be read as passing (check the branch for an import error, or the environment for missing suite dependencies; see $(basename "$raw"))"
+                verify_red "$branch" "$suite: collected far fewer tests than the baseline on 2 runs — the suite did not run to completion, so its unreached tests cannot be read as passing (check the branch for an import error, or the environment for missing suite dependencies; see $(basename "$raw"))" "$on_red"
                 return 1
             fi
         fi
@@ -528,7 +637,7 @@ verify_branch() {
         git add -A
         git diff --cached --quiet || git commit -m "style: pre-commit autofix (nightshift)"
         if ! ns_precommit run --all-files; then
-            verify_red "$branch" "pre-commit red"
+            verify_red "$branch" "pre-commit red" "$on_red"
             return 1
         fi
     fi
@@ -590,7 +699,7 @@ verify_branch() {
                 *validate_docs_code*|*BUN_VERSION*)
                     ns_warn "$(basename "$branch"): the contribution job failed on a WHOLE-REPO check, not a branch-scoped one ($CIMIRROR_FAILED_CMD). If every branch reds here tonight the cause is upstream, not the branches — verify it against main before letting a second night auto-reject their findings." ;;
             esac
-            verify_red "$branch" "CI mirror job 'contribution' red (see $(basename "$cj"))"
+            verify_red "$branch" "CI mirror job 'contribution' red (see $(basename "$cj"))" "$on_red"
             return 1 ;;
     esac
 
@@ -637,8 +746,20 @@ verify_branch() {
         *)  mirror_line="$mirror_line · mirror not applicable:${mirror_skipped} (no .jac files to check)" ;;
     esac
 
-    local check_line="jac check ✓" tests_line
-    case "$changed_jac" in "") check_line="jac check (no .jac files changed)" ;; esac
+    # Keyed off $branch_jac, the list `check` was actually handed, NOT off $changed_jac. A branch
+    # that only DELETES .jac files has a non-empty $changed_jac and an empty $branch_jac, so the
+    # checker never ran -- and "jac check ✓" in the PR body would be this project's dominant defect
+    # in the one line that leaves the repo. Same reasoning as the mirror line above.
+    local check_line tests_line
+    if [ -z "$changed_jac" ]; then
+        check_line="jac check (no .jac files changed)"
+    elif [ -z "$branch_jac" ]; then
+        check_line="jac check (only deletions: $deleted_jac — nothing left to check)"
+    elif [ -n "$deleted_jac" ]; then
+        check_line="jac check ✓ · not checked (deleted on branch): $deleted_jac"
+    else
+        check_line="jac check ✓"
+    fi
     case "$suites" in
         "") tests_line="tests (no suite covers this change)" ;;
         *)  case "$gated" in
@@ -659,8 +780,17 @@ verify_branch() {
 }
 
 verify_red() {
-    local branch=$1 why=$2 fp why_sane
+    local branch=$1 why=$2 on_red="${3:-demote}" fp why_sane
     ns_fail "$branch" "$why"
+    case "$on_red" in
+        report)
+            # S1.6's re-gate of an already-open PR. No ledger write (attempts must not move -- an
+            # upstream-introduced red would otherwise auto-reject every finding in the ledger after
+            # two nights) and no branch delete (the branch is an open PR's head upstream; deleting
+            # it locally is pointless and deleting it at all would orphan the PR).
+            ns_log S1.6 "$branch: gate red, reported only — no attempt counter moved, branch kept"
+            return 0 ;;
+    esac
     # reason goes into a JSON literal: strip the two characters that could break it
     why_sane="$(printf '%s' "$why" | tr -d '"\\')"
     # findings on this branch become failed_verify (attempts++; auto-rejected after 2, TPRD S3-B)

@@ -3,28 +3,38 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.nightshift</string>
-  <!-- macOS TCC hangs (never errors, blocks forever in `open`/`getcwd`) any HEADLESS background
-       daemon -- launchd LaunchAgent, no WindowServer session -- that touches an external volume,
-       across every process identity it forks (jac's python, git, claude, ...), not just the first.
-       Full Disk Access on individual binaries doesn't scale to a whole toolchain. Fix: have launchd
-       ask Terminal.app to run the script instead of running it directly. A real Terminal session is
-       NOT subject to this restriction (same reason a manual `bin/nightshift.sh run` from an
-       interactive terminal always worked fine) -- osascript's automation of Terminal needs a
-       one-time "Allow" click the first time this fires. -->
+  <!-- Direct invocation. The osascript -> Terminal.app indirection this replaces existed for ONE
+       reason: macOS TCC hangs (blocks forever in open()/getcwd(), never errors) any headless
+       launchd agent that touches an EXTERNAL VOLUME, across every identity it forks (jac's python,
+       git, claude, ...), and Full Disk Access on individual binaries does not scale to a whole
+       toolchain. The harness now lives under $HOME, which is not TCC-protected, so the cause is
+       gone and the workaround goes with it.
+       DO NOT transplant this plist back onto an external volume. If the tree ever moves back,
+       restore the osascript form from git history -- and read bin/nightshift.sh's ns_run() comment
+       first: its self-caffeinate and self-timebox children are FORKED, NEVER EXEC'D, and in that
+       order, for TCC reasons that are INDEPENDENT of the volume and still load-bearing here.
+       `date +%F >> nightshift-fired.log` stays: it is the ONLY record that distinguishes "launchd
+       fired and the run died" from "launchd never fired" (lib/preflight.sh). It runs BEFORE the
+       exec so the line lands even if nightshift.sh dies at line 1. -->
   <key>ProgramArguments</key><array>
-    <string>/usr/bin/osascript</string>
-    <!-- Dated fire log on internal disk (no TCC): lets preflight detect a fire that never became
-         a run. launchd's own exit code only measures osascript and is useless for that. -->
-    <string>-e</string>
-    <string>do shell script "date +%F >> $HOME/Library/Logs/nightshift-fired.log"</string>
-    <string>-e</string>
-    <string>tell application "Terminal" to do script "/Volumes/ExtremePro/JaseciLabs/NightShift/bin/nightshift.sh run; exit"</string>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>date +%F &gt;&gt; "$HOME/Library/Logs/nightshift-fired.log"; exec "$HOME/nightshift/bin/nightshift.sh" run</string>
   </array>
+  <!-- 23:00 -> 07:00. [budgets].wallclock_min = 480 is the other half of this window; see the
+       comment there. bin/test-harness.sh section 24 asserts the two agree. -->
   <key>StartCalendarInterval</key><dict>
-    <key>Hour</key><integer>2</integer><key>Minute</key><integer>0</integer>
+    <key>Hour</key><integer>23</integer><key>Minute</key><integer>0</integer>
   </dict>
-  <!-- These are opened BY LAUNCHD before spawning osascript, so they must live on internal disk.
-       The harness's own detailed logs still go to the volume as always. -->
+  <key>EnvironmentVariables</key><dict>
+    <!-- launchd's minimal PATH is the #1 documented cause of silent failures (TPRD row 15) -->
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <!-- Kept in ~/Library/Logs beside the fired log: one directory to look in when a night vanishes,
+       and no dependency on a gitignored logs/ dir existing before the first fire. Unlike the
+       osascript form, these now capture nightshift.sh's OWN output, and launchd's recorded exit
+       status is now the harness's exit code rather than osascript's. No RunAtLoad: loading the
+       agent must not start a night. -->
   <key>StandardOutPath</key><string>/Users/ayush/Library/Logs/nightshift-launchd.out</string>
   <key>StandardErrorPath</key><string>/Users/ayush/Library/Logs/nightshift-launchd.err</string>
 </dict></plist>
