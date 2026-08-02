@@ -100,7 +100,8 @@ flowchart TD
         PJSON{"parse_result merge · any shard produced valid findings JSON?"}
         DEAD["a session that DIED is a dead lens · never salvaged into 0 findings"]
         SEL["selector · drop ledger-known / protected / blocked-by-protected-test / twice-failed · score · group by file+dir · pack at most 15 themes · fit clock"]
-        APPLY["per theme · fresh branch · fresh claude -p APPLY · acceptEdits · scoped tools · NO push/gh/network"]
+        BASE["pick the base · a theme sharing a file with one already applied tonight stacks on it, else main"]
+        APPLY["per theme · branch cut from that base · fresh claude -p APPLY · acceptEdits · scoped tools · NO push/gh/network"]
         MODEL{"complexity routes attempt 1"}
         RJSON{"report JSON ok and diff non-empty?"}
         FRAG["release-note fragment 0000.kind.md · ledger upsert-theme · green queue"]
@@ -108,7 +109,7 @@ flowchart TD
         S3A --> CARRY --> S3B --> SHARD --> AUDIT --> PJSON
         AUDIT -.->|"unfinished:*"| DEAD
         PJSON -->|"no · nothing ships tonight"| S4
-        PJSON -->|"yes"| SEL --> APPLY --> MODEL
+        PJSON -->|"yes"| SEL --> BASE --> APPLY --> MODEL
         MODEL -->|"trivial / mechanical"| SONNET["Sonnet"]
         MODEL -->|"judgement"| OPUS["Opus"]
         SONNET --> RJSON
@@ -124,7 +125,8 @@ flowchart TD
 
     subgraph S4["S4 · Verify gate · fail-closed · per queued branch · cheap jobs first"]
         direction TB
-        SCOPE{"scope contained? · diff subset of theme files + fragment · protected globs rejected unless the TASK carries protect_unless"}
+        VB{"resolve the base · logs, then drafts, then main · parent gone = cascade red"}
+        SCOPE{"scope contained? · diff FROM THE BASE subset of theme files + fragment · protected globs rejected unless the TASK carries protect_unless"}
         CHK{"jac check baseline-diff ok? · new errors vs main only · deleted .jac excluded from both sides"}
         FAST{"CI mirror fast jobs · fmt diff-scoped · check · jir · seconds"}
         TST{"mirrored CI suites per gated suite · baseline-diff · one retry each"}
@@ -133,6 +135,8 @@ flowchart TD
         RAN{"POSITIVE assertion · did the suite / the checker actually RUN?"}
         DISCARD["delete branch · ledger failed_verify++ · failed.tsv"]
         GREEN["green.tsv · record tests line · tune verify_estimate"]
+        VB -->|"parent deleted"| DISCARD
+        VB -->|"resolved"| SCOPE
         SCOPE -->|"no · possible injection"| DISCARD
         SCOPE -->|"yes"| CHK
         CHK -->|"no"| DISCARD
@@ -154,15 +158,20 @@ flowchart TD
         direction TB
         PUSH["git push fork · explicit refspec · nightshift/* only · never force"]
         DRAFT["render_draft · drafts/DATE--slug.md"]
+        STK{"stacked on another branch?"}
+        HELD["branch pushed and drafted · PR HELD · prs.jsonl says held-behind-parent · promote opens it once the parent merges"]
         PR5["gh pr create --draft --repo upstream · POSITIVE assert on rc AND a URL-shaped result"]
         REN["rename fragment 0000 to PR-number · push · the PR updates itself"]
         ROW["prs.jsonl row · ledger shipped + pr_url"]
         PUB["commit + push drafts branch and ledger"]
-        PUSH --> DRAFT --> PR5
+        PUSH --> DRAFT --> STK
+        STK -->|"yes"| HELD
+        STK -->|"no"| PR5
         PR5 -->|"no URL"| FAILPR["ns_fail · prs.jsonl row pr-create-failed · other branches continue"]
         PR5 -->|"URL"| REN --> ROW
         ROW --> PUB
         FAILPR --> PUB
+        HELD --> PUB
     end
     PUB --> S6
 
@@ -187,6 +196,7 @@ flowchart TD
     %% data stores
     LEDGER[("state/ledger.jsonl.cache · fingerprint to status")]
     STATE[("state/state.json · cycle_index · verify_estimate · last_merge_poll")]
+    STACK[("logs/DATE/stack.tsv + claims.tsv · branch to base · ORCHESTRATOR-written, never a theme key")]
     SPEND[("logs/DATE/spend.txt · session_id TAB cost · retry-complete")]
     DS[("dataset/*.jsonl · nights · audit_findings · refactors · sessions")]
     DRAFTSB[("nightshift/drafts orphan branch · drafts/*.md + themes/*.json + ledger")]
@@ -194,6 +204,8 @@ flowchart TD
     SEL -.->|read| LEDGER
     FRAG -.->|write| LEDGER
     DROP3 -.->|write| LEDGER
+    BASE -.->|write| STACK
+    VB -.->|read| STACK
     GREEN -.->|tune| STATE
     S3B -.->|advance| STATE
     POLL -.->|stamp| STATE
@@ -223,7 +235,9 @@ flowchart TD
     HM -->|"not this one"| DISC["nightshift.sh discard BRANCH REASON"]
     HM -->|"leave it"| INV["S1.6 rebases and re-gates it every night until it is dealt with"]
 
-    WHERE -->|"no · dry run, network, permissions"| PROM["nightshift.sh promote BRANCH"]
+    WHERE -->|"no · held behind a stack parent"| WAIT["parent merges upstream"]
+    WAIT --> PROM
+    WHERE -->|"no · dry run, network, permissions"| PROM["nightshift.sh promote BRANCH · rebases onto fresh main, which UNSTACKS it"]
     PROM --> DUP{"PR already open?"}
     DUP -->|"yes"| REFUSE["refuse · nothing to promote"]
     DUP -->|"no"| P1["re-sync main · rebase branch on fresh main"]
@@ -335,7 +349,42 @@ flowchart LR
     TH --> JAC & LIB
 ```
 
-## 5. The one defect class this whole design is shaped around
+## 5. Stacked branches
+
+Added 2026-08-02. `[repo].stacked_prs = true`; set it false and the next night is the old
+behaviour, no revert needed.
+
+**The problem.** Themes are grouped by `task + directory`, so one night's *cycle* themes are
+disjoint by construction — a file lives in exactly one directory. The *reactive* pass breaks that:
+it runs all four task lenses over the **same** merged file set, so `dead-code-cli-commands` and
+`abstraction-cli-commands` claim identical files. Branched independently off main, both gate green
+in isolation and then collide upstream — or the second silently reverts the first.
+
+**The mechanism.** When a theme claims a file another theme already claimed tonight, its branch is
+cut from that branch instead of main, and the S4 gate measures its diff from there. Everything else
+is unchanged: a theme sharing nothing with anything still bases on main, which *is* the old
+behaviour, and that remains the overwhelming majority of branches.
+
+The base lives in `logs/<date>/stack.tsv`, orchestrator-written, and is copied to the drafts branch
+so a later night can re-gate the branch. **It is deliberately not a theme key** — the theme is
+agent-authored JSON, and a base is a permission: it decides which part of a diff the scope gate
+treats as already-reviewed. An agent that could name its own base could name a distant ancestor and
+have its entire diff read as inherited. Same reasoning as `[tasks.*].protect_unless`.
+
+**What does *not* move to the base**, on purpose: the jac-check main side, the test baseline, and
+suite routing. The parent passed the same gate, so main is the same answer by a shorter route — and
+where it differs, it differs strictly.
+
+**Two costs, both deliberate.** A stacked child's PR is *held*: GitHub's `--base` must name a branch
+in the repo the PR is opened on, and the parent lives on the fork while the PR belongs upstream.
+Opening it upstream against main would ship a PR whose diff contains the parent's unreviewed work;
+opening it on the fork produces a PR nobody sees. So the branch is pushed, gated, drafted and
+inventoried, and `nightshift.sh promote` — which already re-syncs, rebases onto fresh main and
+re-gates — opens it once the parent merges. And if a parent fails its gate, its children fail with
+it; that is correct, since a child's tree genuinely contains rejected changes, and S4 names the
+parent in the failure line so the cascade is legible.
+
+## 6. The one defect class this whole design is shaped around
 
 **"Did not run, scored as passed."** Eleven-plus instances have been found in this harness, every
 one of them in a gate, none of them caught by a passing test. The cause is always the same: a
@@ -354,8 +403,12 @@ just that it did not fail:
 - `ledger prunable` had this bug from 2026-07-30 to 2026-08-02: the arm demanded five argv where
   there were four, so every call printed usage, exited 0, and pruned nothing. Harness section 38
   now drives the real CLI and asserts a branch comes back.
+- `selector`'s usage arm exited 0 too, and `tier2_select` reads it on stdout — so any arity drift
+  would have produced an empty selection, "no themes tonight", and a night reporting success having
+  shipped nothing. Now exits 2, like `check_scope`.
 
 The sibling class is **assertions that cannot fail**: `( set -e; … ) || fail` is vacuous, a
 `grep -q` can match the comment instead of the code, and a regression test can contain the bug it
 guards. This is why every tripwire in `bin/test-harness.sh` is paired with a mutation that must
-turn it red.
+turn it red — and it earns its keep: section 39's mutation immediately caught that section 39's own
+`grep -A2` was looking *past* the line it was checking, and had been passing vacuously.

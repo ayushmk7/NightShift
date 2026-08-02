@@ -51,14 +51,38 @@ ship_branch() {
     tests_line="$(cat "$LOG_DIR/tests-$slug.txt" 2>/dev/null \
         || echo "gate result unavailable (tests-$slug.txt missing)")"
 
+    # The base this branch was cut from -- main for all but a stacked one. Resolved BEFORE the push
+    # so a vanished parent is fatal here, while nothing is on the fork yet, rather than after a PR
+    # has been opened against a ref that does not exist.
+    # rc 3 (parent gone) cannot happen here -- verify_branch reds such a branch and it never
+    # reaches green.tsv -- so this arm is a tripwire on that invariant, not a handled case.
+    local sbase sb_rc=0
+    sbase="$(ns_base_of_branch "$branch")" || sb_rc=$?
+    case "$sb_rc" in
+        0) : ;;
+        *) ns_die "$EX_BUG" "$branch reached S5 stacked on '$sbase', which does not exist. verify_branch is supposed to have reded it — something between the gate and here deleted the parent, and pushing this branch would ship the parent's unapproved diff under this theme's name." ;;
+    esac
+
+    # A stacked branch's PARENT must exist on the fork before the child's PR can target it. The
+    # parent is pushed by its own ship_branch call, and green.tsv is in apply order, so by
+    # construction that has already happened -- but "by construction" is how this project's
+    # false-greens all started, so it is checked. `ls-remote` and not a local ref: what matters is
+    # what GitHub can see when `gh pr create --base` resolves it.
+    case "$sbase" in
+        "$NS_REPO_DEFAULT_BRANCH") : ;;
+        *) git -C "$REPO" ls-remote --exit-code origin "refs/heads/$sbase" >/dev/null 2>&1 \
+               || ns_die "$EX_BUG" "$branch is stacked on $sbase, which is not on the fork. Its parent was never pushed (it failed the gate, or green.tsv is out of apply order), so a PR against it would 404 — refusing to push the child." ;;
+    esac
+
     # explicit refspec, only nightshift/* refs, never force (threat T3)
     ns_git_push "$REPO" -u origin "refs/heads/$branch:refs/heads/$branch"
 
     # Real added/removed line counts from git itself, not the agent's self-reported loc_before/after
     # (which is a FILE line count, not a diff stat, and was off by a few lines on a real run: agent
     # said +11 net, actual diff was +90/-77). Overrides render()'s loc_before/loc_after args below.
+    # From the BASE, so a stacked branch's draft reports its own churn and not its parent's too.
     local added removed
-    read -r added removed < <(ns_diff_numstat "$REPO" "$NS_REPO_DEFAULT_BRANCH...$branch")
+    read -r added removed < <(ns_diff_numstat "$REPO" "$sbase...$branch")
 
     draft_path="$DRAFTS/drafts/$NS_DATE--$slug.md"
     ns_jac render_draft render "$report" \
@@ -76,6 +100,18 @@ ship_branch() {
         cp "$LOG_DIR/theme-$slug.json" "$DRAFTS/themes/$slug.json"
     fi
 
+    # ...and its base, for exactly the same reason: $LOG_DIR is date-keyed, so S1.6 re-gating this
+    # PR on a later night would find no stack.tsv, resolve the base to main, and read the parent's
+    # diff as this branch's own -- a scope violation reported against an innocent branch. Written
+    # ONLY for a genuinely stacked branch: an absent file is the unambiguous "cut from main", and
+    # writing main here for every branch would make the two cases indistinguishable if the file
+    # ever failed to write. See ns_base_of_branch.
+    case "$sbase" in
+        "$NS_REPO_DEFAULT_BRANCH") : ;;
+        *) mkdir -p "$DRAFTS/stack"
+           printf '%s\n' "$sbase" > "$DRAFTS/stack/$slug" ;;
+    esac
+
     # findings on this branch: drafted (a branch with no ledger rows simply loops zero times)
     local fp
     ns_jac ledger by-branch "$branch" "$LEDGER" | while IFS= read -r fp; do
@@ -88,7 +124,7 @@ ship_branch() {
     # `|| true`: a PR that could not be opened is recorded by ship_open_pr itself (ns_fail +
     # a prs.jsonl row) and must not take the remaining branches down with it. ship_branch is
     # called from a `while read` loop with errexit live.
-    ship_open_pr "$branch" "$draft_path" "$slug" || true
+    ship_open_pr "$branch" "$draft_path" "$slug" "$sbase" || true
 
     ns_log S5 "shipped $branch + draft $(basename "$draft_path")"
 }
@@ -155,7 +191,7 @@ ns_renumber_fragment() {   # <branch> <pr_num> <fragment_path>
 # `nightshift.sh promote <branch>` for this one. The failure is recorded in failed.tsv and in
 # prs.jsonl, both of which the digest renders.
 ship_open_pr() {
-    local branch=$1 draft=$2 slug=$3
+    local branch=$1 draft=$2 slug=$3 pbase="${4:-$NS_REPO_DEFAULT_BRANCH}"
     local title task pr_url pr_num frag fp pr_rc=0
     title="$(ns_jac render_draft meta "$draft" | ns_jac parse_result field title)"
     case "$title" in
@@ -172,6 +208,30 @@ ship_open_pr() {
             task="unknown" ;;
     esac
     ns_jac render_draft body "$draft" > "$LOG_DIR/pr-body-$slug.md"
+
+    # A STACKED CHILD DOES NOT OPEN A PR TONIGHT, and this is the whole reason the base is threaded
+    # down here rather than only into the gate.
+    #
+    # GitHub cannot express what a stacked PR would need: `--base` must name a branch in the repo
+    # the PR is opened on, and the parent lives on the FORK while the PR belongs upstream. The two
+    # ways out are both worse than waiting. Opening the child upstream against main ships a PR whose
+    # diff silently contains the parent's unreviewed work -- exactly the confusion stacking exists to
+    # prevent, wearing the opposite hat. Opening it on the fork instead produces a PR nobody sees:
+    # S1.6's inventory queries upstream, the digest links upstream, and no reviewer is subscribed to
+    # the fork, so it would be a green tick in a room with nobody in it.
+    #
+    # So the branch is pushed, gated, drafted and inventoried -- everything except the PR -- and
+    # `nightshift.sh promote` opens it once the parent has merged. That is not a new mechanism:
+    # promote already re-syncs main, rebases the branch on it, and re-runs the full S4 gate, which
+    # is precisely the "the parent landed, unstack me" operation, and it is already tested.
+    case "$pbase" in
+        "$NS_REPO_DEFAULT_BRANCH") : ;;
+        *) ns_log S5 "$branch is stacked on $pbase — branch pushed and drafted, PR held until the parent merges (nightshift.sh promote $branch)"
+           ship_pr_row 0 "$title" "$task" "" green "held-behind-$pbase" 0
+           # The findings stay `drafted`, NOT `shipped`: no PR exists upstream. That is what keeps
+           # the selector from re-finding them tomorrow while also not claiming they shipped.
+           return 0 ;;
+    esac
 
     pr_url="$(ns_gh_write pr create --repo "$NS_REPO_UPSTREAM" --draft \
         --base "$NS_REPO_DEFAULT_BRANCH" --head "${NS_REPO_FORK%%/*}:$branch" \

@@ -69,6 +69,20 @@ promote_main() {
         demote_branch "$branch" "rebase conflict at promote time"
         ns_die "$EX_SYNC" "rebase conflict — branch downgraded to failed_verify, no stale PR opened"
     fi
+
+    # UNSTACK. The rebase above just moved this branch onto fresh main, so whatever it was stacked
+    # on is no longer its parent: either those commits are in main now (the parent merged, which is
+    # the case promote exists to service for a held child) or the rebase replayed over them.
+    # Leaving the row behind would make the next re-gate measure this branch's diff from a ref that
+    # is no longer an ancestor of it -- `parent...HEAD` would then report every main commit since
+    # the fork point as this branch's own work, and the scope gate would reject it as an injection.
+    # Removed AFTER the rebase succeeds and BEFORE verify_branch runs, which is the only window
+    # where both statements are true.
+    local pslug; pslug="$(basename "$branch")"
+    if [ -f "$DRAFTS/stack/$pslug" ]; then
+        ns_log S7 "$branch was stacked on $(cat "$DRAFTS/stack/$pslug"); rebased onto $NS_REPO_DEFAULT_BRANCH, clearing the stack record"
+        rm -f "$DRAFTS/stack/$pslug"
+    fi
     # Which theme (if any) verify_branch re-gates this branch against. The reasoning that used to
     # live here now lives at ns_theme_for_branch (lib/common.sh), which also looks on the drafts
     # branch -- so promoting on a different calendar day than the run no longer needs the
@@ -130,6 +144,20 @@ discard_main() {
     # need to find out while the branch still exists to retry against. ns_pr_for_branch ns_dies
     # rather than answering "" when the query itself fails, so a dead token can never route us
     # into the "no PR to close" arm and then delete the branch anyway.
+    # Anything stacked on this branch is about to lose its base. Refused rather than warned: the
+    # child's tree contains this branch's commits, so a `promote` on it afterwards would rebase
+    # those onto main and open a PR carrying the very diff that was just discarded, under a
+    # different theme's name. Discard the children first (or promote them, if the work is fine and
+    # only this parent was wrong) and the order sorts itself out.
+    local kids=""
+    if [ -d "$DRAFTS/stack" ]; then
+        kids="$(grep -lxF "$branch" "$DRAFTS/stack/"* 2>/dev/null | while IFS= read -r k; do basename "$k"; done | tr '\n' ' ')"
+    fi
+    case "$kids" in
+        "") : ;;
+        *)  ns_die "$EX_BUG" "$branch is the base of stacked branch(es): $kids. Discarding it would leave them carrying its discarded commits with no base, and a later promote would ship that diff under their name. Discard or promote the children first." ;;
+    esac
+
     pr_num="$(ns_pr_for_branch "$branch")"
     case "$pr_num" in
         "") ns_log S7 "no open PR for $branch — nothing to close upstream" ;;

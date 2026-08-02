@@ -543,15 +543,37 @@ tier2_apply() {
         # made them. (The original rationale named tier-1's autofix as what would sweep them up;
         # tier-1 was retired 2026-07-30 and the discard is now the only thing standing between a
         # killed session and a mislabelled diff, which makes the -f more load-bearing, not less.)
+        # THE BASE. Cut from main unless another theme applied EARLIER TONIGHT already claimed one
+        # of this theme's files, in which case cut from that branch instead -- see ns_base_of_branch
+        # (lib/common.sh) for why stacks exist and why the base is not a theme key.
+        #
+        # Recorded BEFORE the first attempt and never recomputed between attempts: attempt 2 must
+        # land on the same base as attempt 1, or a retry would silently change what the S4 gate
+        # treats as this branch's own diff. `claims.tsv` is appended only after a branch is queued,
+        # so a theme that failed both attempts claims nothing and no later theme stacks on a branch
+        # that does not exist.
+        local base
+        if ns_stacking_on; then
+            base="$(ns_jac selector stack-base "$theme_file" "$LOG_DIR/claims.tsv")" || base=""
+        else
+            base=""
+        fi
+        [ -n "$base" ] || base="$NS_REPO_DEFAULT_BRANCH"
+        ns_stack_record "$branch" "$base"
+        case "$base" in
+            "$NS_REPO_DEFAULT_BRANCH") : ;;
+            *) ns_log S3 "theme $bslug shares a file with $base — stacking on it rather than on $NS_REPO_DEFAULT_BRANCH" ;;
+        esac
+
         got_report=0
         limit_hit=0
         for attempt in 1 2; do
             attempt_model="$(ns_attempt_model "$attempt" "$theme_cx")"
-            ns_log S3 "apply $bslug attempt $attempt on $attempt_model (task=$theme_task, complexity=$theme_cx)"
+            ns_log S3 "apply $bslug attempt $attempt on $attempt_model (task=$theme_task, complexity=$theme_cx, base=$base)"
             cd "$REPO"
             git checkout -f "$NS_REPO_DEFAULT_BRANCH" 2>/dev/null || true
             git branch -D "$branch" 2>/dev/null || true
-            git checkout -B "$branch" "$NS_REPO_DEFAULT_BRANCH"
+            git checkout -B "$branch" "$base"
 
             # </dev/null is load-bearing: claude reads stdin, and stdin here is the slug pipe
             # from `selector split` — without it the first session EATS the remaining themes
@@ -597,8 +619,13 @@ tier2_apply() {
             continue
         fi
 
-        if git diff --quiet "$NS_REPO_DEFAULT_BRANCH...HEAD" 2>/dev/null; then
-            ns_fail "theme $bslug" "agent made no committed changes — branch discarded"
+        # ...against its BASE, not against main. On a stacked branch the parent's diff is present in
+        # the working tree by construction, so a main-relative check would read a branch on which
+        # the agent did nothing at all as one that made changes, ship the parent's work a second
+        # time under this theme's name, and hand the S4 scope gate a diff of files this theme never
+        # declared. Empty-against-base is the only thing that means "the agent did nothing".
+        if git diff --quiet "$base...HEAD" 2>/dev/null; then
+            ns_fail "theme $bslug" "agent made no committed changes on top of $base — branch discarded"
             git checkout -f "$NS_REPO_DEFAULT_BRANCH"; git branch -D "$branch" || true
             continue
         fi
@@ -629,6 +656,15 @@ tier2_apply() {
 
         ns_jac ledger upsert-theme "$theme_file" "$branch" "$LEDGER" >/dev/null
         ns_queue_branch "$branch" "$theme_file" "$LOG_DIR/report-$bslug.json"
+        # Claim this theme's file slots for the rest of the night, AFTER the branch is queued and
+        # therefore known to exist. The slots come from the theme, not from `git diff`: the theme
+        # is the set of files this branch was PERMITTED to touch (it is what check_scope gates
+        # against), and a later theme overlapping a permitted-but-untouched file still has to stack
+        # -- otherwise it starts from main, the parent later edits that file, and the two conflict
+        # exactly as they would have without any of this.
+        if ns_stacking_on; then
+            ns_jac selector claims "$theme_file" "$branch" >> "$LOG_DIR/claims.tsv"
+        fi
         git checkout -f "$NS_REPO_DEFAULT_BRANCH"
     done
 }

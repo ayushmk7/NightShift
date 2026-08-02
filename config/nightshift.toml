@@ -5,6 +5,26 @@ upstream       = "jaseci-labs/jac"          # renamed from jaseci-labs/jaseci
 fork           = "ayushmk7/jaseci"          # <- set at M0
 default_branch = "main"
 
+# STACKED PRs. When two themes in one night claim the same file, base the second on the first and
+# open its PR against that branch instead of main, so the conflict is resolved once by the agent
+# that has the context rather than by a human in a merge box upstream.
+#
+# This is NOT the common case and is not meant to be: one night's CYCLE themes are disjoint by
+# construction (selector.jac group_key is task + DIRECTORY, and a file lives in exactly one
+# directory), so they all keep basing on main and behave exactly as they did before 2026-08-02.
+# The overlap it exists for is the REACTIVE pass, which runs all four task lenses over the SAME
+# merged file set and therefore can produce four themes claiming identical files.
+#
+# false disables the whole mechanism: every base resolves to default_branch and stack.tsv is never
+# consulted. That is the rollback, and it needs no revert -- flip this and the next night is the
+# old behaviour. Branches already stacked upstream keep their recorded base (lib/ship.sh copies it
+# to the drafts branch), so turning this off does not orphan a live stack.
+#
+# WHAT IT COSTS WHEN A PARENT FAILS: its children fail with it. That is correct, not a bug -- a
+# child's diff genuinely contains its parent's unreviewed changes -- but it means one red gate can
+# take a chain down. lib/verify.sh names the parent in the failure line so the cascade is legible.
+stacked_prs    = true
+
 [shards]                                     # whole-repo audit, LOC-balanced. Measured 2026-07-30:
 # compiler 130920 - scale 86566 - jac0core 46711 - runtimelib 40719 - cli 31630 - byllm 16732 -
 # project 4465 - publish 3022 - langserve 1730 - utils 1486 - lsp 1182. ~365k LOC of Jac total.

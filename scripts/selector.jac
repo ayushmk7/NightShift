@@ -290,6 +290,37 @@ def group_key(f: dict) -> str {
     return slugify(str(f["task"]) + "-" + theme_dir(str(f["file"])));
 }
 
+"""Which already-applied branch a theme must be stacked on, given every file slot the night has
+already claimed (`<branch>\\tab<file>` rows, in the order the branches were applied).
+
+Returns the LAST claiming branch, not the first. `claims` is append-ordered, so the last entry is
+the tip of whatever chain already owns these files -- basing on an earlier link would fork the
+stack and reintroduce the conflict stacking exists to remove. Returns "" for no overlap, which
+lib/common.sh's ns_base_of_branch reads as $NS_REPO_DEFAULT_BRANCH: the pre-stacking behaviour, and
+what the overwhelming majority of themes get, since one night's cycle themes are disjoint by
+construction (group_key is task + DIRECTORY, and a file sits in exactly one directory).
+
+The overlap this really exists for is the REACTIVE pass, which runs all four task lenses over the
+same merged file set and therefore produces up to four themes claiming identical files.
+
+Rows that do not split into exactly two fields are SKIPPED, not fatal: this reads a file the
+orchestrator appends to while branches are being applied, and a torn final line must not take the
+night down. A skipped row can only lose a stack edge, never invent one."""
+def stack_base(files: list[str], claims: list[str]) -> str {
+    want: set[str] = set(files);
+    winner: str = "";
+    for line in claims {
+        parts: list[str] = line.split("\t");
+        if len(parts) != 2 {
+            continue;
+        }
+        if parts[1] in want {
+            winner = parts[0];
+        }
+    }
+    return winner;
+}
+
 """The human-facing theme name (the digest's only use of it): the group key with its task prefix
 removed, so a theme reads as `compiler-type-system` rather than repeating the task."""
 def group_name(key: str, task: str) -> str {
@@ -653,11 +684,44 @@ with entry {
                 print(str(theme2["slug"]) + "\t" + str(path));
             }
         }
+    # Which already-applied branch this theme must be stacked on, or nothing for "cut from main".
+    } elif args[1] == "stack-base" and len(args) == 4 if len(args) > 1 else False {
+        with open(args[2], "r") as f {
+            theme3: dict = parse_obj(f.read());
+        }
+        # Absent claims file = the first theme of the night has nothing to stack on. NOT an error,
+        # and specifically not one that should abort: lib/tier2.sh reads this on stdout and would
+        # otherwise take an empty result as "no base" anyway -- but via a nonzero rc under errexit,
+        # which kills the apply loop before a single theme runs.
+        claims: list[str] = [];
+        if os.path.exists(args[3]) {
+            with open(args[3], "r") as f3 {
+                claims = f3.read().splitlines();
+            }
+        }
+        print(stack_base([str(p) for p in as_list(theme3["files"])], claims));
+    # The claims a single applied theme contributes: `<branch>\tab<file>`, the exact shape
+    # stack-base consumes. Sibling of `slots`, which does the same for a whole selection; this one
+    # is per-theme because lib/tier2.sh appends as each branch is queued, not in one batch.
+    } elif args[1] == "claims" and len(args) == 4 if len(args) > 1 else False {
+        with open(args[2], "r") as f {
+            theme4: dict = parse_obj(f.read());
+        }
+        for path2 in as_list(theme4["files"]) {
+            print(args[3] + "\t" + str(path2));
+        }
     } elif len(args) > 1 and args[1] != "test" {
         eprint("usage: ... findings.json | jac run selector.jac select <config.toml> <ledger.jsonl> <state.json> <remaining_min> <repo_dir>");
         eprint("       jac run selector.jac split <selection.json> <outdir>");
         eprint("       jac run selector.jac dropped <selection.json>");
         eprint("       jac run selector.jac slots <selection.json>");
+        eprint("       jac run selector.jac stack-base <theme.json> <claims.tsv>");
+        eprint("       jac run selector.jac claims <theme.json> <branch>");
+        # NONZERO. The sibling arm in check_scope.jac carries the full reasoning (RECONCILIATION
+        # B8); the short version is that lib/tier2.sh reads `selector select` on STDOUT, so a
+        # usage arm exiting 0 turns any future arity drift into an empty selection -- "no themes
+        # tonight" -- and the night reports success having shipped nothing.
+        sys.exit(2);
     }
 }
 
@@ -1106,4 +1170,24 @@ test "the slots reader names every file of every selected theme, and nothing els
     assert rows == ["dead-code-cli\ta.jac", "dead-code-cli\ta.impl.jac", "dead-code-cli-2\tb.jac"];
     # a DROPPED finding's file is not a slot: the S4 gate reads this list as write permission
     assert "never.jac" not in "\n".join(rows);
+}
+
+test "stack_base picks the LAST claimant, and no overlap means main" {
+    claims: list[str] = [
+        "nightshift/d/dead-code-cli\tjac/jaclang/cli/a.jac",
+        "nightshift/d/dead-code-cli\tjac/jaclang/cli/b.jac",
+        "nightshift/d/abstraction-cli\tjac/jaclang/cli/a.jac",
+    ];
+    # the reactive case this feature exists for: a third lens hitting the same file must land on
+    # the TIP of the chain (abstraction-cli), not on the branch that claimed it first
+    assert stack_base(["jac/jaclang/cli/a.jac"], claims) == "nightshift/d/abstraction-cli";
+    # overlap with an EARLIER-only claimant still bases on that one
+    assert stack_base(["jac/jaclang/cli/b.jac"], claims) == "nightshift/d/dead-code-cli";
+    # disjoint -> "" -> ns_base_of_branch resolves it to main, i.e. today's behaviour
+    assert stack_base(["jac/jaclang/scale/z.jac"], claims) == "";
+    assert stack_base([], claims) == "";
+    assert stack_base(["jac/jaclang/cli/a.jac"], []) == "";
+    # a torn final row loses an edge, never invents one and never raises
+    assert stack_base(["jac/jaclang/cli/a.jac"], ["nightshift/d/x"]) == "";
+    assert stack_base(["jac/jaclang/cli/a.jac"], ["", "a\tb\tc"]) == "";
 }

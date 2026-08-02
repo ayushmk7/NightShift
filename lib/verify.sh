@@ -287,7 +287,7 @@ verify_branch() {
     # entire ledger in two nights over something no branch caused. Passed EXPLICITLY to every
     # verify_red below rather than read out of dynamic scope, because bash's dynamic scoping would
     # make this work by accident and then break silently the day a call site moves.
-    local branch=$1 theme=$2 on_red="${3:-demote}" t0 t1
+    local branch=$1 theme=$2 on_red="${3:-demote}" t0 t1 vbase
     t0="$(date +%s)"
     cd "$REPO"
     # `|| ns_die`, NOT bare. verify_branch is only ever invoked as an `if` CONDITION
@@ -301,6 +301,40 @@ verify_branch() {
     git checkout "$branch" || ns_die "$EX_BUG" "could not check out $branch in $REPO -- the gate would otherwise have run against whatever is currently checked out (normally $NS_REPO_DEFAULT_BRANCH) and scored THAT as this branch passing."
     rm -rf "$REPO/.jac"        # `jac clean --cache` prompts [y/N] non-interactively -> aborts; nuke directly
 
+    # WHAT THIS BRANCH ITSELF CHANGED. Normally $NS_REPO_DEFAULT_BRANCH, and identical to the
+    # pre-stacking behaviour; on a stacked branch it is the parent, whose diff is present in the
+    # tree but is NOT this branch's work and was already gated on its own.
+    #
+    # Only the "what did this branch change" questions move to the base. Three deliberately do not:
+    #
+    #   - the jac-check MAIN side (check-main-*.txt below) stays main. The parent passed this same
+    #     gate, so its error set for these files equals main's; keeping main is the same answer by
+    #     a shorter route, and if it ever differs it differs in the strict direction.
+    #   - the test baseline (state/test-baseline, captured from main) stays main, for the same
+    #     reason: a suite the parent reddened would have failed the parent.
+    #   - gated_suites_from_diff stays main, which routes a stacked branch through the parent's
+    #     suites as well as its own. That is a superset -- slower, never laxer -- and one fewer
+    #     place where a wrong ref could quietly narrow what runs.
+    #
+    # ns_base_of_branch dies rather than defaulting when a recorded base has vanished; see its
+    # comment in lib/common.sh for why that must not fall back to main.
+    local vb_rc=0
+    vbase="$(ns_base_of_branch "$branch")" || vb_rc=$?
+    case "$vb_rc" in
+        0) : ;;
+        # THE CASCADE. The parent is gone, which in S4 means it failed its own gate moments ago and
+        # was deleted. This branch was cut from it, so its tree still carries the parent's rejected
+        # changes -- it cannot be gated on its own merits and must not ship. Red, not fatal: there
+        # are more branches in the queue, and one bad theme taking the night with it is the failure
+        # mode this whole file is written against.
+        *) verify_red "$branch" "stacked on $vbase, which no longer exists — the parent failed its gate or was deleted, so this branch carries changes that were never approved" "$on_red"
+           return 1 ;;
+    esac
+    case "$vbase" in
+        "$NS_REPO_DEFAULT_BRANCH") : ;;
+        *) ns_log S4 "$branch is stacked on $vbase — its own diff is measured from there" ;;
+    esac
+
     # 1. scope containment FIRST — reject before spending a second on tests (anti-injection, T1).
     # --name-status (not --name-only): a vestigial test deletion must be a clean delete, never a
     # modification -- the gate needs to see which each changed path actually is.
@@ -309,7 +343,7 @@ verify_branch() {
     if [ "$theme" != "-" ]; then
         local btask
         btask="$(ns_task_of_branch "$branch")" || ns_die "$EX_BUG" "cannot derive a task from branch '$branch': its slug matches no name in [tasks.*]. Refusing to gate it -- with no task there is no permission set to apply, and defaulting to one would either reject every coverage branch or hand every branch the coverage exemption."
-        if ! git diff --name-status "$NS_REPO_DEFAULT_BRANCH...HEAD" \
+        if ! git diff --name-status "$vbase...HEAD" \
                 | ns_jac check_scope check "$theme" "$CONFIG" "$btask" > "$LOG_DIR/scope-violations.txt"; then
             verify_red "$branch" "scope violation (possible prompt injection): $(head -3 "$LOG_DIR/scope-violations.txt" | tr '\n' ' ')" "$on_red"
             return 1
@@ -320,7 +354,7 @@ verify_branch() {
         #     expensive. Applied to EVERY task, not just coverage: the cheapest way for any theme
         #     to turn a red suite green is to delete the assertion.
         local tw_files tw_rc=0 tw_checked=0 tw_f tw_old
-        tw_files="$(git diff --name-status "$NS_REPO_DEFAULT_BRANCH...HEAD" | awk '$1 == "M" { print $2 }')" || tw_rc=$?
+        tw_files="$(git diff --name-status "$vbase...HEAD" | awk '$1 == "M" { print $2 }')" || tw_rc=$?
         case "$tw_rc" in
             0) : ;;
             *) ns_die "$EX_BUG" "could not list modified files for the test-weakening guard (rc=$tw_rc). An empty list here is indistinguishable from 'this branch modified nothing', which is exactly how a weakened test would sail through." ;;
@@ -329,9 +363,9 @@ verify_branch() {
         # word-split is deliberate; repo paths contain no spaces (same assumption as the shard
         # findings list in lib/tier2.sh, and a violation of it fails loudly on the git show below)
         for tw_f in $tw_files; do
-            git -C "$REPO" cat-file -e "$NS_REPO_DEFAULT_BRANCH:$tw_f" 2>/dev/null || continue
+            git -C "$REPO" cat-file -e "$vbase:$tw_f" 2>/dev/null || continue
             tw_old="$LOG_DIR/tw-old-$(printf '%s' "$tw_f" | tr / _)"
-            git -C "$REPO" show "$NS_REPO_DEFAULT_BRANCH:$tw_f" > "$tw_old" \
+            git -C "$REPO" show "$vbase:$tw_f" > "$tw_old" \
                 || ns_die "$EX_BUG" "git show $NS_REPO_DEFAULT_BRANCH:$tw_f failed; the test-weakening guard cannot compare what it cannot read, and skipping it silently is how a weakened test ships."
             if ! ns_jac check_scope weakened "$tw_f" "$tw_old" "$REPO/$tw_f" >> "$LOG_DIR/test-weakening.txt"; then
                 verify_red "$branch" "test weakened: $(grep VIOLATION "$LOG_DIR/test-weakening.txt" | head -2 | tr '\n' ' ')" "$on_red"
@@ -359,7 +393,7 @@ verify_branch() {
     # near the end of this function reads them, and `local x` leaves x UNSET, which `set -u` turns
     # into an immediate shell exit rather than a catchable failure.
     local changed_jac changed_all changed_rc=0 main_jac branch_jac="" deleted_jac="" f br mr
-    changed_all="$(git -C "$REPO" diff --name-only "$NS_REPO_DEFAULT_BRANCH...HEAD")" || changed_rc=$?
+    changed_all="$(git -C "$REPO" diff --name-only "$vbase...HEAD")" || changed_rc=$?
     case "$changed_rc" in
         0) : ;;
         *) ns_die "$EX_BUG" "could not diff $NS_REPO_DEFAULT_BRANCH...HEAD in $REPO (rc=$changed_rc) -- with no reliable file list neither the type-check nor the test gate can run, and an empty list would look like a clean branch." ;;

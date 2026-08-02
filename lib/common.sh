@@ -86,6 +86,83 @@ ns_theme_for_branch() {
     ns_die "$EX_BUG" "no theme file for the agent-written branch $branch (looked in $LOG_DIR/theme-$slug.json and $DRAFTS/themes/$slug.json). Re-gating it with theme '-' would skip verify_branch's scope-containment/anti-injection check — refusing. If the theme exists under some other night's logs/<date>/, copy it to $DRAFTS/themes/$slug.json so every later night can find it."
 }
 
+# --- stacked branches -------------------------------------------------------------------------
+#
+# WHY STACKS EXIST HERE. Themes are grouped by `task + directory` (scripts/selector.jac group_key),
+# which makes a single night's CYCLE themes disjoint by construction -- a file lives in exactly one
+# directory. The REACTIVE pass breaks that: it runs all four task lenses over the SAME merged file
+# set, so `dead-code-cli-commands` and `abstraction-cli-commands` claim identical files. Branched
+# independently off main, as every branch was before 2026-08-02, those two produce PRs that each
+# gate green in isolation and then conflict upstream -- or worse, the second silently reverts the
+# first when both are merged. Stacking bases the second on the first, so the conflict is resolved
+# once, here, by the agent that has the context, instead of by a human in a merge box.
+#
+# WHAT A BASE IS: the branch this branch was cut from and whose diff is therefore NOT its own.
+# Default is $NS_REPO_DEFAULT_BRANCH, which is exactly the pre-stacking behaviour -- an unstacked
+# night writes a stack.tsv whose every base is main and behaves identically.
+#
+# WHERE IT LIVES, AND WHY NOT IN THE THEME: `$LOG_DIR/stack.tsv`, orchestrator-written, one
+# `<branch>\t<base>` row. It is NOT a theme key for the same reason [tasks.*].protect_unless is not
+# one: the theme is agent-authored JSON, and a base is a permission -- it decides which diff the S4
+# scope gate treats as already-reviewed. An agent that could name its own base could name main's
+# most distant ancestor and have its entire diff read as inherited.
+ns_stack_record() {   # <branch> <base>
+    printf '%s\t%s\n' "$1" "$2" >> "$LOG_DIR/stack.tsv"
+}
+
+# scripts/config.jac renders a TOML boolean through Python's str(), so the value that arrives is
+# `True`/`False`, not `true`/`false`. Both spellings are accepted, and ANYTHING ELSE IS OFF --
+# including the unset case, which is what a config predating this key produces. Fail-closed is the
+# right direction here: stacking off is the pre-2026-08-02 behaviour, which is known good.
+ns_stacking_on() {
+    case "${NS_REPO_STACKED_PRS:-}" in
+        True|true|1|yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Resolve a branch's base: tonight's logs first, the drafts branch second, main last -- the same
+# three-step widening as ns_theme_for_branch, and for the same reason. $LOG_DIR is date-keyed, so
+# S1.6 re-gating a PR opened on an earlier night finds nothing in logs; lib/ship.sh copies each
+# row to $DRAFTS/stack/<slug> beside the theme so a later night can still resolve it.
+#
+# A MISSING ROW IS MAIN, A MISSING REF IS rc 3. Those are different failures and must not share an
+# arm. No row means "this branch was never stacked", the overwhelmingly common case, and resolves
+# to $NS_REPO_DEFAULT_BRANCH. A row naming a ref that does not exist means the parent is GONE --
+# it failed the S4 gate and was deleted, or a discard/prune/human removed it -- and silently
+# falling back to main would hand the gate a diff containing the parent's changes as if this branch
+# had made them.
+#
+# WHY rc 3 AND NOT ns_die, WHICH IS THIS PROJECT'S USUAL ANSWER: the commonest way to reach it is a
+# parent that failed its own gate, and that happens DURING S4, mid-loop, with more branches still
+# to gate. Dying there would turn one bad theme into a dead night. So the policy belongs to the
+# caller: verify_branch reds the child (a cascade, which is correct -- the child's diff really does
+# contain unreviewed work), while ship_branch and promote, which run after the gate and cannot
+# meaningfully continue, die. The base name is still PRINTED on rc 3 so the caller can name it.
+ns_base_of_branch() {   # <branch>; rc 0 = usable, rc 3 = recorded base no longer exists
+    local branch=$1 slug base=""
+    slug="$(basename "$branch")"
+    # The flag gates RESOLUTION, not just recording. A branch stacked while the flag was on keeps
+    # its base for the life of that branch (S1.6 re-gates it on later nights, when the flag may
+    # have been flipped off), so the off-switch cannot consult the tables at all -- it must be the
+    # base itself that is forced to main, and only for branches created while it is off. Those two
+    # populations never mix, because a branch created with stacking off has no row to find.
+    if ! ns_stacking_on && [ ! -f "$DRAFTS/stack/$slug" ]; then
+        printf '%s\n' "$NS_REPO_DEFAULT_BRANCH"
+        return 0
+    fi
+    if [ -f "$LOG_DIR/stack.tsv" ]; then
+        base="$(awk -F'\t' -v b="$branch" '$1 == b { print $2 }' "$LOG_DIR/stack.tsv" | tail -1)"
+    fi
+    if [ -z "$base" ] && [ -f "$DRAFTS/stack/$slug" ]; then
+        base="$(cat "$DRAFTS/stack/$slug")"
+    fi
+    [ -n "$base" ] || base="$NS_REPO_DEFAULT_BRANCH"
+    printf '%s\n' "$base"
+    git -C "$REPO" rev-parse --verify --quiet "$base^{commit}" >/dev/null || return 3
+    return 0
+}
+
 # --- logging & night bookkeeping ---
 # NONE of these three may fail. They are called from ns_die -- whose own comment says $LOG_DIR may
 # not exist yet on the earliest failure paths -- and from email_main, which runs inside the EXIT

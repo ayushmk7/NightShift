@@ -1993,6 +1993,11 @@ echo "== 25. jac-check baseline: a branch that DELETES a .jac file must not kill
 CK="$T/checkstage"; mkdir -p "$CK"
 {
     echo 'ns_check_stage() {'
+    # verify_branch resolves this from the stack table before the stage runs (2026-08-02). The
+    # probes here drive the UNSTACKED path -- deletions vs the default branch, which is what this
+    # section is about -- so it defaults to main, while still being settable by a caller that wants
+    # the stacked one. Section 39 owns the stacked assertions.
+    echo '    local vbase="${vbase:-$NS_REPO_DEFAULT_BRANCH}"'
     # step 2 of verify_branch: the whole jac-check baseline-diff stage
     awk '/^    local changed_jac changed_all changed_rc=0/{p=1} /^    # 3\. FAST CI-mirror jobs/{p=0} p' lib/verify.sh
     # ...and the PR-body line it feeds, which is where a mis-keyed summary would claim "jac check ✓"
@@ -3268,5 +3273,119 @@ grep -q 'nightshift/2026-07-01/stale' "$S38/mut-out.txt" \
     && fail "the restored off-by-one STILL emitted the stale branch -- section 38 cannot fail"
 rm -rf .jac
 echo "prunable parses its own argv, and a night with nothing to prune is not a night that never asked"
+
+echo "== 39. stacked branches: the base is resolved, honoured by the gate, and never agent-chosen =="
+# Stacking exists because the REACTIVE pass runs all four task lenses over the SAME merged file
+# set, so `dead-code-cli-commands` and `abstraction-cli-commands` claim identical files. Before
+# 2026-08-02 both branched off main, each gated green in isolation, and then collided upstream.
+S39="$T/stack"; mkdir -p "$S39"
+
+# --- A. resolution order: logs, then drafts, then main -- and a vanished parent is rc 3, not main
+S39R="$S39/repo"; mkdir -p "$S39R"
+git -C "$S39R" init -q -b main
+git -C "$S39R" config user.email t@t; git -C "$S39R" config user.name t
+echo one > "$S39R/a.jac"; git -C "$S39R" add -A; git -C "$S39R" commit -qm one
+git -C "$S39R" branch nightshift/d/parent
+mkdir -p "$S39/log" "$S39/drafts/stack"
+(
+  set +u
+  NS_ROOT="$NS_ROOT"; . "$NS_ROOT/lib/common.sh" 2>/dev/null || true
+  LOG_DIR="$S39/log"; DRAFTS="$S39/drafts"; REPO="$S39R"
+  NS_REPO_DEFAULT_BRANCH=main; NS_REPO_STACKED_PRS=True
+  ns_die() { echo "DIED: $2" >&2; exit 9; }
+
+  [ "$(ns_base_of_branch nightshift/d/lonely)" = "main" ] \
+      || { echo "FAIL: a branch with no stack row did not resolve to main -- every unstacked branch would change behaviour" >&2; exit 1; }
+
+  ns_stack_record nightshift/d/child nightshift/d/parent
+  [ "$(ns_base_of_branch nightshift/d/child)" = "nightshift/d/parent" ] \
+      || { echo "FAIL: tonight's stack.tsv row was not honoured" >&2; exit 1; }
+
+  # drafts is the SECOND lookup: $LOG_DIR is date-keyed, so S1.6 re-gating an older PR finds
+  # nothing in logs. Without this a stacked PR re-gates against main and reads its parent's diff
+  # as its own -- a scope violation reported against an innocent branch.
+  printf 'nightshift/d/parent\n' > "$S39/drafts/stack/older"
+  [ "$(ns_base_of_branch nightshift/d/older)" = "nightshift/d/parent" ] \
+      || { echo "FAIL: the drafts-branch stack record was not consulted; a stacked PR cannot be re-gated on a later night" >&2; exit 1; }
+
+  # a recorded base that no longer exists is rc 3, and the name is still printed
+  ns_stack_record nightshift/d/orphan nightshift/d/ghost
+  set +e; obase="$(ns_base_of_branch nightshift/d/orphan)"; orc=$?; set -e
+  [ "$orc" = 3 ] || { echo "FAIL: a vanished parent returned rc=$orc, not 3 -- the cascade cannot be distinguished from a clean resolve" >&2; exit 1; }
+  [ "$obase" = "nightshift/d/ghost" ] || { echo "FAIL: rc 3 did not print the base name, so no caller can name the missing parent" >&2; exit 1; }
+
+  # the OFF switch: a branch created while stacking was off has no drafts record and must be main
+  NS_REPO_STACKED_PRS=False
+  [ "$(ns_base_of_branch nightshift/d/child)" = "main" ] \
+      || { echo "FAIL: stacked_prs=false still resolved a stack.tsv row; the rollback switch does nothing" >&2; exit 1; }
+  # ...but a branch ALREADY stacked upstream keeps its base, or flipping the flag orphans live PRs
+  [ "$(ns_base_of_branch nightshift/d/older)" = "nightshift/d/parent" ] \
+      || { echo "FAIL: turning stacking off re-based an already-stacked live branch onto main" >&2; exit 1; }
+) || fail "section 39A: base resolution"
+
+# --- B. the picker itself: last claimant wins, disjoint themes stay on main
+printf '{"files":["jac/jaclang/cli/a.jac"]}\n' > "$S39/t-overlap.json"
+printf '{"files":["jac/jaclang/scale/z.jac"]}\n' > "$S39/t-disjoint.json"
+printf 'nightshift/d/dead-code-cli\tjac/jaclang/cli/a.jac\nnightshift/d/abstraction-cli\tjac/jaclang/cli/a.jac\n' > "$S39/claims.tsv"
+[ "$(jac run "$NS_ROOT/scripts/selector.jac" stack-base "$S39/t-overlap.json" "$S39/claims.tsv")" = "nightshift/d/abstraction-cli" ] \
+    || fail "stack-base did not return the TIP of the chain; basing on an earlier link forks the stack and reintroduces the conflict"
+[ -z "$(jac run "$NS_ROOT/scripts/selector.jac" stack-base "$S39/t-disjoint.json" "$S39/claims.tsv")" ] \
+    || fail "a theme sharing no file was given a base -- every cycle theme would stack needlessly and one red would cascade through the whole night"
+# the first theme of the night: no claims file at all must not abort the apply loop
+[ -z "$(jac run "$NS_ROOT/scripts/selector.jac" stack-base "$S39/t-overlap.json" "$S39/nope.tsv")" ] \
+    || fail "an absent claims.tsv did not yield an empty base"
+jac run "$NS_ROOT/scripts/selector.jac" stack-base "$S39/t-overlap.json" "$S39/nope.tsv" >/dev/null 2>&1 \
+    || fail "an absent claims.tsv exited nonzero -- under errexit that kills the apply loop before a single theme runs"
+
+# --- C. the gate measures the branch's OWN diff. This is the assertion that matters: get it wrong
+#        and a stacked child either ships its parent's work or is rejected as an injection.
+grep -q 'vbase="$(ns_base_of_branch "$branch")"' "$NS_ROOT/lib/verify.sh" \
+    || fail "verify_branch no longer resolves a base"
+# -B2 as well as -A2: the scope check's ref sits on the line BEFORE the `check_scope check` anchor
+# (the pipeline is split across two lines), so an -A2-only grep looks past the very thing it is
+# checking and passes on a verify.sh that diffs from main. Caught by this section's own mutation.
+for s39site in 'check_scope check' 'tw_files=' 'changed_all='; do
+    grep -B2 -A2 "$s39site" "$NS_ROOT/lib/verify.sh" | grep -q 'NS_REPO_DEFAULT_BRANCH\.\.\.HEAD' \
+        && fail "verify.sh still diffs '$s39site' from main, not from the branch's base -- a stacked child's scope check would see its parent's files as its own"
+done
+grep -q 'git diff --quiet "$base\.\.\.HEAD"' "$NS_ROOT/lib/tier2.sh" \
+    || fail "the empty-diff check still measures from main; a stacked branch on which the agent did nothing would read as having made changes"
+
+# --- D. a stacked child does NOT open a PR, and the security property holds
+grep -q 'held-behind-' "$NS_ROOT/lib/ship.sh" \
+    || fail "ship_open_pr no longer holds a stacked child; opening it upstream against main ships the parent's unreviewed diff inside it"
+grep -q 'protect_unless\|agent' "$NS_ROOT/lib/common.sh" >/dev/null    # anchor only
+jac run "$NS_ROOT/scripts/check_scope.jac" 2>/dev/null | grep -q 'base' \
+    && fail "check_scope grew a base-related argv -- the base must never be reachable from theme JSON"
+grep -q '"base"\|stack' "$NS_ROOT/scripts/selector.jac" \
+    && grep -q '"base": ' "$NS_ROOT/scripts/selector.jac" \
+    && fail "the selector writes a 'base' key into the theme; an agent-authored base is an agent-authored write permission"
+
+# MUTATION. Point verify_branch's scope check back at main and require C to go red. Without this,
+# C is a set of greps that pass on any file that merely mentions the right words.
+# `[$]`, not a bare `$`: BSD sed reads a bare dollar mid-pattern as an end-anchor, so the obvious
+# spelling matches nothing and builds an identical "mutant" that passes -- an assertion that cannot
+# fail, guarding the assertions that must. Which is why the build itself is checked below.
+# Both spellings, because the three sites do not share one: the scope check and the
+# test-weakening list use --name-status, the gate-routing file list uses --name-only. A mutant that
+# reverted only two of three would leave the third's assertion unproven.
+sed -e 's|name-status "[$]vbase\.\.\.HEAD"|name-status "$NS_REPO_DEFAULT_BRANCH...HEAD"|' \
+    -e 's|name-only "[$]vbase\.\.\.HEAD"|name-only "$NS_REPO_DEFAULT_BRANCH...HEAD"|' \
+    "$NS_ROOT/lib/verify.sh" > "$S39/mutant.sh"
+# Counted on $vbase, not on $NS_REPO_DEFAULT_BRANCH: two sites in verify.sh reference main
+# legitimately and forever (gated_suites_from_diff and the jac-check main side), so an absolute
+# count of the latter measures those too and moves whenever either is edited.
+[ "$(grep -c '"[$]vbase\.\.\.HEAD"' "$NS_ROOT/lib/verify.sh")" = 3 ] \
+    || fail "expected exactly 3 base-relative diffs in verify.sh, found $(grep -c '"[$]vbase\.\.\.HEAD"' "$NS_ROOT/lib/verify.sh") -- a site was added or removed and section 39's mutation no longer covers them all"
+[ "$(grep -c '"[$]vbase\.\.\.HEAD"' "$S39/mutant.sh")" = 0 ] \
+    || fail "the section-39 mutant still has base-relative diffs in it; the mutation proves nothing"
+# The same greps section C ran must now FIND what they refused to find. This is what proved C's
+# original -A2-only spelling vacuous, and it is why the loop below mirrors C exactly.
+for s39site in 'check_scope check' 'tw_files=' 'changed_all='; do
+    grep -B2 -A2 "$s39site" "$S39/mutant.sh" | grep -q 'NS_REPO_DEFAULT_BRANCH\.\.\.HEAD' \
+        || fail "section 39C's grep for '$s39site' cannot fail -- it passes even on a verify.sh that diffs from main"
+done
+rm -rf .jac
+echo "a stacked branch resolves its base, is gated on its own diff alone, cascades when its parent dies, and never opens a PR that hides its parent"
 
 echo "ALL HARNESS TESTS PASSED"
