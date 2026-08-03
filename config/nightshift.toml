@@ -189,7 +189,20 @@ inventory_min      = 120                     # ceiling for S1.6. Re-gating one o
                                               # deliberately NOT clamped to wallclock_min: the
                                               # watchdog in bin/nightshift.sh is the hard stop, and
                                               # two ceilings that can disagree is a drift bug.
-audit_timeout_min  = 20                      # 15 was too tight for the jac core package: 07-18 hit the
+audit_timeout_min  = 30                      # RAISED from 20 on 2026-08-03, and the reason is the SWEEP,
+                                              # not the clock -- no session has ever been killed here.
+                                              # The measured longest audit is still only 9.6 min (the
+                                              # 2026-08-02 sweep) against the old 20-min box. What
+                                              # changed is the JOB: one session now carries three lenses
+                                              # over the same files and emits a correspondingly larger
+                                              # findings array, and that first sweep already needed a
+                                              # repair round for malformed JSON. A timebox is a ceiling
+                                              # on a HANG, and the money is bounded independently by
+                                              # audit_max_budget_usd below, so the only thing this
+                                              # buys a stuck session is 10 more minutes of wall clock
+                                              # against an 8-hour window. Cheap insurance; drop it back
+                                              # to 20 if a night ever runs short of clock.
+                                              # 15 was too tight for the jac core package: 07-18 hit the
                                               # wall twice, 0-byte envelope both times. DELIBERATELY NOT
                                               # RAISED for the new task lenses: the brief said
                                               # compiler-core and compiler-passes came back 0 bytes at
@@ -221,7 +234,26 @@ max_budget_usd     = 5                       # per APPLY session. NOT inert: eve
                                               # from 2026-07-31 reports a real total_cost_usd, and the
                                               # night really cost $76.55. Applies are cheap ($0.28-$2.13
                                               # each, $9.19 for all eleven), so 5 is genuine headroom.
-audit_max_budget_usd = 12                    # per SHARD audit session (the cycle fan-out).
+audit_max_budget_usd = 8                     # per SHARD audit session (the cycle fan-out). LOWERED
+                                              # from 12 on 2026-08-03, to the same number the reactive
+                                              # lens carries.
+                                              #
+                                              # MEASURED, not guessed: the most expensive audit session
+                                              # this harness has ever run is the 2026-08-02 sweep at
+                                              # $5.85 (54 turns); the 2026-07-31 shard audits ran
+                                              # $2.96-$4.69. 8 leaves ~37% headroom over the worst
+                                              # observed and still lets six shards audit inside a $50
+                                              # night.
+                                              #
+                                              # 5 WAS ASKED FOR AND IS NOT WHAT SHIPPED, so the number
+                                              # is worth stating plainly: 5 would have truncated the
+                                              # 2026-08-02 sweep at roughly 85% of the way through, and
+                                              # on 2026-07-31 it would have cut 5 of the 9 audits that
+                                              # succeeded. A truncated audit is not a cheaper audit --
+                                              # it is a paid-for session whose findings are lost, which
+                                              # is the waste this cap exists to prevent. Set it to 5 in
+                                              # this one line if the trade is wanted anyway; the cost is
+                                              # written down here either way.
                                               # NOT 5: the audits that succeeded cost up to $9.77
                                               # (reactive-dead-code, 69 turns, 5 findings), so a 5 here
                                               # would convert five of the nine successful audits into

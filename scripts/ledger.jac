@@ -73,15 +73,31 @@ def prunable_branches(path: str, days: int) -> list[str] {
     return branches;
 }
 
-"""One row per theme finding, stamped with the branch (tier-2 calls this after a green apply)."""
+"""One row per theme finding, stamped with the branch (tier-2 calls this after a green apply).
+
+THE TWO FINDING SCHEMAS. A coverage finding carries `gap_severity` + `est_loc_added` + `test_file`;
+every other task carries `est_loc_saved`. This function hard-indexed `f["est_loc_saved"]` from the
+day the task registry landed, so it raised KeyError on every coverage theme -- and because
+lib/tier2.sh calls it under errexit, that KeyError killed the whole night at S3, before S4 gated
+anything or S5 shipped anything.
+
+It went unseen for four days because no coverage theme had ever survived an apply session before
+2026-08-02. That night it did: two applies ran, $17.42 was spent, and both branches were thrown away
+by a bookkeeping call that could not read one of the two schemas its own selector produces.
+
+`est_loc` therefore reads BOTH keys by name rather than with a blanket `.get(..., 0)`: a finding
+carrying neither is genuinely malformed and should still raise here, where the theme file is on disk
+to inspect, rather than silently banking a zero. nslib.score_of has always handled both -- this
+function simply never asked it."""
 def upsert_theme(path: str, theme: dict, branch: str) -> int {
     n: int = 0;
     for item in as_list(theme["findings"]) {
         f: dict = as_dict(item);
+        est_loc: any = f["est_loc_added"] if "est_loc_added" in f else f["est_loc_saved"];
         row: dict = {
             "fingerprint": f["fingerprint"], "file": f["file"],
             "rule": f["rule"], "summary": f["summary"], "score": f.get("score"),
-            "est_loc_saved": f["est_loc_saved"], "confidence": f["confidence"], "risk": f["risk"],
+            "est_loc_saved": est_loc, "confidence": f["confidence"], "risk": f["risk"],
             "branch": branch,
             # Called only from lib/tier2.sh AFTER the branch is queued, so this is never stamped on
             # a theme whose apply session failed -- those rows stay `new` and are eligible again
@@ -92,6 +108,31 @@ def upsert_theme(path: str, theme: dict, branch: str) -> int {
         };
         upsert(path, row);
         n += 1;
+    }
+    return n;
+}
+
+"""Reset `in_theme` rows left behind by a night that died between the queue and the gate.
+
+`in_theme` means "an apply session produced a branch and S4 has not ruled yet", so it is only ever
+legitimate WITHIN the night that wrote it: by the end of that night verify_red has written
+failed_verify or ship has written drafted/shipped. A row still in_theme on a later day describes a
+branch that will never be ruled on -- and because scripts/selector.jac treats in_theme as terminal,
+that finding would be suppressed forever, invisible and unbuyable.
+
+Not hypothetical. On 2026-08-02, the first live night, S3 died mid-apply and left four such rows.
+The code comment introducing in_theme named this exact case as "the one way to get stuck"; this is
+that comment's other half, so the stuck state heals on the next sync instead of needing a human.
+
+Returns the number reset. The branch is kept on the row: it is evidence of what happened, and
+prunable_branches only looks at shipped/rejected."""
+def reap_stale_in_theme(path: str) -> int {
+    n: int = 0;
+    for (fp, row) in load_ledger(path).items() {
+        if str(row.get("status", "")) == "in_theme" and str(row.get("last_seen", "")) != today() {
+            set_status(path, fp, "new", {"reaped_from": "in_theme"});
+            n += 1;
+        }
     }
     return n;
 }
@@ -143,6 +184,8 @@ with entry {
             theme: dict = parse_obj(f.read());
         }
         print(upsert_theme(args[4], theme, args[3]));
+    } elif cmd == "reap" and len(args) == 3 {
+        print(reap_stale_in_theme(args[2]));
     } elif cmd == "by-branch" and len(args) == 4 {
         for fp in by_branch(args[3], args[2]) {
             print(fp);
@@ -162,6 +205,7 @@ with entry {
         eprint("       jac run ledger.jac tally <ledger.jsonl>");
         eprint("       jac run ledger.jac prunable <days> <ledger.jsonl>");
         eprint("       jac run ledger.jac upsert-theme <theme.json> <branch> <ledger.jsonl>");
+        eprint("       jac run ledger.jac reap <ledger.jsonl>");
         eprint("       jac run ledger.jac by-branch <branch> <ledger.jsonl>");
         eprint("       jac run ledger.jac state-get <key> <state.json>");
         eprint("       jac run ledger.jac state-set <key> <value> <state.json>");
@@ -220,4 +264,30 @@ test "state roundtrip" {
     state["verify_estimate_min"] = 7;
     state_write(path, state);
     assert state_read(path)["verify_estimate_min"] == 7;
+}
+
+test "reap frees in_theme rows a dead night stranded, and leaves today's alone" {
+    import tempfile;
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tf {
+        path: str = tf.name;
+    }
+    stale: str = fingerprint("a/b.jac", "dead-code");
+    fresh: str = fingerprint("c/d.jac", "dead-code");
+    upsert(path, {"fingerprint": stale, "file": "a/b.jac", "rule": "dead-code", "summary": "s"});
+    upsert(path, {"fingerprint": fresh, "file": "c/d.jac", "rule": "dead-code", "summary": "s"});
+    set_status(path, stale, "in_theme", {"last_seen": "2026-08-02"});   # a night that died
+    set_status(path, fresh, "in_theme", {});                            # tonight, still in flight
+    assert reap_stale_in_theme(path) == 1;
+    rows: dict[str, dict] = load_ledger(path);
+    # the stranded one is buyable again...
+    assert rows[stale]["status"] == "new";
+    assert rows[stale]["reaped_from"] == "in_theme";
+    # ...and the branch is kept as evidence of what happened
+    assert "branch" not in rows[stale] or rows[stale]["branch"] is not None;
+    # ...while a row from THE CURRENT night is untouched: reaping it mid-flight would let the cycle
+    # phase re-buy a finding the reactive pass is applying right now, which is the exact duplicate
+    # this status exists to prevent.
+    assert rows[fresh]["status"] == "in_theme";
+    # idempotent: a second sweep finds nothing left to do
+    assert reap_stale_in_theme(path) == 0;
 }

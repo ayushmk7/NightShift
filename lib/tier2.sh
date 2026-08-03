@@ -690,8 +690,22 @@ tier2_apply() {
             ns_log S3 "theme $bslug touches no jac/jaclang/ path — no fragment required"
         fi
 
-        ns_jac ledger upsert-theme "$theme_file" "$branch" "$LEDGER" >/dev/null
+        # QUEUE FIRST, BOOKKEEPING SECOND, AND THE BOOKKEEPING CANNOT KILL THE NIGHT.
+        #
+        # On 2026-08-02 these were the other way round and the ledger call was fatal. upsert_theme
+        # raised KeyError on a coverage finding's schema, tier2_apply is under errexit, and S3 died
+        # holding two finished apply sessions -- $17.42 of work, two committed branches -- that S4
+        # never gated and S5 never shipped. The schema bug is fixed in scripts/ledger.jac, but the
+        # SHAPE is the real defect: a bookkeeping write was standing between finished work and the
+        # gate that ships it, and any future failure in it would do the same thing again.
+        #
+        # ns_queue_branch is what makes the work reachable, so it goes first and stays fatal. The
+        # ledger row is how tomorrow avoids re-buying this finding: losing it costs one duplicate
+        # audit, which is strictly cheaper than losing the night. Loud, never silent -- a missing
+        # row means the dedup in scripts/selector.jac will not fire for these fingerprints.
         ns_queue_branch "$branch" "$theme_file" "$LOG_DIR/report-$bslug.json"
+        ns_jac ledger upsert-theme "$theme_file" "$branch" "$LEDGER" >/dev/null \
+            || ns_fail "theme $bslug" "ledger upsert-theme failed — the branch is queued and will still be gated and shipped, but its findings carry no in_theme row, so a later phase or night may re-buy them"
         # Claim this theme's file slots for the rest of the night, AFTER the branch is queued and
         # therefore known to exist. The slots come from the theme, not from `git diff`: the theme
         # is the set of files this branch was PERMITTED to touch (it is what check_scope gates

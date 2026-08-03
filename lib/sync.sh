@@ -25,7 +25,22 @@ sync_main() {
     done
 
     # refresh the local ledger cache from the drafts branch (source of truth lives in the fork)
+    #
+    # WORTH KNOWING BEFORE EDITING THE CACHE BY HAND: this line makes state/ledger.jsonl.cache a
+    # CACHE in the strict sense. A repair applied there and not to $DRAFTS/ledger.jsonl survives
+    # exactly until the next night's S1, which silently overwrites it. That happened on 2026-08-02.
     [ -f "$DRAFTS/ledger.jsonl" ] && cp "$DRAFTS/ledger.jsonl" "$LEDGER"
+
+    # Heal `in_theme` rows stranded by a night that died between the queue and the gate. Such a row
+    # names a branch S4 will never rule on, and scripts/selector.jac treats in_theme as terminal --
+    # so without this the finding is suppressed forever. Runs AFTER the refresh so it also heals
+    # rows that arrive from the drafts branch, and its result is copied back at S5.
+    local reaped
+    reaped="$(ns_jac ledger reap "$LEDGER")" || reaped=""
+    case "$reaped" in
+        ""|0) : ;;
+        *) ns_log S1 "reaped $reaped stale in_theme row(s) from a night that never reached its gate — those findings are eligible again" ;;
+    esac
     return 0
 }
 

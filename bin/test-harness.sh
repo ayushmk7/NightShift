@@ -2622,7 +2622,7 @@ fi
 rm -rf .jac
 echo "the reactive window is 40 auditable .jac files: no changelog, no docs, no scripts, no protected tests"
 
-echo "== 31. the audit money cap is per CALLER, because the two callers cost 2.2x apart =="
+echo "== 31. the audit money cap is per CALLER, and the reactive pass cannot starve the fan-out =="
 # 2026-07-31: four reactive lenses cost $28.72 over 207 turns ($0.139/turn) and eight cycle shards
 # cost $38.36 over 601 turns ($0.0638/turn). One audit_max_budget_usd served both, so raising
 # audit_max_turns to 130 let a lens reach $12 at ~turn 86 -- four lenses billing $48 of a $50 night
@@ -2663,46 +2663,64 @@ esac
 case "$shard_cap" in
     "") fail "the shard audit was started with no --max-budget-usd at all: $(tr '\n' ' ' < "$S31/out.txt")" ;;
 esac
-[ "$react_cap" = "8" ] \
-    || fail "a reactive lens was capped at \$$react_cap, not the \$8 [budgets].reactive_audit_max_budget_usd declares"
-[ "$shard_cap" = "12" ] \
-    || fail "a shard audit was capped at \$$shard_cap, not the \$12 [budgets].audit_max_budget_usd declares"
-
-# THE REGRESSION ITSELF, as an inequality rather than as two constants: whatever the numbers become,
-# four reactive lenses must not be able to bill the whole night before a shard can be scheduled.
+# Read the expected numbers OUT OF THE CONFIG rather than pinning literals. A literal here is an
+# assertion about today's budget, not about the mechanism -- section 22 had the same shape and
+# reddened the moment a flag moved. What this section is for is that each caller gets ITS OWN
+# number, and the mutation controls below are what actually prove that.
 react_num="$(sed -n 's/^reactive_audit_max_budget_usd *= *\([0-9][0-9]*\).*/\1/p' config/nightshift.toml | head -1)"
 shard_num="$(sed -n 's/^audit_max_budget_usd *= *\([0-9][0-9]*\).*/\1/p' config/nightshift.toml | head -1)"
 night_num="$(sed -n 's/^night_budget_usd *= *\([0-9][0-9]*\).*/\1/p' config/nightshift.toml | head -1)"
 case "$react_num.$shard_num.$night_num" in
     *[!0-9.]*|.*|*..*|*.) fail "could not read the three budget numbers out of config/nightshift.toml (got '$react_num' '$shard_num' '$night_num')" ;;
 esac
-[ "$react_num" -lt "$shard_num" ] \
-    || fail "reactive_audit_max_budget_usd ($react_num) is not below audit_max_budget_usd ($shard_num); a reactive turn costs 2.2x a shard turn, so an equal cap starves the fan-out"
-[ "$(( react_num * 4 ))" -lt "$night_num" ] \
-    || fail "four reactive lenses at \$$react_num is \$$(( react_num * 4 )), which reaches the \$$night_num night ceiling on its own -- the cycle shards would never be scheduled"
+[ "$react_cap" = "$react_num" ] \
+    || fail "a reactive lens was capped at \$$react_cap, not the \$$react_num [budgets].reactive_audit_max_budget_usd declares"
+[ "$shard_cap" = "$shard_num" ] \
+    || fail "a shard audit was capped at \$$shard_cap, not the \$$shard_num [budgets].audit_max_budget_usd declares"
 
-# THE MUTATION CONTROL: with the two numbers made equal in the config, the probe must report the
-# SAME cap for both callers. Without this arm every assertion above is satisfied by a
-# tier2_audit_shard that ignores the name and reads one number, which is what it did before.
-sed 's/^reactive_audit_max_budget_usd = 8/reactive_audit_max_budget_usd = 12/' config/nightshift.toml > "$S31/same.toml"
-grep -q '^reactive_audit_max_budget_usd = 12' "$S31/same.toml" \
-    || fail "the equal-caps mutant config was not built; the comparison below proves nothing"
+# THE STARVATION REGRESSION, stated as what it actually is rather than as `react < shard`.
+#
+# That inequality was a PROXY, and on 2026-08-03 the proxy broke while the property held: both caps
+# became 8, and a proxy that fails on equal-but-safe numbers is an assertion about the budget, not
+# about starvation. The real property is that the reactive pass cannot bill the night ceiling before
+# the cycle fan-out is scheduled -- and how many reactive sessions there are now depends on
+# [budgets].reactive_single_session, so the count is derived, not assumed.
+if ( . "$NS_ROOT/lib/common.sh"; ns_load_config; ns_reactive_sweep_on ); then
+    react_n=2      # the sweep, plus coverage on its own session
+else
+    react_n=4      # one per task lens
+fi
+[ "$(( react_num * react_n ))" -lt "$night_num" ] \
+    || fail "$react_n reactive session(s) at \$$react_num is \$$(( react_num * react_n )), which reaches the \$$night_num night ceiling on its own -- the cycle shards would never be scheduled"
+# ...and the fan-out must still have room for a useful number of shards after the reactive pass,
+# or the night degenerates into a reactive-only run that never touches the wider repo.
+[ "$(( (night_num - react_num * react_n) / shard_num ))" -ge 3 ] \
+    || fail "after $react_n reactive session(s) at \$$react_num, a \$$night_num night affords only $(( (night_num - react_num * react_n) / shard_num )) shard audit(s) at \$$shard_num -- fewer than 3 is a reactive-only night wearing a cycle night's name"
+
+# THE MUTATION CONTROLS: each caller must follow ITS OWN config key. Written against whatever the
+# numbers currently are (via the values read above) so they keep working when a budget moves --
+# which is exactly what broke the literals these replaced.
+sed "s/^reactive_audit_max_budget_usd = $react_num/reactive_audit_max_budget_usd = 99/" config/nightshift.toml > "$S31/same.toml"
+grep -q '^reactive_audit_max_budget_usd = 99' "$S31/same.toml" \
+    || fail "the reactive-cap mutant config was not built; the comparison below proves nothing"
 mut_react="$(budget_probe reactive-dead-code "$S31/same.toml")"
-[ "$mut_react" = "12" ] \
-    || fail "the reactive cap does not come from the config: the mutant says 12 and the session was handed \$$mut_react"
-# ...and the other direction, so the split cannot be satisfied by a hard-coded 8: move the SHARD
-# number and the shard probe must follow it while the reactive one does not.
-sed 's/^audit_max_budget_usd = 12/audit_max_budget_usd = 20/' config/nightshift.toml > "$S31/shard20.toml"
-grep -q '^audit_max_budget_usd = 20' "$S31/shard20.toml" \
+[ "$mut_react" = "99" ] \
+    || fail "the reactive cap does not come from the config: the mutant says 99 and the session was handed \$$mut_react"
+mut_react_shard="$(budget_probe cli "$S31/same.toml")"
+[ "$mut_react_shard" = "$shard_num" ] \
+    || fail "moving the REACTIVE key changed the SHARD cap to \$$mut_react_shard -- the two callers are reading one number"
+# ...and the other direction, so the split cannot be satisfied by one key driving both.
+sed "s/^audit_max_budget_usd = $shard_num/audit_max_budget_usd = 77/" config/nightshift.toml > "$S31/shard77.toml"
+grep -q '^audit_max_budget_usd = 77' "$S31/shard77.toml" \
     || fail "the shard mutant config was not built; the comparison below proves nothing"
-mut_shard="$(budget_probe cli "$S31/shard20.toml")"
-[ "$mut_shard" = "20" ] \
-    || fail "the shard cap is hard-coded: the mutant config says 20 and the session was handed \$$mut_shard"
-mut_react2="$(budget_probe reactive-dead-code "$S31/shard20.toml")"
-[ "$mut_react2" = "8" ] \
-    || fail "moving the SHARD cap to 20 moved the REACTIVE cap to \$$mut_react2 too; the two callers are still sharing one number"
+mut_shard="$(budget_probe cli "$S31/shard77.toml")"
+[ "$mut_shard" = "77" ] \
+    || fail "the shard cap is hard-coded: the mutant config says 77 and the session was handed \$$mut_shard"
+mut_shard_react="$(budget_probe reactive-dead-code "$S31/shard77.toml")"
+[ "$mut_shard_react" = "$react_num" ] \
+    || fail "moving the SHARD key changed the REACTIVE cap to \$$mut_shard_react -- the two callers are reading one number"
 rm -rf .jac
-echo "a reactive lens is capped at \$8 and a shard audit at \$12, read from the config, keyed on the caller"
+echo "each audit caller is capped from its OWN config key (\$$react_num reactive, \$$shard_num shard), and the reactive pass cannot bill the night ceiling before the fan-out is scheduled"
 
 echo "== 32. the selector ships what the audits already paid for, and drops what cannot be applied =="
 # 2026-07-31, three defects in one selection:
@@ -3524,5 +3542,55 @@ s40task() { jac run "$NS_ROOT/scripts/parse_result.jac" findings "$1" loc_saved 
     || fail "a non-swept audit stopped stamping the task from argv -- the agent's label is being trusted outside the sweep"
 rm -rf .jac
 echo "the cycle phase no longer re-buys the reactive pass's findings, the A/B is named and bounded, and a swept finding cannot label itself into a write permission"
+
+echo "== 41. the two finding schemas: a coverage theme must survive the whole apply tail =="
+# THE 2026-08-02 NIGHT. upsert_theme hard-indexed f["est_loc_saved"]; a coverage finding carries
+# gap_severity + est_loc_added + test_file instead. It raised KeyError, tier2_apply runs under
+# errexit, and S3 died holding two finished apply sessions -- $17.42, two committed branches --
+# that S4 never gated and S5 never shipped. Broken since the task registry landed; invisible for
+# four days because no coverage theme had ever survived an apply before.
+#
+# Driven against the REAL theme file from that night, so this section fails if anyone reintroduces
+# the assumption that one schema fits all four tasks.
+S41="$T/schemas"; mkdir -p "$S41"
+S41COV="$NS_ROOT/logs/2026-08-02/theme-coverage-reactive-scale-sdk.json"
+if [ ! -f "$S41COV" ]; then
+    # The fixture is a real night's artifact and nights get purged. Rebuild the shape it pins --
+    # deliberately spelled out rather than skipped, because a section that silently no-ops when its
+    # fixture ages out is this project's dominant defect wearing a fixture's clothes.
+    S41COV="$S41/coverage-theme.json"
+    printf '{"name":"c","slug":"coverage-x","task":"coverage","complexity":"judgement","fragment_kind":"","carry":false,"files":["a.jac"],"vestigial_deletions":[],"est_loc":10,"score":9,"findings":[{"file":"a.jac","rule":"missing-test","snippet":"x","summary":"s","gap_severity":9,"est_loc_added":10,"test_file":"t.jac","confidence":5,"risk":1,"complexity":"judgement","theme_hint":"h","task":"coverage","fingerprint":"c0ffee","score":9}]}\n' > "$S41COV"
+fi
+grep -q 'est_loc_added' "$S41COV" \
+    || fail "the section-41 coverage fixture carries no est_loc_added -- it is not the schema this section exists to pin"
+grep -q 'est_loc_saved' "$S41COV" \
+    && fail "the section-41 coverage fixture carries est_loc_saved, so it would pass against the very bug this pins"
+: > "$S41/led.jsonl"
+jac run "$NS_ROOT/scripts/ledger.jac" upsert-theme "$S41COV" nightshift/d/coverage-x "$S41/led.jsonl" > "$S41/n.txt" 2>&1 \
+    || fail "upsert-theme died on a COVERAGE theme: $(tr '\n' ' ' < "$S41/n.txt" | head -c 300)"
+grep -q 'in_theme' "$S41/led.jsonl" \
+    || fail "upsert-theme exited 0 on a coverage theme but wrote no in_theme row -- the dedup would silently never fire for coverage"
+# ...and the other schema still works, or the fix could be "ignore est_loc entirely".
+printf '{"findings":[{"fingerprint":"f2","file":"b.jac","rule":"dead-code","summary":"s","score":5,"est_loc_saved":7,"confidence":5,"risk":1}]}\n' > "$S41/dead.json"
+jac run "$NS_ROOT/scripts/ledger.jac" upsert-theme "$S41/dead.json" nightshift/d/dead-y "$S41/led.jsonl" >/dev/null 2>&1 \
+    || fail "upsert-theme broke the est_loc_saved schema while fixing the coverage one"
+# ...and a finding carrying NEITHER key is still a loud failure. Fixing this by reaching for
+# .get(k, 0) would bank a silent zero for a genuinely malformed finding, which is the other half of
+# this project's defect class.
+printf '{"findings":[{"fingerprint":"f3","file":"c.jac","rule":"dead-code","summary":"s","score":5,"confidence":5,"risk":1}]}\n' > "$S41/bad.json"
+jac run "$NS_ROOT/scripts/ledger.jac" upsert-theme "$S41/bad.json" nightshift/d/bad-z "$S41/led.jsonl" >/dev/null 2>&1 \
+    && fail "upsert-theme accepted a finding with NEITHER est_loc key; a malformed finding now banks a silent zero"
+
+# --- THE SHAPE, not just the bug. Bookkeeping must never stand between finished work and the gate.
+S41T="$(grep -n 'ns_queue_branch "$branch" "$theme_file"' "$NS_ROOT/lib/tier2.sh" | head -1 | cut -d: -f1)"
+S41L="$(grep -n 'ledger upsert-theme "$theme_file"' "$NS_ROOT/lib/tier2.sh" | head -1 | cut -d: -f1)"
+[ -n "$S41T" ] && [ -n "$S41L" ] \
+    || fail "cannot locate the queue/ledger pair in lib/tier2.sh; section 41's ordering check is vacuous"
+[ "$S41T" -lt "$S41L" ] \
+    || fail "lib/tier2.sh still writes the ledger BEFORE queueing the branch (queue at $S41T, ledger at $S41L) -- a bookkeeping failure would again strand finished apply work before S4"
+grep -A2 'ledger upsert-theme "$theme_file"' "$NS_ROOT/lib/tier2.sh" | grep -q 'ns_fail' \
+    || fail "the ledger upsert-theme call is fatal again; a KeyError in bookkeeping would take the whole night down, exactly as it did on 2026-08-02"
+rm -rf .jac
+echo "a coverage theme survives the apply tail, the other schema still works, a malformed finding still fails loud, and bookkeeping can no longer strand the night"
 
 echo "ALL HARNESS TESTS PASSED"

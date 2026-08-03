@@ -92,11 +92,11 @@ flowchart TD
 
     subgraph S3["S3 · agentic clean · priority order top to bottom"]
         direction TB
-        S3A["S3a · REACTIVE · 4 lenses over the merged file set · cap $8 per lens · optional SWEEP merges 3 of them into 1 session"]
+        S3A["S3a · REACTIVE · SWEEP (3 lenses, 1 session) + coverage · cap $8 each"]
         CARRY["carry-over · findings a past night banked but could not apply · no audit cost"]
         S3B["S3b · CYCLE · tonight's ONE task, rotating dead-code, abstraction, maintenance, coverage"]
-        SHARD["8 LOC-balanced shards of the whole repo · concurrency 2 · cap $12 per shard"]
-        AUDIT["claude -p AUDIT · Opus, or Sonnet for shards named in [shards].sonnet_shards · read-only · 130 turns · 20 min box"]
+        SHARD["8 LOC-balanced shards of the whole repo · concurrency 2 · cap $8 per shard"]
+        AUDIT["claude -p AUDIT · Opus, or Sonnet for shards named in [shards].sonnet_shards · read-only · 130 turns · 30 min box"]
         PJSON{"parse_result merge · any shard produced valid findings JSON?"}
         DEAD["a session that DIED is a dead lens · never salvaged into 0 findings"]
         SEL["selector · drop ledger-known / protected / blocked-by-protected-test / twice-failed · score · group by file+dir · pack at most 15 themes · fit clock"]
@@ -104,7 +104,7 @@ flowchart TD
         APPLY["per theme · branch cut from that base · fresh claude -p APPLY · acceptEdits · scoped tools · NO push/gh/network"]
         MODEL{"complexity routes attempt 1"}
         RJSON{"report JSON ok and diff non-empty?"}
-        FRAG["release-note fragment 0000.kind.md · ledger upsert-theme · green queue"]
+        FRAG["release-note fragment 0000.kind.md · QUEUE the branch, then the ledger row (non-fatal)"]
         CEIL3{"night_budget_usd 50 reached?"}
         S3A --> CARRY --> S3B --> SHARD --> AUDIT --> PJSON
         AUDIT -.->|"unfinished:*"| DEAD
@@ -422,6 +422,12 @@ just that it did not fail:
 - `check_scope`'s usage arm exits **2**, not 0 — a gate that cannot parse its own arguments must
   never be the reason a branch passes.
 - An audit session that died is a dead lens, never a clean zero.
+- `upsert_theme` hard-indexed `est_loc_saved`; a coverage finding carries `est_loc_added` instead.
+  It raised KeyError under errexit and killed the **first live night** at S3 — $17.42 spent, two
+  finished branches thrown away, nothing gated and nothing shipped. Broken since the task registry
+  landed, invisible for four days because no coverage theme had ever survived an apply. The branch
+  is now queued *before* the ledger is written, and the ledger write is non-fatal: bookkeeping must
+  never stand between finished work and the gate that ships it.
 - `ledger prunable` had this bug from 2026-07-30 to 2026-08-02: the arm demanded five argv where
   there were four, so every call printed usage, exited 0, and pruned nothing. Harness section 38
   now drives the real CLI and asserts a branch comes back.
