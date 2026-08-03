@@ -68,6 +68,12 @@ def valid_rules() -> list[str] {
 
 glob COMPLEXITY_LEVELS: list[str] = ["trivial", "mechanical", "judgement"];
 
+"""The reactive sweep's pseudo-task, and the labels its findings may carry. `coverage` is absent on
+purpose -- see validate_finding. SWEEP_TASKS[0] is also the fallback for an unrecognised label, so
+it must be the most conservative of the three."""
+glob SWEEP: str = "sweep";
+glob SWEEP_TASKS: list[str] = ["dead-code", "abstraction", "maintenance"];
+
 """Which keys a finding must carry, per [tasks.<task>].scoring (design spec 3.2).
 
   loc_saved      the change REMOVES lines: est_loc_saved is both the score weight and what the
@@ -114,7 +120,22 @@ def validate_finding(f: dict, task: str, mode: str) -> dict {
     }
     # The TASK is stamped by the harness, never taken from the agent: it decides which prompt, which
     # budget, and (through the branch name) which write permissions the theme gets.
-    f["task"] = task;
+    #
+    # THE ONE EXCEPTION, and the reason it is safe. The reactive SWEEP runs three lenses in one
+    # session -- it reads the merged file set once instead of three times, which is where 93% of
+    # that pass's cost went -- so its findings have to say which lens found them, and only the agent
+    # knows. The label is clamped to SWEEP_TASKS, which deliberately excludes `coverage`: coverage
+    # is the only task carrying [tasks.*].protect_unless, so it is the only label that would buy a
+    # write permission. An agent that mislabels among the other three moves its finding between
+    # prompts that all have the same (empty) permission set, and an unrecognised label falls back to
+    # the harness-supplied default rather than being trusted. That is why coverage keeps its own
+    # session even when the sweep is enabled.
+    if task == SWEEP {
+        agent_task: str = str(f.get("task", ""));
+        f["task"] = agent_task if agent_task in SWEEP_TASKS else SWEEP_TASKS[0];
+    } else {
+        f["task"] = task;
+    }
     return f;
 }
 

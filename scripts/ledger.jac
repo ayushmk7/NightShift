@@ -83,6 +83,12 @@ def upsert_theme(path: str, theme: dict, branch: str) -> int {
             "rule": f["rule"], "summary": f["summary"], "score": f.get("score"),
             "est_loc_saved": f["est_loc_saved"], "confidence": f["confidence"], "risk": f["risk"],
             "branch": branch,
+            # Called only from lib/tier2.sh AFTER the branch is queued, so this is never stamped on
+            # a theme whose apply session failed -- those rows stay `new` and are eligible again
+            # tomorrow. From here S4 always rules: verify_red writes failed_verify, ship writes
+            # drafted/shipped. The one way to get stuck is a night that dies between the queue and
+            # the gate, which also leaves an undeleted branch behind and is already a manual clean-up.
+            "status": "in_theme",
         };
         upsert(path, row);
         n += 1;

@@ -121,6 +121,15 @@ ns_stacking_on() {
     esac
 }
 
+# Same True/False-from-Python contract, same fail-closed default: unset means the four-lens reactive
+# pass, which is the behaviour every measurement so far describes.
+ns_reactive_sweep_on() {
+    case "${NS_BUDGETS_REACTIVE_SINGLE_SESSION:-}" in
+        True|true|1|yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Resolve a branch's base: tonight's logs first, the drafts branch second, main last -- the same
 # three-step widening as ns_theme_for_branch, and for the same reason. $LOG_DIR is date-keyed, so
 # S1.6 re-gating a PR opened on an earlier night finds nothing in logs; lib/ship.sh copies each

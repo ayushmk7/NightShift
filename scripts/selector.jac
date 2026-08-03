@@ -411,7 +411,13 @@ def drop_reason(f: dict, ledger: dict[str, dict], globs: list[str]) -> str | Non
     }
     if fp in ledger {
         status: str = str(ledger[fp]["status"]);
-        if status in ["shipped", "rejected", "drafted"] {
+        # `in_theme` is the SAME-NIGHT case and is what dedupes reactive against cycle: the
+        # reactive pass applies before the cycle phase selects, so by the time these findings are
+        # scored a reactive branch may already exist for them. Without this the cycle phase pays a
+        # second apply session to redo work that is already queued, and ships a second branch for
+        # it. (Stacking keeps those two branches from conflicting; this keeps the second from being
+        # bought at all. They solve different halves of the same overlap.)
+        if status in ["shipped", "rejected", "drafted", "in_theme"] {
             return "ledger-" + status;
         }
         if status == "failed_verify" and int(ledger[fp].get("attempts", 0)) >= 2 {

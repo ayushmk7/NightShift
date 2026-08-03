@@ -172,7 +172,37 @@ reactive_main() {
         fi
     fi
 
+    # THE SWEEP. [budgets].reactive_single_session merges the three lenses that share an (empty)
+    # permission set into ONE session, so the merged file set is read once instead of three times.
+    # That is not a marginal saving: on 2026-07-31 the reactive pass billed $28.72, of which $26.58
+    # was context ingestion and only $2.15 was model output -- four sessions re-reading the same 40
+    # files.
+    #
+    # COVERAGE IS NEVER SWEPT IN. It is the only task carrying [tasks.*].protect_unless, so it is
+    # the only label an agent could claim to buy itself a write permission, and a swept finding's
+    # task label is necessarily agent-authored. Keeping it as its own session keeps the label that
+    # matters orchestrator-stamped. See validate_finding in scripts/parse_result.jac.
+    #
+    # DEFAULT OFF, deliberately, and here is the honest reason: the $26.58 was measured over an
+    # UNFILTERED window that included a 735 KB changelog and five tests/** files, and the scope
+    # filter that removed them has not yet run a single night. The saving this chases may already
+    # have been taken by that filter. Turn it on after a night whose reactive pass still bills over
+    # ~$15 -- the number is in sessions.jsonl, grouped by phase -- and not before.
     conc="${NS_SHARDS_CONCURRENCY:-2}"
+    if ns_reactive_sweep_on; then
+        ns_log S3a "reactive pass over $n_files merged file(s): one SWEEP session (dead-code + abstraction + maintenance) plus the coverage lens"
+        if ! spent="$(ns_spend_check)"; then
+            ns_warn "NIGHT COST CEILING reached ($spent USD) — reactive pass not scheduled at all"
+        else
+            tier2_audit_shard "reactive-sweep" "$scope" "sweep" &
+            ns_jobs_wait "$conc"
+            tier2_audit_shard "reactive-coverage" "$scope" "coverage" &
+        fi
+        wait
+        reactive_collect "sweep coverage" "$n_files"
+        return 0
+    fi
+
     ns_log S3a "reactive pass over $n_files merged file(s), $(printf '%s' "$task_list" | wc -w | tr -d ' ') lenses"
     for task in $task_list; do
         if [ "$(ns_remaining_min)" -lt $(( NS_BUDGETS_AUDIT_TIMEOUT_MIN + NS_BUDGETS_APPLY_TIMEOUT_MIN )) ]; then
@@ -194,13 +224,25 @@ reactive_main() {
         tier2_audit_shard "reactive-$task" "$scope" "$task" &
     done
     wait
+    reactive_collect "$task_list" "$n_files"
+    return 0
+}
 
-    # Collect. Space-joined string, not a bash array: under set -u bash 3.2 aborts on ${#arr[@]}
-    # and "${arr[@]}" when the array is EMPTY, and "every lens failed" is exactly the case this
-    # has to survive.
+# Collect every lens's findings, merge them, and hand the result to select+apply. Extracted from
+# reactive_main so the four-lens path and the SWEEP path cannot drift apart: they differ only in
+# which sessions ran and therefore only in the name list passed here.
+#
+# <names> are the ARTIFACT names minus the `reactive-` prefix -- `dead-code abstraction ...` on the
+# four-lens path, `sweep coverage` on the swept one. They are not task names on the swept path, and
+# nothing here needs them to be: this function only reads files and counts.
+reactive_collect() {   # <names> <n_files>
+    local names=$1 n_files=$2 task
+    # Space-joined string, not a bash array: under set -u bash 3.2 aborts on ${#arr[@]} and
+    # "${arr[@]}" when the array is EMPTY, and "every lens failed" is exactly the case this has to
+    # survive.
     local found="" n_found=0
     : > "$LOG_DIR/reactive-summary.tsv"
-    for task in $task_list; do
+    for task in $names; do
         if [ -s "$LOG_DIR/findings-reactive-$task.json" ]; then
             found="$found $LOG_DIR/findings-reactive-$task.json"
             n_found=$(( n_found + 1 ))

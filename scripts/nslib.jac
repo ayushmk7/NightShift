@@ -102,8 +102,14 @@ def days_ago(iso: str) -> int {
     return (date.today() - date.fromisoformat(iso)).days;
 }
 
+"""`in_theme` was a documented state of the finding lifecycle that the ledger never recorded
+(WORKFLOW.md section 3 has drawn it since the first diagram). It means "an apply session produced a
+branch for this finding and the S4 gate has not ruled on it yet", and its absence is what let the
+same fingerprint be selected twice in one night -- once by the reactive pass, then again by the
+cycle phase, which runs after reactive has already applied. Two sessions, two branches, one
+finding."""
 def valid_statuses() -> list[str] {
-    return ["new", "drafted", "shipped", "rejected", "failed_verify", "deferred"];
+    return ["new", "in_theme", "drafted", "shipped", "rejected", "failed_verify", "deferred"];
 }
 
 """Ledger IO: append-only JSONL, one row per finding, last line per fingerprint wins."""

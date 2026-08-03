@@ -117,10 +117,17 @@ tier2_audit_shard() {   # tier2_audit_shard <name> <scope> <task>
     # prompts at the wrong mode. The eval is BARE (no export, no `set -a`) for the same reason
     # tier2_resolve_task's is -- these stay orchestrator-local and never reach a claude session --
     # and it is safe in this shell because both callers invoke this function with `&`.
-    task_env="$(ns_jac tasks env "$task" "$CONFIG")" || rc=$?
+    #
+    # `sweep` is the reactive SWEEP pseudo-task -- three lenses in one session -- and has no
+    # [tasks.sweep] table on purpose: adding one would insert it into the nightly cycle rotation,
+    # which reads [tasks.*] in file order. It borrows dead-code's knobs, the strictest of the three
+    # it covers, and the same value parse_result clamps an unrecognised label to.
+    local env_task="$task"
+    case "$task" in sweep) env_task="dead-code" ;; esac
+    task_env="$(ns_jac tasks env "$env_task" "$CONFIG")" || rc=$?
     case "$rc$task_env" in
         0?*) : ;;
-        *)  ns_fail "audit[$name]" "[tasks.$task] did not yield a usable NS_TASK_* env (rc=$rc)"
+        *)  ns_fail "audit[$name]" "[tasks.$env_task] did not yield a usable NS_TASK_* env (rc=$rc)"
             return 1 ;;
     esac
     eval "$task_env"
@@ -150,10 +157,39 @@ tier2_audit_shard() {   # tier2_audit_shard <name> <scope> <task>
         "shard=$name" "scope=$scope" "coverage_evidence=$evidence" \
         "protect_globs=$NS_PROTECT_GLOBS" "ponytail_mode=$NS_TASK_PONYTAIL")"
 
-    # The audit is ALWAYS the expensive model: it is judgement work, and a bad finding costs a
-    # whole 25-minute apply session downstream (design spec 13). No `model_args` array -- the flag
-    # is unconditional, which also removes one of the bash-3.2 empty-array hazards.
+    # The audit is the expensive model by DEFAULT: it is judgement work, and a bad finding costs a
+    # whole 25-minute apply session downstream (design spec 13).
+    #
+    # THE A/B. [shards].sonnet_shards names the shards audited on the cheap model instead. It exists
+    # because "is Opus worth 1.67x Sonnet for the audit" is a question no amount of staring at the
+    # existing data can answer -- all 12 audits on 2026-07-31 ran Opus, so there is no comparison in
+    # it. sessions.jsonl already records `model`, `total_cost_usd` and `findings_out` per session, so
+    # naming two shards here makes the next few nights answer it as a query:
+    #
+    #   findings per dollar, by model, over shards that ran both
+    #
+    # NAMED, NOT SAMPLED. A random half would be cheaper to write and useless to read: the shards
+    # differ enormously in size and character (compiler-passes vs periphery), so a model difference
+    # and a shard difference would be inseparable. Fixed names mean the SAME shard is measured on the
+    # same model night after night, and the comparison is against that shard's own Opus history.
+    # It is also the reason this is not `Math.random`-shaped: a reproducible night is worth more
+    # than an unbiased sample here.
+    #
+    # Reactive lenses are deliberately NOT eligible -- they are the expensive caller and the one
+    # whose findings feed same-night applies, so an experiment there costs more and risks more.
     local audit_model="$NS_AGENT_MODEL"
+    case "$name" in
+        reactive-*) : ;;
+        # config.jac renders a TOML array as its JSON text (`["periphery", "scale"]`), so the
+        # membership test matches the QUOTED name. That is not a shortcut around parsing -- it is
+        # what makes it exact: bare-substring matching would let a future shard named `cli-extra`
+        # be caught by an entry for `cli`.
+        *)  case "${NS_SHARDS_SONNET_SHARDS:-}" in
+                *"\"$name\""*)
+                    audit_model="$NS_AGENT_MODEL_SIMPLE"
+                    ns_log S3 "audit[$name] on $audit_model (A/B: [shards].sonnet_shards) — compare findings/\$ against this shard's Opus nights in sessions.jsonl" ;;
+            esac ;;
+    esac
 
     # THE PER-SESSION MONEY CAP, SPLIT BY CALLER. Both callers of this function pass through the one
     # `--max-budget-usd` below, and their per-turn costs differ 2.2x (2026-07-31: reactive $0.139/turn

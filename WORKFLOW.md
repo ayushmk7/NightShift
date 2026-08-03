@@ -92,11 +92,11 @@ flowchart TD
 
     subgraph S3["S3 · agentic clean · priority order top to bottom"]
         direction TB
-        S3A["S3a · REACTIVE · 4 lenses over the merged file set · cap $8 per lens"]
+        S3A["S3a · REACTIVE · 4 lenses over the merged file set · cap $8 per lens · optional SWEEP merges 3 of them into 1 session"]
         CARRY["carry-over · findings a past night banked but could not apply · no audit cost"]
         S3B["S3b · CYCLE · tonight's ONE task, rotating dead-code, abstraction, maintenance, coverage"]
         SHARD["8 LOC-balanced shards of the whole repo · concurrency 2 · cap $12 per shard"]
-        AUDIT["claude -p AUDIT · Opus · read-only · 130 turns · 20 min box · ponytail-audit scoped to the shard"]
+        AUDIT["claude -p AUDIT · Opus, or Sonnet for shards named in [shards].sonnet_shards · read-only · 130 turns · 20 min box"]
         PJSON{"parse_result merge · any shard produced valid findings JSON?"}
         DEAD["a session that DIED is a dead lens · never salvaged into 0 findings"]
         SEL["selector · drop ledger-known / protected / blocked-by-protected-test / twice-failed · score · group by file+dir · pack at most 15 themes · fit clock"]
@@ -265,7 +265,7 @@ stateDiagram-v2
     [*] --> new: audit surfaces it (cycle shard or reactive lens)
     new --> deferred: did not fit the theme / night / clock budget
     deferred --> in_theme: re-packed on a later night, at zero audit cost
-    new --> in_theme: selected and applied
+    new --> in_theme: selected and applied — RECORDED since 2026-08-02, which is what stops the cycle phase re-buying a finding the reactive pass already has a branch for
     new --> blocked: only referencing file is a protected test
     in_theme --> drafted: S4 green, S5 pushed, PR not yet open
     drafted --> shipped: S5 opened the draft PR upstream
@@ -384,7 +384,28 @@ re-gates — opens it once the parent merges. And if a parent fails its gate, it
 it; that is correct, since a child's tree genuinely contains rejected changes, and S4 names the
 parent in the failure line so the cascade is legible.
 
-## 6. The one defect class this whole design is shaped around
+## 6. Three levers, and why two of them are off
+
+- **`[shards].sonnet_shards`** — ON, naming `periphery` and `scale`. Whether Opus is worth 1.67x
+  Sonnet for a read-only audit is unanswerable from the current data (all 12 audits on 2026-07-31
+  ran Opus). `sessions.jsonl` already carries `model`, `total_cost_usd` and `findings_out`, so
+  naming two shards turns it into a query against those shards' own Opus history. Named rather than
+  sampled: the shards differ so much in size that a random split would confound model with shard.
+- **`[budgets].reactive_single_session`** — OFF. Merges the three lenses that share an empty
+  permission set into one session, so the merged files are read twice instead of four times ($26.58
+  of the $28.72 reactive bill was context ingestion). Coverage is never swept in — it is the only
+  task with `protect_unless`, and a swept finding's task label is necessarily agent-authored;
+  `parse_result.validate_finding` clamps swept labels to the three that buy nothing. It ships off
+  because the $26.58 was measured over an *unfiltered* window that has since lost a 735 KB
+  changelog and five `tests/**` files, and that filter has never run a night. Turn it on after a
+  night whose reactive phase still bills over ~$15.
+- **`[repo].stacked_prs`** — ON. See section 5.
+
+Two more were considered and **rejected on evidence**, not deferred: raising `audit_timeout_min`
+(the longest audit ever recorded was 8.0 minutes against a 20-minute box — disproved twice) and
+lowering `audit_max_budget_usd` to 5 (it would have truncated 5 of the 9 audits that succeeded).
+
+## 7. The one defect class this whole design is shaped around
 
 **"Did not run, scored as passed."** Eleven-plus instances have been found in this harness, every
 one of them in a gate, none of them caught by a passing test. The cause is always the same: a
@@ -410,5 +431,8 @@ just that it did not fail:
 The sibling class is **assertions that cannot fail**: `( set -e; … ) || fail` is vacuous, a
 `grep -q` can match the comment instead of the code, and a regression test can contain the bug it
 guards. This is why every tripwire in `bin/test-harness.sh` is paired with a mutation that must
-turn it red — and it earns its keep: section 39's mutation immediately caught that section 39's own
-`grep -A2` was looking *past* the line it was checking, and had been passing vacuously.
+turn it red — and it keeps earning its keep. Section 39's mutation caught that section 39's own
+`grep -A2` was looking *past* the line it checked. Section 40's caught that section 38's mutant was
+written to a **dot-prefixed** file, which `jac run` cannot load at all — so the mutant emitted
+nothing, and "the mutant did not produce the bad output" was true for the wrong reason. Both
+sections now assert the mutant is *alive* before reading meaning into its silence.

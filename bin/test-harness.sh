@@ -3260,14 +3260,21 @@ grep -q 'deferred\|ccc' "$S38/out.txt" \
 
 # MUTATION. Put the off-by-one back and require the assertion above to go red. Without this, a
 # section that only ever greps for a branch name is satisfied by any verb that prints something.
-# The mutant must live beside nslib.jac for its imports to resolve; the leading dot keeps it out of
-# the `scripts/*.jac` glob that section 1 sweeps, and the trap removes it on any exit.
-S38M="$NS_ROOT/scripts/.ledger-mutant.jac"
+# The mutant must live beside nslib.jac for its imports to resolve. It was briefly dot-prefixed to
+# keep it out of section 1's `scripts/*.jac` sweep -- which does work, but `jac run` cannot LOAD a
+# dot-prefixed file ("Cannot find module ledger-mutant"), so the mutant produced no output and the
+# assertion below passed because nothing ran. A mutation that cannot execute proves less than no
+# mutation at all, because it reads as proof. Hence the underscore, and the positive assertion that
+# the mutant actually produced something before its output is interpreted.
+S38M="$NS_ROOT/scripts/_ledger_mutant.jac"
 trap 'rm -f "$S38M"' EXIT
 sed 's|elif cmd == "prunable" and len(args) == 4 {|elif cmd == "prunable" and len(args) == 5 {|; s|prunable_branches(args\[3\], int(args\[2\]))|prunable_branches(args[4], int(args[3]))|' \
     "$NS_ROOT/scripts/ledger.jac" > "$S38M"
 grep -q 'len(args) == 5' "$S38M" \
     || fail "the section-38 mutant was not built; the mutation proves nothing"
+jac run "$S38M" tally "$S38/led.jsonl" > "$S38/mut-live.txt" 2>/dev/null || true
+grep -q 'shipped' "$S38/mut-live.txt" \
+    || fail "the section-38 mutant did not RUN (a verb it shares with the original produced nothing), so its silence on prunable proves nothing"
 jac run "$S38M" prunable 14 "$S38/led.jsonl" > "$S38/mut-out.txt" 2>/dev/null || true
 grep -q 'nightshift/2026-07-01/stale' "$S38/mut-out.txt" \
     && fail "the restored off-by-one STILL emitted the stale branch -- section 38 cannot fail"
@@ -3387,5 +3394,95 @@ for s39site in 'check_scope check' 'tw_files=' 'changed_all='; do
 done
 rm -rf .jac
 echo "a stacked branch resolves its base, is gated on its own diff alone, cascades when its parent dies, and never opens a PR that hides its parent"
+
+echo "== 40. the three deferred items: reactive/cycle dedup, the audit A/B, and the sweep clamp =="
+S40="$T/deferred"; mkdir -p "$S40"
+
+# --- A. DEDUP. The reactive pass APPLIES before the cycle phase SELECTS, so without a status the
+#        same fingerprint is bought twice in one night: two apply sessions, two branches, one
+#        finding. upsert_theme now stamps in_theme and the selector treats it as terminal.
+# The fingerprint must be the REAL one -- sha1(file \x1f rule), nslib.fingerprint -- or the ledger
+# row keys on something the selector never looks up and this whole section passes on a miss.
+S40FP="$(python3 -c 'import hashlib,sys; print(hashlib.sha1(b"a.jac\x1fdead-code").hexdigest())')"
+printf '{"findings":[{"fingerprint":"%s","file":"a.jac","rule":"dead-code","summary":"s","score":10,"est_loc_saved":5,"confidence":5,"risk":1}]}\n' \
+    "$S40FP" > "$S40/theme.json"
+: > "$S40/led.jsonl"
+jac run "$NS_ROOT/scripts/ledger.jac" upsert-theme "$S40/theme.json" nightshift/d/dead-code-a "$S40/led.jsonl" >/dev/null \
+    || fail "upsert-theme failed"
+[ "$(jac run "$NS_ROOT/scripts/ledger.jac" tally "$S40/led.jsonl")" = '{"in_theme": 1}' ] \
+    || fail "upsert-theme did not stamp in_theme -- the cycle phase would re-buy a finding the reactive pass already has a branch for"
+# `task` is present because the selector reads findings AFTER parse_result has stamped it; a
+# fixture without it dies in group_key rather than testing anything.
+printf '[{"file":"a.jac","task":"dead-code","rule":"dead-code","snippet":"x","summary":"s","est_loc_saved":5,"confidence":5,"risk":1,"complexity":"trivial","theme_hint":"h"}]\n' > "$S40/f.json"
+S40CFG="$S40/cfg.toml"
+{ printf '[protect]\nglobs = []\n[budgets]\nthemes_per_night = 5\nfiles_per_theme = 6\nloc_per_theme = 600\napply_timeout_min = 25\n'
+  printf '[tasks.dead-code]\nponytail="full"\nscoring="loc_saved"\nfragment="refactor"\n'; } > "$S40CFG"
+S40DROP="$(jac run "$NS_ROOT/scripts/selector.jac" select "$S40CFG" "$S40/led.jsonl" /nonexistent-state 999 /nonexistent-repo < "$S40/f.json" \
+    | jac run "$NS_ROOT/scripts/parse_result.jac" field dropped)"
+case "$S40DROP" in
+    *ledger-in_theme*) : ;;
+    *) fail "a finding already carried by tonight's reactive branch was NOT dropped by the cycle selector (dropped=$S40DROP) -- it would be applied a second time" ;;
+esac
+
+# MUTATION: put the pre-2026-08-02 status list back and require the drop to disappear.
+sed 's|"drafted", "in_theme"\]|"drafted"]|' "$NS_ROOT/scripts/selector.jac" > "$NS_ROOT/scripts/_sel_mutant.jac"
+trap 'rm -f "$NS_ROOT/scripts/_sel_mutant.jac" "$S38M"' EXIT
+grep -q '"shipped", "rejected", "drafted"\]' "$NS_ROOT/scripts/_sel_mutant.jac" \
+    || fail "the section-40A mutant was not built; the mutation proves nothing"
+# Liveness first: a mutant that cannot load emits nothing, and "nothing" would satisfy the
+# no-longer-dropped assertion below for entirely the wrong reason. See section 38.
+# `|| rc=` and not a bare call followed by `$?`: under this file's set -e the nonzero exit aborts
+# the section before the status can be read, which is the same shape as the guards section 10 exists
+# for. Any exit is fine here EXCEPT the module-not-found one; what is asserted is that it loaded.
+S40LIVE=0
+jac run "$NS_ROOT/scripts/_sel_mutant.jac" slots "$S40/nonexistent.json" > "$S40/live.txt" 2>&1 || S40LIVE=$?
+grep -q 'Cannot find module' "$S40/live.txt" \
+    && fail "the section-40A mutant does not load; its silence would fake a passing mutation (see section 38)"
+S40MUT="$(jac run "$NS_ROOT/scripts/_sel_mutant.jac" select "$S40CFG" "$S40/led.jsonl" /nonexistent-state 999 /nonexistent-repo < "$S40/f.json" \
+    | jac run "$NS_ROOT/scripts/parse_result.jac" field dropped)"
+case "$S40MUT" in
+    *ledger-in_theme*) fail "the mutant with in_theme removed STILL dropped the finding -- section 40A cannot fail" ;;
+esac
+
+# --- B. THE AUDIT A/B. Named shards, not sampled, and reactive lenses never eligible.
+grep -q 'sonnet_shards' "$NS_ROOT/config/nightshift.toml" \
+    || fail "sonnet_shards is gone from the config; the audit A/B has no input"
+[ -n "$(jac run "$NS_ROOT/scripts/config.jac" env "$NS_ROOT/config/nightshift.toml" | grep '^NS_SHARDS_SONNET_SHARDS=')" ] \
+    || fail "sonnet_shards did not reach the env as NS_SHARDS_SONNET_SHARDS -- it is probably nested under a sub-table again, where config.jac folds it into that table's JSON"
+# The membership test must be exact: a bare-substring match would catch a future `cli-extra` on a
+# `cli` entry, which is how an experiment silently grows to cover shards nobody chose.
+grep -q '\*"\\"\$name\\""\*' "$NS_ROOT/lib/tier2.sh" \
+    || fail "the sonnet-shard membership test is no longer quoted-exact"
+grep -B12 'NS_SHARDS_SONNET_SHARDS' "$NS_ROOT/lib/tier2.sh" | grep -q 'reactive-\*) : ;;' \
+    || fail "reactive lenses are no longer excluded from the audit A/B -- the expensive caller, whose findings feed same-night applies, would be running the experiment"
+
+# --- C. THE SWEEP. Its prompt must render with no placeholder left, and the agent-authored task
+#        label must be clamped to the three tasks that share an EMPTY permission set.
+[ -f "$NS_ROOT/prompts/audit-sweep.md" ] || fail "prompts/audit-sweep.md is missing; the sweep would render an empty prompt"
+S40P="$(sed -e "s/{scope}/x/g" -e "s/{shard}/y/g" -e "s/{ponytail_mode}/full/g" -e "s/{protect_globs}/g/g" -e "s/{coverage_evidence}//g" "$NS_ROOT/prompts/audit-sweep.md")"
+case "$S40P" in
+    *"{"*"}"*) : ;;   # the JSON schema block legitimately contains braces
+esac
+printf '%s' "$S40P" | grep -qE '\{(scope|shard|ponytail_mode|protect_globs|coverage_evidence)\}' \
+    && fail "prompts/audit-sweep.md still carries an unrendered placeholder"
+grep -q 'Do NOT hunt missing test coverage' "$NS_ROOT/prompts/audit-sweep.md" \
+    || fail "the sweep prompt no longer excludes the coverage lens -- coverage is the ONLY task carrying protect_unless, so a swept coverage finding would be an agent-authored write permission"
+grep -q 'SWEEP_TASKS: list\[str\] = \["dead-code", "abstraction", "maintenance"\]' "$NS_ROOT/scripts/parse_result.jac" \
+    || fail "SWEEP_TASKS changed; if `coverage` is now in it, a swept finding can label itself into the tests/** write exemption"
+# ...and the clamp actually clamps, driven through the REAL validator on a REAL envelope shape.
+# Both directions: a hostile `coverage` label must be rewritten, and a legitimate one must survive,
+# or "clamp everything to dead-code" would satisfy the first assertion on its own.
+s40env() {   # <task-label> -> an audit envelope carrying one finding with that label
+    printf '{"is_error": false, "result": "```json\\n[{\\"file\\":\\"a.jac\\",\\"task\\":\\"%s\\",\\"rule\\":\\"dead-code\\",\\"snippet\\":\\"x\\",\\"summary\\":\\"s\\",\\"est_loc_saved\\":1,\\"confidence\\":5,\\"risk\\":1,\\"complexity\\":\\"trivial\\",\\"theme_hint\\":\\"h\\"}]\\n```"}\n' "$1"
+}
+s40task() { jac run "$NS_ROOT/scripts/parse_result.jac" findings "$1" loc_saved | grep -o '"task": "[a-z-]*"' | head -1; }
+[ "$(s40env coverage    | s40task sweep)" = '"task": "dead-code"' ] \
+    || fail "a swept finding labelled itself coverage and the clamp let it through -- that label buys the tests/** write exemption at the S4 gate"
+[ "$(s40env abstraction | s40task sweep)" = '"task": "abstraction"' ] \
+    || fail "the sweep clamp rewrote a LEGITIMATE label; the sweep would file every finding as dead-code and the three lenses would be one"
+[ "$(s40env coverage    | s40task dead-code)" = '"task": "dead-code"' ] \
+    || fail "a non-swept audit stopped stamping the task from argv -- the agent's label is being trusted outside the sweep"
+rm -rf .jac
+echo "the cycle phase no longer re-buys the reactive pass's findings, the A/B is named and bounded, and a swept finding cannot label itself into a write permission"
 
 echo "ALL HARNESS TESTS PASSED"

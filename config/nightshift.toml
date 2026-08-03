@@ -34,6 +34,26 @@ concurrency = 2                              # bash 3.2 has no `wait -n`; the dr
 names = ["compiler-passes", "compiler-core", "scale", "jac0core",
          "runtimelib", "cli", "byllm", "periphery"]
 
+# THE AUDIT MODEL A/B. Shards named here are audited on [agent].model_simple instead of
+# [agent].model. Everything else, and every reactive lens, stays on the expensive model.
+#
+# The question is whether Opus is worth its 1.67x over Sonnet for a READ-ONLY investigation, and no
+# amount of re-reading the existing data answers it: all 12 audits on 2026-07-31 ran Opus, so there
+# is no comparison in the dataset to find. sessions.jsonl already carries `model`,
+# `total_cost_usd` and `findings_out` per session, so naming two shards turns it into a query --
+# findings per dollar, by model, for a shard measured against its OWN Opus history.
+#
+# Named rather than randomly sampled on purpose: the shards differ enormously in size and character,
+# so a random half would confound "which model" with "which shard" and answer neither. These two are
+# the cheap end of the fan-out -- an experiment that goes badly costs a fraction of a night and no
+# shard that carries the compiler.
+#
+# Empty this list to end the experiment. Read it after ~5 nights; if Sonnet's findings/$ is within
+# noise of Opus's on the same shards, widen it; if its findings are thinner or wronger (the ledger's
+# failed_verify rate per model is the second reading), delete it and the question is settled with
+# evidence instead of instinct.
+sonnet_shards   = ["periphery", "scale"]
+
 [shards.paths]
 compiler-passes = ["jac/jaclang/compiler/passes"]
 compiler-core   = ["jac/jaclang/compiler"]
@@ -53,6 +73,7 @@ periphery       = ["jac/jaclang/langserve", "jac/jaclang/lsp", "jac/jaclang/proj
 
 [shards.exclude]                             # subtracted from the shard's own paths in the prompt
 compiler-core   = ["jac/jaclang/compiler/passes", "jac/jaclang/compiler/tests"]
+
 
 [tasks]                                      # ONE task per night, cycling in the order these
 # tables appear below. scripts/tasks.jac reads that order straight from the file (tomllib
@@ -235,6 +256,28 @@ reactive_audit_max_budget_usd = 8            # per REACTIVE LENS session. A SEPA
                                               # 8 is that projection plus ~30% headroom, and four lenses
                                               # at 8 is $32 of 50, which still leaves the fan-out room.
                                               # RE-MEASURE after the first filtered night.
+# THE REACTIVE SWEEP. false = four lens sessions over the merged file set (one per task). true =
+# ONE session covering dead-code + abstraction + maintenance, plus a separate coverage session --
+# the merged files are read twice instead of four times.
+#
+# Why it exists: on 2026-07-31 the reactive pass billed $28.72, of which $26.58 was context
+# ingestion and $2.15 was model output. Four sessions re-reading the same 40 files is the entire
+# shape of that number.
+#
+# Why coverage is never swept in: it is the only task with [tasks.*].protect_unless, so it is the
+# only label that buys a write permission -- and a swept finding's task label is necessarily
+# agent-authored. parse_result.validate_finding clamps swept labels to the three that share an
+# empty permission set, and an unrecognised one falls back to dead-code. Keeping coverage as its own
+# session keeps the one label that matters stamped by the harness.
+#
+# WHY IT SHIPS OFF. The $26.58 was measured over an UNFILTERED window that included a 735 KB
+# changelog and five tests/** files; the scope filter that removed them has not yet run a single
+# night. The saving this chases may already have been taken. Turn it on after a night whose
+# reactive phase still bills over ~$15 -- group sessions.jsonl by `phase` -- and not before. Doing
+# it on projection rather than measurement is how audit_timeout_min got raised twice for a box that
+# was never hit.
+reactive_single_session = false
+
 night_budget_usd   = 50                      # WHOLE-NIGHT ceiling, and the only thing that actually
                                               # bounds spend: a per-session cap times fifty sessions is
                                               # not a brake. lib/common.sh sums the total_cost_usd the
