@@ -391,14 +391,15 @@ parent in the failure line so the cascade is legible.
   ran Opus). `sessions.jsonl` already carries `model`, `total_cost_usd` and `findings_out`, so
   naming two shards turns it into a query against those shards' own Opus history. Named rather than
   sampled: the shards differ so much in size that a random split would confound model with shard.
-- **`[budgets].reactive_single_session`** — OFF. Merges the three lenses that share an empty
+- **`[budgets].reactive_single_session`** — ON since 2026-08-02. Merges the three lenses that share an empty
   permission set into one session, so the merged files are read twice instead of four times ($26.58
   of the $28.72 reactive bill was context ingestion). Coverage is never swept in — it is the only
   task with `protect_unless`, and a swept finding's task label is necessarily agent-authored;
-  `parse_result.validate_finding` clamps swept labels to the three that buy nothing. It ships off
-  because the $26.58 was measured over an *unfiltered* window that has since lost a 735 KB
-  changelog and five `tests/**` files, and that filter has never run a night. Turn it on after a
-  night whose reactive phase still bills over ~$15.
+  `parse_result.validate_finding` clamps swept labels to the three that buy nothing, and harness
+  section 22 asserts from the outside that coverage still gets its own session. Note the caveat it
+  was originally held back for: the $26.58 was measured over an *unfiltered* window that has since
+  lost a 735 KB changelog and five `tests/**` files, so part of that saving may already have been
+  taken by the scope filter. `sessions.jsonl` grouped by `phase` says which.
 - **`[repo].stacked_prs`** — ON. See section 5.
 
 Two more were considered and **rejected on evidence**, not deferred: raising `audit_timeout_min`
@@ -435,4 +436,11 @@ turn it red — and it keeps earning its keep. Section 39's mutation caught that
 `grep -A2` was looking *past* the line it checked. Section 40's caught that section 38's mutant was
 written to a **dot-prefixed** file, which `jac run` cannot load at all — so the mutant emitted
 nothing, and "the mutant did not produce the bad output" was true for the wrong reason. Both
-sections now assert the mutant is *alive* before reading meaning into its silence.
+sections now assert the mutant is *alive* before reading meaning into its silence, and a sweep of
+every mutation site found the same hole a third time in section 33, whose mutant output was read
+without ever checking that the mutant ran.
+
+A related shape, found in the same sweep: an assertion pinned to a **current configuration value**
+rather than to the invariant. Section 22 hard-coded "4 lens rows", so enabling the sweep reddened a
+section that has nothing to say about it. It now derives the expected shape from the live config and
+asserts both — which is strictly more coverage than the number it replaced.

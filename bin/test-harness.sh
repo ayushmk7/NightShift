@@ -42,9 +42,15 @@ grep -q '"task": *"dead-code"' "$T/f.json" || fail "parse_result no longer stamp
 grep -q '"complexity"' "$T/f.json" || fail "parse_result no longer requires a complexity tag"
 # `findings` with no task/scoring must FAIL, not fall back to a default schema. A default would
 # silently gate every coverage night against the loc_saved shape and reject every finding.
-if jac run scripts/parse_result.jac findings < fixtures/golden-audit.json >/dev/null 2>&1; then
+# Asserted on the REASON, not merely on a nonzero exit. `if <cmd>; then fail` is satisfied by ANY
+# failure -- a missing fixture, a syntax error, an unrelated crash -- so on its own it would keep
+# passing after the check it guards was deleted. Section 13 carries the same note; this site was the
+# one that still had the hole.
+if jac run scripts/parse_result.jac findings < fixtures/golden-audit.json > "$T/arity.out" 2> "$T/arity.err"; then
     fail "parse_result findings accepted no task/scoring argv -- it must require both"
 fi
+grep -q 'findings needs <task> <scoring>' "$T/arity.err" \
+    || fail "parse_result findings rejected the short argv for the WRONG reason ($(tr '\n' ' ' < "$T/arity.err")) -- this assertion would survive the deletion of the check it exists for"
 jac run scripts/selector.jac select config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
     < "$T/f.json" > "$T/s1.json"
 jac run scripts/selector.jac select config/nightshift.toml /nonexistent /nonexistent 999 /nonexistent-repo \
@@ -1694,8 +1700,32 @@ grep -q 'exceeds the 40-file ceiling' "$C/warnings.txt" \
 grep -q 'f01.jac' "$C/prompts.txt" || fail "the truncated scope dropped the highest-ranked file"
 grep -q 'f45.jac' "$C/prompts.txt" \
     && fail "the ceiling did not actually truncate: the 45th file reached the audit prompt"
-[ "$(wc -l < "$C/reactive-summary.tsv" | tr -d ' ')" = "4" ] \
-    || fail "reactive-summary.tsv is not one row per lens: $(cat "$C/reactive-summary.tsv")"
+# ONE ROW PER SESSION, in whichever shape [budgets].reactive_single_session selects: four task
+# lenses, or the SWEEP plus coverage. Asserted against the live config rather than a hard 4, because
+# a hard number silently becomes a test of the flag's current value instead of a test of the
+# invariant -- and then flipping the flag reds a section that has nothing to say about it.
+if ( . "$NS_ROOT/lib/common.sh"; ns_load_config; ns_reactive_sweep_on ); then
+    S22ROWS=2; S22SHAPE="sweep + coverage"
+else
+    S22ROWS=4; S22SHAPE="four task lenses"
+fi
+[ "$(wc -l < "$C/reactive-summary.tsv" | tr -d ' ')" = "$S22ROWS" ] \
+    || fail "reactive-summary.tsv is not one row per session ($S22SHAPE => $S22ROWS rows): $(cat "$C/reactive-summary.tsv")"
+# ...and the row names match the shape, so the count above cannot be satisfied by the wrong two.
+if [ "$S22ROWS" = 2 ]; then
+    cut -f1 "$C/reactive-summary.tsv" | tr '\n' ' ' | grep -q '^sweep coverage $' \
+        || fail "the swept pass did not run exactly the sweep and coverage sessions: $(cut -f1 "$C/reactive-summary.tsv" | tr '\n' ' ')"
+    # COVERAGE MUST STILL BE ITS OWN SESSION. It is the only task carrying protect_unless, so
+    # folding it into the sweep would make the one label that buys a write permission
+    # agent-authored. This is the assertion that keeps that true from the outside.
+    grep -q '^coverage' "$C/reactive-summary.tsv" \
+        || fail "the sweep absorbed the coverage lens -- a swept finding could then label itself coverage and buy the tests/** write exemption"
+    grep -c 'auditing ONLY' "$C/prompts.txt" | grep -q '^2$' \
+        || fail "the swept pass rendered $(grep -c 'auditing ONLY' "$C/prompts.txt") audit prompts, not 2; the whole point is reading the merged files twice instead of four times"
+else
+    grep -c 'auditing ONLY' "$C/prompts.txt" | grep -q '^4$' \
+        || fail "the four-lens pass rendered $(grep -c 'auditing ONLY' "$C/prompts.txt") audit prompts, not 4"
+fi
 
 # RECONCILIATION B2 -- the reactive marker goes AFTER the task in the branch slug, never in front.
 # ns_task_of_branch resolves the task BY PREFIX and that resolution is the sole input to
@@ -2883,7 +2913,14 @@ sed 's|^dataset_record_night() {|dataset_record_night() {\n    [ -n "${NS_DRY_RU
 grep -q 'NS_DRY_RUN:-}" \] && return 0' "$S33/mutant.sh" \
     || fail "the section-33 mutant was not built; the mutation proves nothing"
 mkdir -p "$S33/ds-mutant"
-dry_probe "$S33/mutant.sh" "$S33/ds-mutant"
+dry_probe "$S33/mutant.sh" "$S33/ds-mutant" \
+    || fail "the section-33 mutant exited nonzero, so its empty output says nothing about the mutation"
+# LIVENESS, and it is not optional. Only dataset_record_night was mutated, so the mutant must still
+# write a refactors row; without this, a mutant that failed to source at all produces no nights.jsonl
+# and satisfies the assertion below for entirely the wrong reason. That is exactly how section 38's
+# mutation was silently dead -- it was written to a dot-prefixed file `jac run` cannot even load.
+[ -s "$S33/ds-mutant/refactors.jsonl" ] \
+    || fail "the section-33 mutant recorded NOTHING at all -- it did not run, so the nights.jsonl check below proves nothing about the NS_DRY_RUN early return"
 [ -s "$S33/ds-mutant/nights.jsonl" ] \
     && fail "the mutant with the NS_DRY_RUN early return restored STILL recorded a nights row -- section 33 cannot fail"
 echo "a rehearsal night is captured, flagged, and only its push-dependent URL is withheld"
@@ -3426,6 +3463,9 @@ esac
 
 # MUTATION: put the pre-2026-08-02 status list back and require the drop to disappear.
 sed 's|"drafted", "in_theme"\]|"drafted"]|' "$NS_ROOT/scripts/selector.jac" > "$NS_ROOT/scripts/_sel_mutant.jac"
+# Both mutants in ONE trap, because `trap ... EXIT` REPLACES rather than appends: section 38 set its
+# own trap for $S38M, and this line silently took ownership of it. Naming both keeps that correct
+# instead of accidentally correct.
 trap 'rm -f "$NS_ROOT/scripts/_sel_mutant.jac" "$S38M"' EXIT
 grep -q '"shipped", "rejected", "drafted"\]' "$NS_ROOT/scripts/_sel_mutant.jac" \
     || fail "the section-40A mutant was not built; the mutation proves nothing"

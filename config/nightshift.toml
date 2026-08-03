@@ -276,7 +276,7 @@ reactive_audit_max_budget_usd = 8            # per REACTIVE LENS session. A SEPA
 # reactive phase still bills over ~$15 -- group sessions.jsonl by `phase` -- and not before. Doing
 # it on projection rather than measurement is how audit_timeout_min got raised twice for a box that
 # was never hit.
-reactive_single_session = false
+reactive_single_session = true
 
 night_budget_usd   = 50                      # WHOLE-NIGHT ceiling, and the only thing that actually
                                               # bounds spend: a per-session cap times fifty sessions is
