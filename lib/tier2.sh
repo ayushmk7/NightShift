@@ -513,17 +513,77 @@ tier2_select() {
     done
 }
 
+# A theme deferred BEFORE its apply session started, rejoined to the one carry-over stream.
+#
+# THE HOLE THIS CLOSES. tier2_select writes state/carryover.json from selection.json's `carryover`
+# field, and that field only ever describes findings the selector could not PACK -- over-night-budget
+# and no-clock-left. A theme that was packed, selected, and then turned away at the door by one of
+# tier2_apply's guards fell outside all three of the places this system remembers work:
+#   * no `in_theme` ledger row  — ns_jac ledger upsert-theme runs only after a session succeeds,
+#   * nothing in carryover.json — tier2_select wrote it before the apply loop ever ran,
+#   * only an ns_fail row       — which the digest reports and nothing ever reads back.
+# So its findings were not re-discovered and not retried; they were gone. Harmless-looking while the
+# only apply guard was the clock (which fires at the tail of a night, on themes the next audit would
+# re-find anyway); not harmless at all from 2026-08-04, when the night cost ceiling started deferring
+# themes from the FRONT of the loop -- on 2026-08-03's numbers that is most of the selection.
+#
+# THE SAME MECHANISM, not a parallel one: same file, same carry-flagged finding shape (see
+# selector.jac carry_findings), and therefore the same read at the top of tier2_select tomorrow.
+#
+# APPENDED, never overwritten -- `parse_result merge` over the existing file, oldest first, so the
+# carried copy still wins the (file, rule) dedupe. That is also why this is safe in BOTH phases
+# despite RECONCILIATION B7: B7 forbids the reactive pass DISPLACING the cycle phase's carry-over
+# file, and a merge cannot displace anything. A reactive theme deferred here is simply offered to
+# tier2_select cycle later the same night, and re-carried by it if it does not fit there either.
+#
+# NEVER FATAL, and loud when it fails: this runs inside the apply loop under errexit, and losing a
+# carry-over row must not also lose the themes behind it in the queue.
+tier2_defer_theme() {   # tier2_defer_theme <theme.json> <label> <why>
+    local theme_file=$1 label=$2 why=$3 carry="$NS_ROOT/state/carryover.json"
+    ns_fail "theme $label" "$why"
+    [ -s "$carry" ] || printf '[]\n' > "$carry"
+    if ns_jac selector carryover "$theme_file" > "$carry.defer" \
+        && ns_jac parse_result merge "$carry" "$carry.defer" > "$carry.tmp"; then
+        mv "$carry.tmp" "$carry"
+        ns_log S3 "theme $label carried to the next night ($(ns_jac parse_result len < "$carry" || echo 0) finding(s) now deferred)"
+    else
+        rm -f "$carry.tmp"
+        ns_fail "theme $label" "deferred, but its findings could not be added to $carry — they will not be retried unless a future audit re-finds them"
+    fi
+    rm -f "$carry.defer"
+}
+
 # Phase C — apply: fresh branch + fresh headless session per theme
 tier2_apply() {
     local phase=$1 sfx slug bslug branch theme_file prompt remaining attempt got_report limit_hit
-    local theme_task theme_cx attempt_model
+    local theme_task theme_cx attempt_model spent
     sfx="$(ns_phase_suffix "$phase")"
     ns_jac selector split "$LOG_DIR/selection$sfx.json" "$LOG_DIR" | while IFS= read -r slug; do
         theme_file="$LOG_DIR/theme-$slug.json"
 
         remaining="$(ns_remaining_min)"
         if [ "$remaining" -lt $(( NS_BUDGETS_APPLY_TIMEOUT_MIN + 20 )) ]; then
-            ns_fail "theme $slug" "no clock left — deferred to a future night"
+            tier2_defer_theme "$theme_file" "$slug" "no clock left — deferred to a future night"
+            continue
+        fi
+
+        # THE MONEY BRAKE, sitting beside the clock brake because it is the same kind of guard and
+        # defers to the same place. It was DELIBERATELY absent until 2026-08-04, on the arithmetic
+        # of 2026-07-31: eleven applies were $9.19 of $76.55, audits were 88% of the bill, and
+        # gating the applies would have thrown away work the night had already paid to find.
+        # 2026-08-03 killed that premise. The fan-out stopped itself at $54.78 of 50.00 at 00:19:30
+        # and the night still finished at $109.73, because sixteen more apply sessions were spawned
+        # between 00:26 and 01:56 with nothing checking, and the applies were $60.25 of that bill --
+        # 55%, not 12%. A ceiling that governs one of the two spending paths is not a ceiling.
+        # FAILS CLOSED: ns_spend_check (lib/common.sh) returns nonzero for an unreadable, malformed
+        # or unsummable ledger as well as for a spent one, and both stop the theme. A cost brake
+        # that cannot be evaluated must not read as "budget left" -- see the same note there.
+        # The honest residual, stated as the fan-out guard states its own: the check is per THEME,
+        # so a theme that passes it and then retries can straddle the ceiling by one more session,
+        # bounded by [budgets].max_budget_usd. It cannot run a theme that starts over the line.
+        if ! spent="$(ns_spend_check)"; then
+            tier2_defer_theme "$theme_file" "$slug" \
+                "NIGHT COST CEILING reached ($spent USD) — no apply session started; deferred to a future night"
             continue
         fi
 
@@ -622,10 +682,8 @@ tier2_apply() {
                 --max-turns "$NS_BUDGETS_MAX_TURNS" --max-budget-usd "$NS_BUDGETS_MAX_BUDGET_USD" \
                 --output-format json) > "$LOG_DIR/apply-$bslug.json" < /dev/null || true
 
-            # Apply spend is ACCUMULATED but the apply loop is deliberately NOT gated on the night
-            # ceiling — see [budgets].night_budget_usd. Audits are 88% of the bill; the applies are
-            # what ship, and refusing to spend $0.80 shipping work the night already paid $50 to
-            # find would be the expensive kind of thrift.
+            # Apply spend is ACCUMULATED here, which is what makes the per-theme brake at the top of
+            # this loop see its own cost and not just the audits' — see [budgets].night_budget_usd.
             ns_spend_add "$LOG_DIR/apply-$bslug.json"
 
             ns_jac parse_result meta < "$LOG_DIR/apply-$bslug.json" > "$LOG_DIR/meta-apply-$bslug.json" || true

@@ -321,6 +321,38 @@ def stack_base(files: list[str], claims: list[str]) -> str {
     return winner;
 }
 
+"""A packed theme projected back into the carry-over stream: its findings, carry-flagged, in the
+EXACT shape select() puts in selection.json's `carryover` field.
+
+Exists because select()'s carryover only knows about findings that never got packed. A theme that
+WAS packed and selected and then deferred at APPLY time -- by the clock guard or the night cost
+ceiling in lib/tier2.sh's tier2_apply -- used to leave a failed.tsv row and nothing else: no
+in_theme ledger row (that is written only after a session succeeds), and no entry in
+state/carryover.json (written by tier2_select, before apply runs). Its findings were simply gone
+from the system's memory, which is this project's "did not run scored as passed" defect wearing an
+apply guard's clothes -- the money brake landed 2026-08-04 and would have started silently
+deleting themes the moment it fired.
+
+`carry` is what makes them pack FIRST tomorrow (pack_themes sorts on it), and it is the only field
+added -- the findings already carry fingerprint and score, stamped by select() before they were
+ever packed, so a reader cannot tell one of these from a selection-time carry-over entry.
+
+EMPTY IS AN ERROR, not an empty list. pack_themes only ever builds a theme from a non-empty
+bucket, so a theme with no findings is malformed; returning [] would let the caller merge nothing
+and log success, which is the exact silent-vanishing this function exists to stop."""
+def carry_findings(theme: dict) -> list[dict] {
+    out: list[dict] = [];
+    for f in as_list(theme["findings"]) {
+        item: dict = as_dict(f);
+        item["carry"] = True;
+        out.append(item);
+    }
+    if not out {
+        raise ValueError("theme " + str(theme.get("slug", "?")) + " carries no findings to defer");
+    }
+    return out;
+}
+
 """The human-facing theme name (the digest's only use of it): the group key with its task prefix
 removed, so a theme reads as `compiler-type-system` rather than repeating the task."""
 def group_name(key: str, task: str) -> str {
@@ -403,11 +435,34 @@ def impl_siblings(file: str, repo_dir: str) -> list[str] {
     return [c for c in candidates if os.path.exists(repo_dir + "/" + c)];
 }
 
-"""Eligibility (TPRD S3-B step 2). Returns a drop reason, or None when the finding is in play."""
-def drop_reason(f: dict, ledger: dict[str, dict], globs: list[str]) -> str | None {
+"""Eligibility (TPRD S3-B step 2). Returns a drop reason, or None when the finding is in play.
+
+repo_dir is here for `file-gone`, and that check is the finding's OWN file, which nothing used to
+look at. impl_siblings has existence-checked its GUESSES since the 36-slot measurement below it,
+but a guess is not the only path that can be wrong: the audit reads a clone, the clone is refreshed
+before the next night, and upstream renames files between the two. Measured on the 2026-07-31
+replay -- jac/jaclang/runtimelib/planner.jac was audited, upstream renamed it to query_planner.jac,
+and the finding still packed a theme naming a path that is not on disk. The apply session pays a
+model call, a branch and a 25-minute timeout to discover the file is gone and report "no changes
+made", which is this project's "did not run scored as passed" defect at the file level.
+
+TERMINAL, and deliberately so: select() carries only over-night-budget and no-clock-left, and
+nothing about tomorrow puts a deleted path back. The finding does not need carrying -- the file is
+gone, so the next audit over the refreshed clone either re-finds the issue at its new path (a new
+fingerprint, since fingerprint() is keyed on the file) or does not find it at all. Carrying the
+dead path instead would re-drop it for the same reason every night, forever.
+
+STANDS DOWN when there is no tree to check against -- the unit tests' "/nonexistent-repo", a clone
+that failed -- exactly as vestigial_test_files and blocking_test_files do, and on the same guard.
+Dropping every finding because the clone is missing would silently ship nothing and report a clean
+night, which is a far more expensive failure than the one this catches."""
+def drop_reason(f: dict, ledger: dict[str, dict], globs: list[str], repo_dir: str) -> str | None {
     fp: str = str(f["fingerprint"]);
     if is_protected(str(f["file"]), globs) {
         return "protected-path";
+    }
+    if os.path.isdir(repo_dir + "/jac") and not os.path.exists(repo_dir + "/" + str(f["file"])) {
+        return "file-gone";
     }
     if fp in ledger {
         status: str = str(ledger[fp]["status"]);
@@ -617,7 +672,7 @@ def select(findings: list[dict], config_path: str, ledger_path: str,
     for f in findings {
         f["fingerprint"] = fingerprint(str(f["file"]), str(f["rule"]));
         f["score"] = score_of(f);
-        reason: str | None = drop_reason(f, ledger, globs);
+        reason: str | None = drop_reason(f, ledger, globs, repo_dir);
         if reason is None {
             eligible.append(f);
         } else {
@@ -690,6 +745,15 @@ with entry {
                 print(str(theme2["slug"]) + "\t" + str(path));
             }
         }
+    # One deferred-at-apply theme, projected back into the carry-over stream as a findings ARRAY --
+    # the same shape `parse_result merge` consumes and `parse_result field carryover` emits, so
+    # lib/tier2.sh can append it to state/carryover.json with the reader it already uses. See
+    # carry_findings; a theme with no findings exits nonzero rather than emitting `[]`.
+    } elif args[1] == "carryover" and len(args) == 3 if len(args) > 1 else False {
+        with open(args[2], "r") as f {
+            theme5: dict = parse_obj(f.read());
+        }
+        print(json.dumps(carry_findings(theme5)));
     # Which already-applied branch this theme must be stacked on, or nothing for "cut from main".
     } elif args[1] == "stack-base" and len(args) == 4 if len(args) > 1 else False {
         with open(args[2], "r") as f {
@@ -721,6 +785,7 @@ with entry {
         eprint("       jac run selector.jac split <selection.json> <outdir>");
         eprint("       jac run selector.jac dropped <selection.json>");
         eprint("       jac run selector.jac slots <selection.json>");
+        eprint("       jac run selector.jac carryover <theme.json>");
         eprint("       jac run selector.jac stack-base <theme.json> <claims.tsv>");
         eprint("       jac run selector.jac claims <theme.json> <branch>");
         # NONZERO. The sibling arm in check_scope.jac carries the full reasoning (RECONCILIATION
@@ -948,6 +1013,48 @@ test "impl_siblings pairs decl<->impl BOTH ways, and returns only paths that exi
     assert impl_siblings("gw/other.jac", repo) == ["gw/other.impl.jac"];
 }
 
+test "file-gone: a finding whose OWN file upstream renamed away is dropped at selection" {
+    import tempfile;
+    import os as _os;
+    repo: str = tempfile.mkdtemp();
+    _os.makedirs(repo + "/jac/jaclang/runtimelib");
+    # The real 2026-07-31 shape: the audit found planner.jac, upstream renamed it to
+    # query_planner.jac before the clone was refreshed, and only the new name is on disk.
+    with open(repo + "/jac/jaclang/runtimelib/query_planner.jac", "w") as f {
+        f.write("x\n");
+    }
+    body: str = "[budgets]\nthemes_per_night = 4\nfiles_per_theme = 5\nloc_per_theme = 500\napply_timeout_min = 25\n[protect]\nglobs = []\n" + TEST_TASKS;
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as tf {
+        cfg_path: str = tf.name;
+        tf.write(body);
+    }
+    mk = lambda path: str -> dict {
+        return {"file": path, "rule": "dead-code", "snippet": "s", "summary": "x",
+                "task": "dead-code", "est_loc_saved": 20, "confidence": 5, "risk": 1,
+                "theme_hint": "rt", "complexity": "trivial"};
+    };
+    gone: dict = select([mk("jac/jaclang/runtimelib/planner.jac")], cfg_path,
+                        "/nonexistent-ledger", "/nonexistent-state", 999, repo);
+    assert as_list(gone["themes"]) == [];
+    assert [str(d["reason"]) for d in as_list(gone["dropped"])] == ["file-gone"];
+    # TERMINAL, like protected-path and blocked-by-protected-test: the path is gone, so carrying it
+    # would re-drop it for the same reason every night while the real code lives elsewhere.
+    assert as_list(gone["carryover"]) == [];
+
+    # THE FALSE-POSITIVE ARM, the one that matters: a rule that drops everything satisfies the three
+    # assertions above and costs the harness its entire output. The file that IS on disk still packs.
+    live: dict = select([mk("jac/jaclang/runtimelib/query_planner.jac")], cfg_path,
+                        "/nonexistent-ledger", "/nonexistent-state", 999, repo);
+    assert len(as_list(live["themes"])) == 1;
+    assert as_list(live["dropped"]) == [];
+
+    # ...and with NO tree to check against the rule stands down rather than dropping the night's
+    # whole selection, the same way vestigial_test_files and blocking_test_files do.
+    blind: dict = select([mk("jac/jaclang/runtimelib/planner.jac")], cfg_path,
+                         "/nonexistent-ledger", "/nonexistent-state", 999, "/nonexistent-repo");
+    assert len(as_list(blind["themes"])) == 1;
+}
+
 test "packing pulls a finding's EXISTING impl sibling into theme scope" {
     import tempfile;
     import os as _os;
@@ -1151,6 +1258,31 @@ test "clock shedding removes lowest-scored theme" {
     assert any([str(d["reason"]) == "no-clock-left" for d in as_list(result["dropped"])]);
     # the shed theme is carried, so a short night defers work rather than losing it
     assert [str(as_dict(c)["theme_hint"]) for c in as_list(result["carryover"])] == ["small"];
+
+    # THE APPLY-TIME HALF OF THE SAME MECHANISM. The theme that DID fit the clock at selection can
+    # still be deferred by tier2_apply's clock or cost guard, and until 2026-08-04 that left it
+    # nowhere: no ledger row, nothing in state/carryover.json. Projected here, it must be
+    # INDISTINGUISHABLE from the selection-time entry above -- same keys, same carry flag -- because
+    # tomorrow night reads both through the one reader.
+    kept: dict = as_dict(as_list(result["themes"])[0]);
+    deferred_at_apply: list[dict] = carry_findings(kept);
+    assert len(deferred_at_apply) == 1;
+    assert deferred_at_apply[0]["carry"] == True;
+    assert sorted(deferred_at_apply[0].keys())
+        == sorted(as_dict(as_list(result["carryover"])[0]).keys());
+    # ...and it is the finding, not the theme: the fingerprint is what tomorrow's dedupe and
+    # re-discovery key on, so an entry without it would silently never come back.
+    assert str(deferred_at_apply[0]["fingerprint"])
+        == fingerprint("big/a.jac", "dead-code");
+    # A theme with nothing in it is a BUG, and must not project as a quiet empty list -- that is
+    # the vanishing this whole path exists to stop, one layer down.
+    raised: bool = False;
+    try {
+        carry_findings({"slug": "empty-theme", "findings": []});
+    } except ValueError {
+        raised = True;
+    }
+    assert raised;
 }
 
 test "the slots reader names every file of every selected theme, and nothing else" {

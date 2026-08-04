@@ -65,11 +65,19 @@ v2: ... + {phase, task, complexity, theme_hint, carry}
 
 - `status` — `applied`, `not_selected`, or a terminal selector drop reason: `ledger-drafted`,
   `ledger-shipped`, `ledger-rejected`, `over-theme-budget`, `over-night-budget`, `no-clock-left`,
-  `blocked-by-protected-test`.
+  `blocked-by-protected-test`, `file-gone`.
+- `file-gone` means the finding's own file was not on disk when the selection ran — upstream
+  renamed or deleted it between the audit and the clone refresh. Added 2026-08-04; rows before that
+  date carry the finding under whatever reason it drew instead, usually `applied`, since the theme
+  packed and the apply session then found nothing to change.
 - `task` — which of the four lenses found it (`dead-code`, `maintenance`, `coverage`,
   `abstraction`). The most waste-relevant field in the file, and absent from every v1 row.
 - `carry` — true when the finding was banked by an earlier night's audit and re-packed by this
-  one, rather than freshly discovered. Carried findings cost nothing to find.
+  one, rather than freshly discovered. Carried findings cost nothing to find. Two things bank a
+  finding, and the flag does not distinguish them: the selector could not fit it (`over-night-budget`,
+  `no-clock-left`), or — since 2026-08-04 — `tier2_apply` turned its whole theme away at the clock
+  or the night cost ceiling before the session started. Both write the same `state/carryover.json`
+  in the same shape, on purpose.
 
 ## `refactors.jsonl`
 
@@ -110,7 +118,11 @@ v2: ... + {dry_run, phases, findings_carryover, findings_fresh, themes_deferred,
   count; do not compare the two generations on this field.
 - `themes_deferred` is the carry queue — findings the audit paid for that the night had no clock
   or budget to apply. A large gap between `findings_count` and `themes_selected` is the signal
-  that audit money is being spent and not converted.
+  that audit money is being spent and not converted. **Selection-time only**: a theme that packed
+  and was then turned away by `tier2_apply`'s clock or cost guard is carried in
+  `state/carryover.json` but is not counted here, so on a night whose apply loop hit the cost
+  ceiling this undercounts the real backlog. `themes_selected` minus the branches that reached S4
+  is the other half.
 - `cost_usd` / `turns` cover the whole night, every phase, audits plus applies plus repairs.
 - `cost_source` — `spend.txt` on a live night (the session ledger, retry-complete and
   overwrite-proof) or `envelopes` when a backfill had to reconstruct the bill from

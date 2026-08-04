@@ -2388,8 +2388,127 @@ case "$(shard_probe "$(printf 'barely-started\t1.00')")" in
     "called=yes") : ;;
     *) fail "the cycle audit fan-out scheduled nothing with $49 of budget left; its brake is stuck on" ;;
 esac
+
+# ...and the APPLY loop, which is the half that had no brake at all until 2026-08-04 and is where the
+# money actually went. 2026-08-03: the cycle fan-out stopped itself at 54.78 of 50.00 at 00:19:30 and
+# the night closed at $109.73 over 37 sessions, because tier2_apply started sixteen more sessions
+# between 00:26 and 01:56 with nothing checking -- $60.25 of apply against $44.44 of audit. Every
+# assertion above passed on that night. Driven through the real tier2_apply against the same stub.
+S27A="$S27/apply"; mkdir -p "$S27A/state"
+git init -q "$S27A/repo"
+git -C "$S27A/repo" config user.email n@n; git -C "$S27A/repo" config user.name n
+mkdir -p "$S27A/repo/jac/jaclang/cli"
+: > "$S27A/repo/seed.txt"; : > "$S27A/repo/jac/jaclang/cli/a.jac"
+git -C "$S27A/repo" add -A
+git -C "$S27A/repo" -c commit.gpgsign=false commit -qm seed
+git -C "$S27A/repo" branch -M main
+cp "$S27/claude" "$S27A/claude"
+# NS_ROOT is overridden inside the probe so tier2_defer_theme's "$NS_ROOT/state/carryover.json"
+# lands in this sandbox and not in the live repo's state/; ns_jac resolves scripts/ and the apply
+# prompts against the same variable, so link the real ones in. Same technique as section 22's B7.
+ln -sfn "$NS_ROOT/scripts" "$S27A/scripts"
+ln -sfn "$NS_ROOT/prompts" "$S27A/prompts"
+
+# ONE finding, put through the REAL selector TWICE -- and that is what makes the carry-over claim
+# below a measurement rather than a fixture. With a full night it packs into a theme (which is what
+# tier2_apply then turns away at the door); with no clock left the SELECTOR defers it itself, which
+# is the shape state/carryover.json has carried since carry-over existed. The two must come out
+# byte-identical, or "deferred at apply time" is a second, weaker class of memory.
+printf '{"verify_estimate_min": 1}\n' > "$S27A/state.json"
+printf '[{"file":"jac/jaclang/cli/a.jac","rule":"dead-code","snippet":"def gone() {","summary":"x","task":"dead-code","theme_hint":"brake-probe","est_loc_saved":40,"confidence":5,"risk":1,"complexity":"trivial"}]\n' \
+    > "$S27A/findings.json"
+jac run scripts/selector.jac select config/nightshift.toml /nonexistent "$S27A/state.json" 999 "$S27A/repo" \
+    < "$S27A/findings.json" > "$S27A/selection.json" \
+    || fail "the selector could not build the apply probe's selection"
+jac run scripts/selector.jac select config/nightshift.toml /nonexistent "$S27A/state.json" 1 "$S27A/repo" \
+    < "$S27A/findings.json" > "$S27A/short.json" \
+    || fail "the selector could not build the no-clock control selection"
+jac run scripts/parse_result.jac field carryover < "$S27A/short.json" > "$S27A/carry-at-selection.json"
+grep -q 'jac/jaclang/cli/a.jac' "$S27A/carry-at-selection.json" \
+    || fail "the SELECTION-time control carried nothing, so the shape comparison below would compare against an empty list and pass on anything"
+# The slug is read off the selection rather than spelled here: a hardcoded one silently stops
+# matching the day group_key changes, and every assertion naming it would then pass vacuously.
+mkdir -p "$S27A/probe-split"
+S27SLUG="$(jac run scripts/selector.jac split "$S27A/selection.json" "$S27A/probe-split" | head -1)"
+[ -n "$S27SLUG" ] || fail "the apply probe's selection packed no theme; every assertion below would be driving an empty loop"
+# YESTERDAY's carry-over, restored before every probe. tier2_defer_theme must ADD to this file, not
+# replace it: a deferral that overwrites the carry-over destroys more work than it saves.
+printf '[{"file":"jac/jaclang/scale/old.jac","rule":"dead-code","snippet":"s","summary":"y","task":"dead-code","theme_hint":"scale","est_loc_saved":10,"confidence":5,"risk":1,"complexity":"trivial","fingerprint":"yesterday1","score":10,"carry":true}]\n' \
+    > "$S27A/carryover.seed"
+apply_probe() {        # apply_probe <ledger-row> [carry-seed] -> "called=<yes|no>"
+    rm -f "$S27A/CLAUDE_WAS_CALLED" "$S27A/warnings.txt" "$S27A/failed.tsv" "$S27A/run.log" \
+          "$S27A/stack.tsv" "$S27A/claims.tsv" "$S27A"/theme-*.json "$S27A"/apply-*.json
+    cp "${2:-$S27A/carryover.seed}" "$S27A/state/carryover.json"
+    printf '%s\n' "$1" > "$S27A/spend.txt"
+    NS_ROOT="$NS_ROOT" bash -c 'set -euo pipefail
+        . "$NS_ROOT/lib/common.sh"; ns_load_config; . "$NS_ROOT/lib/tier2.sh"
+        LOG_DIR="$1"; REPO="$1/repo"; NS_PATHS_CLAUDE="$1/claude"; NS_ROOT="$1"
+        export STUB27_CALLED="$1/CLAUDE_WAS_CALLED"
+        date +%s > "$1/start_epoch"; tier2_apply cycle' _ "$S27A" > "$S27A/out.txt" 2>&1 || true
+    if [ -e "$S27A/CLAUDE_WAS_CALLED" ]; then printf 'called=yes'; else printf 'called=no'; fi
+}
+case "$(apply_probe "$(printf 'spent-it-all\t99.00')")" in
+    "called=no") : ;;
+    *) fail "tier2_apply started an apply session with the night's cost ceiling already spent -- the 2026-08-03 defect is back" ;;
+esac
+grep -q 'NIGHT COST CEILING reached (99.00 of 50.00' "$S27A/run.log" \
+    || fail "the apply brake fired silently, or without the numbers: $(cat "$S27A/run.log" 2>/dev/null)"
+grep -q "$S27SLUG" "$S27A/failed.tsv" \
+    || fail "the deferred theme was not recorded in failed.tsv; a theme that never ran must not read as one that passed"
+
+# --- THE DEFERRED THEME MUST STILL EXIST TOMORROW ----------------------------------------------
+# failed.tsv is a REPORT, not memory: nothing reads it back. Until 2026-08-04 that row was the only
+# trace an apply-time deferral left -- no in_theme ledger row (that is written after a session
+# succeeds) and nothing in state/carryover.json (tier2_select wrote it before the apply loop ran) --
+# so the findings behind the theme were not retried and not re-discovered. They were gone. Harmless
+# while the only apply guard was the clock, which fires at the tail of a night; not harmless at all
+# now that the cost ceiling defers themes from the FRONT of the loop.
+grep -q 'jac/jaclang/cli/a.jac' "$S27A/state/carryover.json" \
+    || fail "the theme deferred by the cost ceiling left no entry in carryover.json -- its findings vanish instead of being retried: $(cat "$S27A/state/carryover.json")"
+grep -q 'yesterday1' "$S27A/state/carryover.json" \
+    || fail "the apply-time deferral OVERWROTE yesterday's carry-over instead of appending to it; deferring one theme must not destroy the rest of the backlog"
+# ...and the next night must actually be able to pack it, which is the whole point: fed back through
+# the selector the way tier2_select feeds carryover.json, it becomes a theme again.
+jac run scripts/selector.jac select config/nightshift.toml /nonexistent "$S27A/state.json" 999 "$S27A/repo" \
+    < "$S27A/state/carryover.json" > "$S27A/next-night.json" \
+    || fail "the carry-over tier2_apply wrote is not a findings array the selector can read back"
+jac run scripts/selector.jac slots "$S27A/next-night.json" | grep -q 'jac/jaclang/cli/a.jac' \
+    || fail "the deferred theme's file is in carryover.json but the next selection pass does not pack it"
+
+# --- ...IN A SHAPE INDISTINGUISHABLE FROM A SELECTION-TIME DEFERRAL -----------------------------
+# Same file, same schema, same read path -- asserted as a byte comparison against the control built
+# above, so a parallel mechanism that merely looks similar (a different key set, a missing carry
+# flag, a lost fingerprint) cannot pass. Run against an EMPTY carry-over so the file holds only the
+# apply-time entry and the two are directly comparable.
+printf '[]\n' > "$S27A/carryover.empty"
+apply_probe "$(printf 'spent-it-all\t99.00')" "$S27A/carryover.empty" > /dev/null
+cmp -s "$S27A/state/carryover.json" "$S27A/carry-at-selection.json" \
+    || fail "an apply-time deferral is written in a DIFFERENT shape from a selection-time one; tomorrow's selector reads both through one reader. apply=$(cat "$S27A/state/carryover.json") selection=$(cat "$S27A/carry-at-selection.json")"
+
+# ...and it fails CLOSED, the assertion this repo exists to keep making: a ledger the reader cannot
+# sum is NOT "budget left". Without this arm the guard could be `[ -s spend.txt ] && ...` and every
+# other assertion here would still pass.
+case "$(apply_probe 'no-session-id-column')" in
+    "called=no") : ;;
+    *) fail "tier2_apply started an apply session off an unreadable cost ledger -- 'did not run' scoring as 'passed', at the bill" ;;
+esac
+# THE POSITIVE CONTROL, without which "called=no" is satisfied by a tier2_apply that never spawns
+# anything: the same theme, the same repo, $1.00 spent, must reach the session.
+case "$(apply_probe "$(printf 'barely-started\t1.00')")" in
+    "called=yes") : ;;
+    *) fail "tier2_apply started nothing with $49 of budget left; the apply brake is stuck on: $(cat "$S27A/out.txt" 2>/dev/null)" ;;
+esac
+grep -q 'NIGHT COST CEILING' "$S27A/run.log" 2>/dev/null \
+    && fail "the apply brake fired with $49 of budget left"
+# THE CARRY-OVER'S OWN FALSE-POSITIVE ARM. A theme that was NOT deferred must not be carried, or
+# "it appears in carryover.json" is satisfied by a tier2_apply that carries everything it touches --
+# and every finding the night actually shipped would be re-bought tomorrow.
+grep -q 'jac/jaclang/cli/a.jac' "$S27A/state/carryover.json" \
+    && fail "a theme that REACHED its apply session was still written to carryover.json; work that ran is not work that was deferred"
+cmp -s "$S27A/state/carryover.json" "$S27A/carryover.seed" \
+    || fail "the carry-over file was modified by a theme that was never deferred: $(cat "$S27A/state/carryover.json")"
 rm -rf .jac
-echo "the night ceiling is summed from real envelopes, fails closed, and stops the fan-out for real"
+echo "the night ceiling is summed from real envelopes, fails closed, stops BOTH the fan-out and the apply loop, and a theme it defers reappears in carryover.json in the selection-time shape"
 
 echo "== 28. the digest tells the truth about the night it describes =="
 # 2026-07-31 delivered a real email to a real inbox saying, for a 97-minute night that pushed

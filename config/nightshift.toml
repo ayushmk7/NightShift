@@ -313,9 +313,11 @@ reactive_single_session = true
 night_budget_usd   = 50                      # WHOLE-NIGHT ceiling, and the only thing that actually
                                               # bounds spend: a per-session cap times fifty sessions is
                                               # not a brake. lib/common.sh sums the total_cost_usd the
-                                              # harness already parses out of every envelope, and the
-                                              # two audit fan-outs (tier2_audit_all, reactive_main) stop
-                                              # SCHEDULING once the sum reaches this, loudly.
+                                              # harness already parses out of every envelope, and every
+                                              # path that starts a session -- the two audit fan-outs
+                                              # (tier2_audit_all, reactive_main) and the apply loop
+                                              # (tier2_apply) -- stops SCHEDULING once the sum reaches
+                                              # this, loudly.
                                               # WHAT IT PROTECTS AGAINST, with the arithmetic: on
                                               # 2026-07-31 one unattended night spent $76.55 in 97
                                               # minutes of a 480-minute window -- 27 UNIQUE session_ids,
@@ -335,13 +337,22 @@ night_budget_usd   = 50                      # WHOLE-NIGHT ceiling, and the only
                                               # whole reactive pass and it is five times the entire apply
                                               # phase, so the value-producing half of the night survives
                                               # the brake.
-                                              # DELIBERATELY NOT CHECKED IN tier2_apply: audits are 88%
-                                              # of the spend and the applies are what ship. Gating them
-                                              # on the same number would mean a night that spent its
-                                              # ceiling auditing throws that work away instead of
-                                              # shipping it. Apply spend is still ACCUMULATED here (so
-                                              # the number is the night's real total); it is the audit
-                                              # scheduling that is gated on it.
+                                              # IT USED TO BE UNCHECKED IN tier2_apply, on that same
+                                              # arithmetic: audits were 88% of the spend, the applies
+                                              # are what ships, and gating them would throw away work
+                                              # the night had already paid to find. 2026-08-03 retired
+                                              # that argument with numbers. The cycle fan-out braked
+                                              # itself at 54.78 of 50.00 at 00:19:30 and the night still
+                                              # closed at $109.73 over 37 sessions, because sixteen more
+                                              # apply sessions were started between 00:26 and 01:56 with
+                                              # nothing checking -- $60.25 of apply against $44.44 of
+                                              # audit. The applies were 55% of that bill, not 12%, so a
+                                              # brake on the audits alone let the night run to 2.2x this
+                                              # number. tier2_apply now checks it per THEME, before any
+                                              # session starts, and defers the rest of the selection to
+                                              # a future night; a theme already in flight still finishes
+                                              # (bounded by max_budget_usd above), which is the same
+                                              # honest overshoot the fan-out guards carry.
 
 [agent]
 # Two models, both pinned. An empty value means "account default", which silently drifts with

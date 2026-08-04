@@ -1,9 +1,9 @@
 # Nightshift — Workflow
 
-End-to-end map of the harness as it actually runs, current as of the v2 cutover (2026-08-02):
-four task lenses cycling nightly over a whole-repo sharded audit, a reactive pass over what merged
-upstream that day, an S4 gate that replicates locally the CI jobs a fork PR cannot reach, and draft
-PRs opened automatically at the end of the night.
+End-to-end map of the harness as it actually runs, current as of 2026-08-04 (the v2 cutover was
+2026-08-02): four task lenses cycling nightly over a whole-repo sharded audit, a reactive pass over
+what merged upstream that day, an S4 gate that replicates locally the CI jobs a fork PR cannot
+reach, and draft PRs opened automatically at the end of the night.
 
 Stages `S0 – S6` run nightly and unattended. `S7` is the human loop, and it is now mostly *review
 on GitHub* — S5 opens the PRs itself.
@@ -96,32 +96,34 @@ flowchart TD
         CARRY["carry-over · findings a past night banked but could not apply · no audit cost"]
         S3B["S3b · CYCLE · tonight's ONE task, rotating dead-code, abstraction, maintenance, coverage"]
         SHARD["8 LOC-balanced shards of the whole repo · concurrency 2 · cap $8 per shard"]
-        AUDIT["claude -p AUDIT · Opus, or Sonnet for shards named in [shards].sonnet_shards · read-only · 130 turns · 30 min box"]
+        AUDIT["claude -p AUDIT · Opus, or Sonnet for shards named in [shards].sonnet_shards · dontAsk + read-only allow-list · 130 turns · 30 min box"]
         PJSON{"parse_result merge · any shard produced valid findings JSON?"}
         DEAD["a session that DIED is a dead lens · never salvaged into 0 findings"]
-        SEL["selector · drop ledger-known / protected / blocked-by-protected-test / twice-failed · score · group by file+dir · pack at most 15 themes · fit clock"]
+        SEL["selector · drop ledger-known / protected / file-gone / blocked-by-protected-test / twice-failed · score · group by file+dir · pack at most 15 themes · fit clock"]
         BASE["pick the base · a theme sharing a file with one already applied tonight stacks on it, else main"]
         APPLY["per theme · branch cut from that base · fresh claude -p APPLY · acceptEdits · scoped tools · NO push/gh/network"]
         MODEL{"complexity routes attempt 1"}
         RJSON{"report JSON ok and diff non-empty?"}
         FRAG["release-note fragment 0000.kind.md · QUEUE the branch, then the ledger row (non-fatal)"]
-        CEIL3{"night_budget_usd 50 reached?"}
+        CEIL3{"per theme, BEFORE the session · clock left? · night_budget_usd 50 unspent?"}
+        DEFER3["tier2_defer_theme · ns_fail row AND the theme's findings merged into carryover.json"]
         S3A --> CARRY --> S3B --> SHARD --> AUDIT --> PJSON
         AUDIT -.->|"unfinished:*"| DEAD
         PJSON -->|"no · nothing ships tonight"| S4
-        PJSON -->|"yes"| SEL --> BASE --> APPLY --> MODEL
+        PJSON -->|"yes"| SEL --> BASE --> CEIL3
+        CEIL3 -->|"no · also when the spend ledger cannot be read · fails closed"| DEFER3
+        CEIL3 -->|"yes"| APPLY --> MODEL
         MODEL -->|"trivial / mechanical"| SONNET["Sonnet"]
         MODEL -->|"judgement"| OPUS["Opus"]
         SONNET --> RJSON
         OPUS --> RJSON
         RJSON -->|"no · or the agent declined"| DROP3["delete branch · ledger failed_verify · decline kept as data"]
         RJSON -->|"yes"| FRAG
-        FRAG --> CEIL3
-        CEIL3 -->|"yes · stop the fan-out"| S4
-        CEIL3 -->|"no · next theme"| APPLY
+        FRAG -->|"next theme"| CEIL3
     end
     FRAG --> S4
     DROP3 --> S4
+    DEFER3 --> S4
 
     subgraph S4["S4 · Verify gate · fail-closed · per queued branch · cheap jobs first"]
         direction TB
@@ -198,6 +200,7 @@ flowchart TD
     STATE[("state/state.json · cycle_index · verify_estimate · last_merge_poll")]
     STACK[("logs/DATE/stack.tsv + claims.tsv · branch to base · ORCHESTRATOR-written, never a theme key")]
     SPEND[("logs/DATE/spend.txt · session_id TAB cost · retry-complete")]
+    CARRYF[("state/carryover.json · findings banked for a future night · one file, one schema, append-only")]
     DS[("dataset/*.jsonl · nights · audit_findings · refactors · sessions")]
     DRAFTSB[("nightshift/drafts orphan branch · drafts/*.md + themes/*.json + ledger")]
     PULL -.->|read| LEDGER
@@ -212,6 +215,9 @@ flowchart TD
     AUDIT -.->|charge| SPEND
     APPLY -.->|charge| SPEND
     CEIL3 -.->|read| SPEND
+    CARRY -.->|read| CARRYF
+    SEL -.->|write| CARRYF
+    DEFER3 -.->|merge into| CARRYF
     ROW -.->|write| LEDGER
     ROW -.->|append| DS
     DROP3 -.->|append as a decline| DS
@@ -263,10 +269,12 @@ Every finding is remembered across nights so work is never re-litigated. The fin
 ```mermaid
 stateDiagram-v2
     [*] --> new: audit surfaces it (cycle shard or reactive lens)
-    new --> deferred: did not fit the theme / night / clock budget
+    new --> deferred: did not fit the theme / night / clock budget at selection, OR its theme was turned away at apply time by the clock or the night cost ceiling — SAME carryover.json either way, since 2026-08-04
     deferred --> in_theme: re-packed on a later night, at zero audit cost
     new --> in_theme: selected and applied — RECORDED since 2026-08-02, which is what stops the cycle phase re-buying a finding the reactive pass already has a branch for
     new --> blocked: only referencing file is a protected test
+    new --> file_gone: upstream renamed or deleted the file between the audit and the clone refresh
+    file_gone --> [*]: terminal, deliberately not carried — the next audit re-finds it at its new path under a new fingerprint
     in_theme --> drafted: S4 green, S5 pushed, PR not yet open
     drafted --> shipped: S5 opened the draft PR upstream
     in_theme --> failed_verify: S4 red, or the agent declined the change
@@ -287,11 +295,22 @@ Two jac binaries exist and are never mixed: `$NS_PATHS_JAC` runs the harness's o
 `$NS_PATHS_JAC_REPO` is the dev build inside `work/repo` and is the only one that touches the
 target repo.
 
+Every `claude -p` session names its own permission mode on the command line — `--permission-mode
+dontAsk` for the audits, `--permission-mode acceptEdits` for the applies, each with an explicit
+`--allowedTools` list. **Nothing here relies on the machine's global Claude Code settings**, and
+`~/.claude/settings.json` carries no `bypassPermissions` default (it was removed 2026-08-04); a
+session's permissions are whatever `lib/tier2.sh` passes it and nothing else. The one piece of
+per-machine setup a fresh deploy does need is the `jac` MCP server, registered against the target
+worktree — `cd work/repo && claude mcp add jac -- jac mcp`. It is a local registration in
+`~/.claude.json`, not a `.mcp.json` in the target repo, so a fresh clone at `work/repo` does not
+inherit it and both the audit and apply allow-lists' `mcp__jac__*` entries silently resolve to
+nothing until it is added.
+
 ```mermaid
 flowchart LR
     subgraph ENTRY["bin"]
         NS["nightshift.sh · run / dry-run / promote / discard / status / baseline / mirror / dataset-backfill"]
-        TH["test-harness.sh · 38 sections · every tripwire mutation-tested"]
+        TH["test-harness.sh · 41 sections · every tripwire mutation-tested"]
     end
     subgraph LIB["lib · bash stages"]
         CM["common.sh · seams, spend ledger, jobs, git/gh wrappers"]
@@ -408,9 +427,10 @@ lowering `audit_max_budget_usd` to 5 (it would have truncated 5 of the 9 audits 
 
 ## 7. The one defect class this whole design is shaped around
 
-**"Did not run, scored as passed."** Eleven-plus instances have been found in this harness, every
-one of them in a gate, none of them caught by a passing test. The cause is always the same: a
-command exits 0 for *nothing to do* and 0 for *all good*, and the caller cannot tell the two apart.
+**"Did not run, scored as passed."** Thirteen-plus instances have been found in this harness, every
+one of them in a gate or a guard, none of them caught by a passing test. The cause is always the
+same: a command exits 0 for *nothing to do* and 0 for *all good*, and the caller cannot tell the
+two apart.
 
 The countermeasure is always the same too — a **positive assertion that the work happened**, not
 just that it did not fail:
@@ -434,6 +454,24 @@ just that it did not fail:
 - `selector`'s usage arm exited 0 too, and `tier2_select` reads it on stdout — so any arity drift
   would have produced an empty selection, "no themes tonight", and a night reporting success having
   shipped nothing. Now exits 2, like `check_scope`.
+- A theme deferred at *apply* time — by the clock guard, and from 2026-08-04 by the night cost
+  ceiling — left only an `ns_fail` row. No `in_theme` ledger row (that is written after a session
+  succeeds) and nothing in `state/carryover.json` (`tier2_select` wrote it before the apply loop
+  ran), so its findings were neither retried nor re-discovered: they were gone. Both guards now
+  route through `tier2_defer_theme`, which merges the theme's findings into the same carry-over
+  file, in the same carry-flagged shape, that selection-time deferrals use — appended, never
+  overwritten. **Two holes of the same shape are known and unfixed:** the apply loop's
+  session-limit `break` never drains the `selector split` pipe, so the themes behind it are never
+  read and cannot be carried; and a theme whose session dies or commits nothing still gets only an
+  `ns_fail`.
+- `selector`'s `drop_reason` existence-checked the *sibling* paths it derives but never the
+  finding's own `file`, so a finding naming a path upstream had renamed away
+  (`runtimelib/planner.jac` → `query_planner.jac`, measured on the 2026-07-31 replay) packed a
+  theme against a file not on disk, and the apply session paid a model call, a branch and a
+  25-minute box to report "no changes made". Now dropped `file-gone` — terminal and deliberately
+  not carried, because the next audit over the refreshed clone re-finds it at its new path. It
+  stands down when `repo_dir/jac` is not a directory, so a missing or failed clone cannot silently
+  drop the night's entire selection and report a clean night.
 
 The sibling class is **assertions that cannot fail**: `( set -e; … ) || fail` is vacuous, a
 `grep -q` can match the comment instead of the code, and a regression test can contain the bug it
@@ -450,3 +488,14 @@ A related shape, found in the same sweep: an assertion pinned to a **current con
 rather than to the invariant. Section 22 hard-coded "4 lens rows", so enabling the sweep reddened a
 section that has nothing to say about it. It now derives the expected shape from the live config and
 asserts both — which is strictly more coverage than the number it replaced.
+
+And one more, the most expensive to date: an assertion that covers **one of the two paths** the
+invariant runs on. Section 27 proved the night cost ceiling was summed from real envelopes, failed
+closed, and stopped the audit fan-out — and stayed green through 2026-08-03, a night that braked its
+fan-out at $54.78 of $50.00 at 00:19:30 and still closed at $109.73 over 37 sessions, because
+`tier2_apply` started sixteen more apply sessions between 00:26 and 01:56 with nothing checking.
+The applies were $60.25 of that bill against the audits' $44.44 — 55%, not the 12% the "audits are
+88% of the spend" comment had assumed when it exempted them. A ceiling that governs one of two
+spending paths is not a ceiling. `tier2_apply` now calls `ns_spend_check` per theme before spawning,
+and section 27 drives the real apply loop rather than the fan-out alone. `night_budget_usd` is still
+50; whether that is the right number is a separate, deliberately deferred question.

@@ -69,6 +69,12 @@ first, packs yesterday's carry-over into the reactive phase (spec §4 says react
 carry-over), then overwrites `carryover.json` with reactive deferrals — consuming yesterday's
 carry-over twice in one night.
 
+*Amended 2026-08-04.* `tier2_defer_theme` writes `carryover.json` from the apply loop, in **both**
+phases. It does not reopen B7: what B7 forbids is the reactive pass *displacing* the cycle phase's
+carry-over file, and this is a `parse_result merge` over the existing contents, oldest first —
+append-only, so it cannot displace anything. A reactive theme deferred there is simply offered to
+`tier2_select cycle` later the same night, and re-carried by it if it does not fit there either.
+
 **B8 — Plan 2 Task 6 must update harness §4.** It moves `check_scope check` to `len(args)==5` while
 shipped `bin/test-harness.sh:43-46` calls it with 4. Also add `sys.exit(2)` to `check_scope.jac`'s
 usage arm: it currently exits **0**, so any future arity drift makes the S4 scope gate report

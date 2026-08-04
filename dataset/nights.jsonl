@@ -9,3 +9,4 @@
 {"date": "2026-07-24", "package": "jac-byllm", "findings_count": 4, "themes_selected": 2, "cost_usd": 3.3460032, "turns": 79}
 {"date": "2026-07-30", "package": "jac-byllm", "findings_count": 22, "themes_selected": 6, "cost_usd": 12.82258005, "turns": 239}
 {"date": "2026-07-31", "package": "repo", "dry_run": true, "phases": ["cycle", "reactive"], "findings_count": 117, "findings_carryover": 17, "findings_fresh": 100, "themes_selected": 11, "themes_deferred": 103, "declines": 5, "sessions": 27, "session_rows": 27, "cost_usd": 76.5503646, "turns": 1054, "cost_source": "envelopes"}
+{"date": "2026-08-03", "package": "repo", "dry_run": false, "phases": ["cycle", "reactive"], "findings_count": 182, "findings_carryover": 103, "findings_fresh": 79, "themes_selected": 26, "themes_deferred": 105, "declines": 1, "sessions": 37, "session_rows": 36, "cost_usd": 109.72527175000002, "turns": 1728, "cost_source": "spend.txt"}
