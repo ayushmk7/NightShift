@@ -1,0 +1,30 @@
+flowchart TD
+    SELP["selector could not PACK the finding<br/>over-night-budget · no-clock-left"]
+    CF[("state/carryover.json · one file, one schema, append-only")]
+    NXT["tomorrow's selector · carried findings pack FIRST"]
+    TH["a theme that WAS packed, at the apply loop"]
+    G1{"clock left?"}
+    G2{"$50 night ceiling unspent?"}
+    DEFERRED["theme turned away before any session started"]
+    VOID["failed.tsv row · a report nothing ever reads back"]
+    RUN["apply session actually runs"]
+    HOLE1["themes still queued behind it: never read, never carried"]
+    HOLE2["no in_theme row, no carryover row"]
+
+    SELP -->|"written at SELECTION time, before apply runs"| CF
+    CF -->|"merged ahead of tonight's findings"| NXT
+    TH --> G1
+    G1 -->|"no"| DEFERRED
+    G1 -->|"yes"| G2
+    G2 -->|"no · NEW guard, 08-04"| DEFERRED
+    G2 -->|"yes"| RUN
+    DEFERRED ==>|"BEFORE · ns_fail row and nothing else · findings gone"| VOID
+    DEFERRED -.->|"NEW 08-04 · tier2_defer_theme merges, oldest first · cannot displace"| CF
+    RUN -->|"session limit · break exits without draining the theme pipe"| HOLE1
+    RUN -->|"session died, or committed nothing"| HOLE2
+    HOLE1 ==>|"STILL OPEN"| VOID
+    HOLE2 ==>|"STILL OPEN"| VOID
+
+    linkStyle 7 stroke:#c0392b,stroke-width:4px
+    linkStyle 8 stroke:#1e8449,stroke-width:3px
+    linkStyle 11,12 stroke:#c0392b,stroke-width:3px,stroke-dasharray:6 4

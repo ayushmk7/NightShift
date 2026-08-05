@@ -1,0 +1,21 @@
+flowchart TD
+    LD["launchd 23:00 · user domain"]
+    LD -->|"caffeinate -i · gtimeout 480m to 07:00"| S0["S0 · preflight"]
+    S0 -.->|"DISABLE file, offline, or claude cannot answer · exit 42/43"| DIG
+    S0 -->|"gh authed · claude -p pong ok · missed-night scan clean"| S1["S1 · sync fork from upstream main"]
+    S1 -->|"worktrees cut · ledger pulled from the drafts branch"| S15["S1.5 · poll what merged upstream today"]
+    S15 -->|"union of changed .jac files · churn-ranked · cap 40"| S16["S1.6 · inventory our own open PRs"]
+    S16 -->|"rebase each on fresh main · re-run the S4 gate"| REA["S3a · reactive lenses over today's merged files"]
+    REA -->|"findings on code that just landed"| CARRY["carry-over · findings a past night banked"]
+    CARRY -->|"re-offered at zero audit cost"| SHARD["S3b · cycle audit · 8 LOC-balanced shards · 1 of 4 task lenses"]
+    SHARD -->|"per-shard findings JSON, merged and deduped"| SEL["selector · drop, score, group by task+directory, pack"]
+    SEL -.->|"could not be packed · banked for a later night"| CF[("state/carryover.json")]
+    SEL -->|"per theme, BEFORE the spawn: clock left? $50 ceiling unspent?"| APP["apply · fresh branch · fresh claude -p · acceptEdits · no network"]
+    APP -.->|"turned away at the door · NEW 2026-08-04"| CF
+    CF -.->|"read first, packs first, tomorrow"| SEL
+    APP -->|"report JSON parsed AND the diff is non-empty"| S4["S4 · verify gate · fail-closed"]
+    S4 -.->|"red · branch deleted · ledger failed_verify"| DIG
+    S4 -->|"scope contained · jac check · CI mirror · the suites provably RAN"| S5["S5 · push fork · open the draft PR upstream"]
+    S5 -->|"prs.jsonl row · ledger shipped · drafts branch pushed"| DIG["S6 · digest email · fires on EVERY exit path"]
+    DIG -->|"morning"| H["S7 · human reviews on GitHub · merge or discard"]
+    H -.->|"what merges becomes tomorrow's reactive scope"| S15

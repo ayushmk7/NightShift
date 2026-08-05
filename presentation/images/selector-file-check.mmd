@@ -1,0 +1,25 @@
+flowchart TD
+    F["finding · file: jac/jaclang/runtimelib/planner.jac"]
+    P{"path matches a protected glob?"}
+    DROP["drop: protected-path"]
+    EX{"NEW 08-04 · is the finding's OWN file on disk?"}
+    GONE["drop: file-gone · terminal, deliberately NOT carried"]
+    LED{"fingerprint already in the ledger?"}
+    SIB["impl_siblings() · DERIVED X.impl.jac candidates<br/>existence-checked since long before 08-04"]
+    PACK["packed into a theme, branch cut"]
+    WASTE["session reports 'no changes made'"]
+
+    F --> P
+    P -->|"yes"| DROP
+    P ==>|"BROKEN until 08-04 · the finding's own file was never checked"| LED
+    P -.->|"no · check the file itself first"| EX
+    EX -.->|"gone · upstream renamed it to query_planner.jac"| GONE
+    EX -.->|"no tree to check against · clone missing · stand down"| LED
+    EX -.->|"on disk"| LED
+    LED -->|"unseen · eligible"| SIB
+    SIB -->|"only the guesses that exist"| PACK
+    PACK ==>|"on the broken path: a model call, a branch, a 25-min box"| WASTE
+
+    linkStyle 2 stroke:#c0392b,stroke-width:4px
+    linkStyle 3,4,5,6 stroke:#1e8449,stroke-width:3px
+    linkStyle 9 stroke:#c0392b,stroke-width:4px

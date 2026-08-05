@@ -1,0 +1,21 @@
+flowchart TD
+    SPEND[("logs/DATE/spend.txt · session_id TAB total_cost_usd · deduped")]
+    CHK{"ns_spend_check · sum vs night_budget_usd 50<br/>unreadable ledger counts as OVER"}
+    AUD["audit session · shard or reactive lens"]
+    STOPA["fan-out stops scheduling, loudly"]
+    SEL["selection.json · the night's packed themes"]
+    APP["apply session · fresh branch, 25-min box, $5 cap"]
+    DEF["tier2_defer_theme · findings banked in carryover.json"]
+
+    SPEND --> CHK
+    CHK -->|"under · schedule it"| AUD
+    CHK -->|"over · braked at $54.78 on 08-03, 00:19:30"| STOPA
+    AUD -->|"ns_spend_add on completion"| SPEND
+    SEL ==>|"BROKEN until 08-04 · spawn, nothing consulted<br/>16 applies from 00:26 to 01:56, after the brake had fired"| APP
+    SEL -.->|"NEW 08-04 · ns_spend_check per theme, before the spawn"| CHK
+    CHK -.->|"over, or unsummable · fails closed"| DEF
+    CHK -.->|"under"| APP
+    APP -->|"ns_spend_add · $60.25 of the night's $109.73, counted but never read"| SPEND
+
+    linkStyle 4 stroke:#c0392b,stroke-width:4px
+    linkStyle 5,6,7 stroke:#1e8449,stroke-width:3px

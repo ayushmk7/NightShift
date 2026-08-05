@@ -1,0 +1,28 @@
+flowchart TD
+    W["a gate, a guard, a permission, a check"]
+    Q{"what actually happened?"}
+    FOUND["ran · found a problem · exit nonzero"]
+    CLEAN["ran · found nothing · exit 0"]
+    NOTHING["NEVER RAN · exit 0<br/>no MCP server · no spend read · no carryover write · file not on disk"]
+    RED["reads as FAIL · work is stopped"]
+    PASS["reads as PASS · work proceeds"]
+    ASSERT{"POSITIVE assertion · can we prove the work happened?"}
+    MUT["mutation test · break the code on purpose"]
+    VAC["mutant stays green · the assertion was vacuous · start over"]
+
+    W --> Q
+    Q -->|"the honest failure"| FOUND
+    Q -->|"the honest success"| CLEAN
+    Q -->|"the silent one"| NOTHING
+    FOUND -->|"caller stops"| RED
+    CLEAN -->|"caller proceeds"| PASS
+    NOTHING ==>|"OLD SHAPE · exit 0 for 'nothing to do' is exit 0 for 'all good'"| PASS
+    NOTHING -.->|"FIXED SHAPE · demand evidence, not the absence of an error"| ASSERT
+    ASSERT -.->|"no evidence · fail closed"| RED
+    ASSERT -.->|"evidence"| PASS
+    ASSERT -.->|"then prove the assertion itself can fail"| MUT
+    MUT -.->|"assertion goes red · it is real"| RED
+    MUT -.->|"assertion stays green"| VAC
+
+    linkStyle 6 stroke:#c0392b,stroke-width:4px
+    linkStyle 7,8,9 stroke:#1e8449,stroke-width:3px
