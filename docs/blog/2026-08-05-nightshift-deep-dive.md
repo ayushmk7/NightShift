@@ -1,7 +1,8 @@
 # Inside NightShift: the Night a Bug Killed the First Live Run
 
-*Part 2 of 2. Part 1 has the general lessons: [What I Learned Building an Unattended Agent
-Harness](2026-08-05-unattended-agent-harness-lessons.md).*
+*Part 2 of 3. Part 1 has the general lessons: [What I Learned Building an Unattended Agent
+Harness](2026-08-05-unattended-agent-harness-lessons.md). Part 3 is the pitch: [Why This Might
+Matter Beyond One Repo](2026-08-06-nightshift-for-open-source.md).*
 
 NightShift runs against [jaseci-labs/jac](https://github.com/jaseci-labs/jac) — roughly 365,000
 lines of Jac across eleven packages, a compiler written in the language it compiles. Codebases that
@@ -101,3 +102,6 @@ work when something small breaks downstream of it, and whether a budget guard ac
 full pipeline it's supposed to be guarding. That's most of what "unattended" turned out to mean in
 practice — not that the agent works alone, but that the scaffolding around it has to fail the way
 you'd want it to when nobody's there to catch it failing some other way.
+
+Part 3 makes the case for why this pattern is worth more than one repo's backlog: [Why This Might
+Matter Beyond One Repo](2026-08-06-nightshift-for-open-source.md).

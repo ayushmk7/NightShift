@@ -1,6 +1,8 @@
 # What I Learned Building an Unattended Agent Harness
 
-*Part 1 of 2. Part 2 is the war story: [Inside NightShift](2026-08-05-nightshift-deep-dive.md).*
+*Part 1 of 3. Part 2 is the war story: [Inside NightShift](2026-08-05-nightshift-deep-dive.md).
+Part 3 is the pitch: [Why This Might Matter Beyond One
+Repo](2026-08-06-nightshift-for-open-source.md).*
 
 A few weeks ago I gave Claude Code a repository, a clock, and no one watching. Every night at
 23:00 it wakes up, audits a ~365k-line codebase, picks a handful of findings worth a session,
@@ -57,3 +59,5 @@ you didn't review being opened on a codebase you do care about.
 
 Part 2 has the specific night this went wrong, what broke, and what "safe when wrong" looked like
 in the fix: [Inside NightShift: the night a bug killed the first live run](2026-08-05-nightshift-deep-dive.md).
+Part 3 makes the case for why this is worth more than one repo's backlog: [Why This Might Matter
+Beyond One Repo](2026-08-06-nightshift-for-open-source.md).
