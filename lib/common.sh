@@ -210,7 +210,17 @@ ns_lock_acquire() {
         echo $$ > "$LOCK_DIR/pid"
         return 0
     fi
-    local holder; holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    local holder wait_ms=0
+    holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    # TOCTOU: a competitor whose mkdir just won this instant may not have written its pid yet, so an
+    # empty read here is ambiguous between that in-flight write and a genuinely stale lock. The write
+    # is microseconds; give it up to a second to land before concluding stale, so a live winner's pid
+    # -- not a transiently empty one -- is what decides this.
+    while [ -z "$holder" ] && [ "$wait_ms" -lt 1000 ]; do
+        sleep 0.1
+        wait_ms=$((wait_ms + 100))
+        holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    done
     if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
         ns_die "$EX_LOCK" "lock held by live pid $holder"
     fi

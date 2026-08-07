@@ -40,7 +40,7 @@ def test_identifiers(repo_dir: str) -> set[str] {
     # confirmed by running it. Every element is re-narrowed with str() for the same reason.
     for (walk_dir, walk_subdirs, walk_files) in os.walk(repo_dir + "/jac") {
         dir_path: str = str(walk_dir);
-        if "/tests" not in dir_path and not dir_path.endswith("/tests") {
+        if "/tests/" not in dir_path and not dir_path.endswith("/tests") {
             continue;
         }
         for name in walk_files {

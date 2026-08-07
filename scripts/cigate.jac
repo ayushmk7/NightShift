@@ -142,16 +142,17 @@ def gate(raw_path: str, baseline_path: str) -> tuple[int, list[str]] {
 
 The filter is a SAFETY INVARIANT, not a convenience. `gh pr list --author @me` also matches a PR
 the operator opened by hand from an unrelated branch, and everything downstream of this projection
-fetches, rebases and force-pushes what it is handed. Tabs in a title are replaced because the
-consumer is a `while IFS=$'\\t' read` loop."""
+fetches, rebases and force-pushes what it is handed. Tabs and newlines in a title are replaced
+because the consumer is a `while IFS=$'\\t' read` loop, which is line-oriented -- an embedded
+newline would split one PR's row across two lines and misalign every field after it."""
 def pr_rows(raw: str, prefix: str) -> list[str] {
     rows: list[str] = [];
     for item in parse_list(raw) {
         pr: dict = as_dict(item);
         head: str = str(pr["headRefName"]);
         if head.startswith(prefix) {
-            rows.append("\t".join([str(pr["number"]), head, str(pr["url"]),
-                                   str(pr["title"]).replace("\t", " ")]));
+            title: str = str(pr["title"]).replace("\t", " ").replace("\n", " ").replace("\r", " ");
+            rows.append("\t".join([str(pr["number"]), head, str(pr["url"]), title]));
         }
     }
     return rows;
@@ -518,17 +519,24 @@ test "a pr-inventory row is one typed JSON line carrying exactly what the digest
     assert nonnum;
 }
 
-test "prs keeps only nightshift heads and survives a tab in a title" {
+test "prs keeps only nightshift heads and survives a tab or newline in a title" {
     raw: str = json.dumps([
         {"number": 1, "headRefName": "nightshift/2026-07-30/dead-cli", "url": "u1",
          "title": "refactor: a\tb"},
         {"number": 2, "headRefName": "my-manual-branch", "url": "u2", "title": "hand-written"},
         {"number": 3, "headRefName": "nightshift/2026-07-29/unused", "url": "u3", "title": "t3"},
+        {"number": 4, "headRefName": "nightshift/2026-07-29/multiline", "url": "u4",
+         "title": "a\nb\r\nc"},
     ]);
     rows: list[str] = pr_rows(raw, "nightshift/");
-    assert len(rows) == 2;
+    assert len(rows) == 3;
     assert rows[0] == "1\tnightshift/2026-07-30/dead-cli\tu1\trefactor: a b";
     assert rows[1].startswith("3\t");
+    # an embedded newline must not split one PR's row across two lines for the `while read` loop
+    assert rows[2] == "4\tnightshift/2026-07-29/multiline\tu4\ta b  c";
+    for row in rows {
+        assert "\n" not in row and "\r" not in row;
+    }
     # an empty PR list is a legitimate answer and must not raise
     assert pr_rows("[]", "nightshift/") == [];
 }

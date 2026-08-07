@@ -1,6 +1,5 @@
 """Read config/nightshift.toml and expose it to bash as flat NS_* env lines."""
 import sys;
-import os;
 import json;
 import from shlex { quote }
 import from nslib { eprint, load_config_toml }
@@ -25,22 +24,11 @@ def as_env_lines(cfg: dict) -> list[str] {
     return lines;
 }
 
-def config_path(args: list[str], idx: int) -> str {
-    if len(args) > idx {
-        return args[idx];
-    }
-    from_env: str | None = os.environ.get("NS_CONFIG");
-    if from_env is not None {
-        return from_env;
-    }
-    return "config/nightshift.toml";
-}
-
 with entry {
     args: list[str] = sys.argv;
     cmd: str = args[1] if len(args) > 1 else "";
     if cmd == "env" {
-        for line in as_env_lines(load_config_toml(config_path(args, 2))) {
+        for line in as_env_lines(load_config_toml(args[2])) {
             print(line);
         }
     } elif cmd != "" and cmd != "test" {

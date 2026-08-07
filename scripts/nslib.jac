@@ -146,9 +146,11 @@ def state_read(path: str) -> dict {
 }
 
 def state_write(path: str, state: dict) {
-    with open(path, "w") as f {
+    tmp_path: str = path + ".tmp";
+    with open(tmp_path, "w") as f {
         f.write(json.dumps(state, indent=2) + "\n");
     }
+    os.replace(tmp_path, path);
 }
 
 """Config access ([protect].globs et al) straight from nightshift.toml."""

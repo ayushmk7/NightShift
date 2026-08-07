@@ -54,7 +54,8 @@ dataset_record_refactor() {
         *)  url="" ;;
     esac
     local base_ref
-    base_ref="$(git -C "$REPO" merge-base "$NS_REPO_DEFAULT_BRANCH" "$branch")" || return 0
+    base_ref="$(git -C "$REPO" merge-base "$NS_REPO_DEFAULT_BRANCH" "$branch" 2>/dev/null || true)"
+    [ -n "$base_ref" ] || { ns_log DATASET "skip $branch (no merge-base)"; return 0; }
     mkdir -p "$DATASET_DIR"
     ns_jac dataset record-refactor "$base_ref" "$branch" "$REPO" "$DATASET_DIR" "$LOG_DIR" \
         "$NS_DATE" "$pkg" "$theme" "$report" "$added" "$removed" "$verify_line" "$url" \

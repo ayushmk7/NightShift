@@ -178,9 +178,18 @@ ns_renumber_fragment() {   # <branch> <pr_num> <fragment_path>
         ns_warn "$branch: expected release-note fragment $frag is not tracked on the branch; upstream's check-release-notes.sh will red this PR"
         return 0
     fi
-    git -C "$REPO" mv "$frag" "$new"
-    git -C "$REPO" commit -qm "docs: release note fragment for #$pr"
-    ns_git_push "$REPO" origin "refs/heads/$branch:refs/heads/$branch"
+    if ! git -C "$REPO" mv "$frag" "$new"; then
+        ns_warn "$branch: git mv $base -> ${new##*/} failed; the fragment ships still named 0000 and upstream's check-release-notes.sh will red this PR"
+        return 0
+    fi
+    if ! git -C "$REPO" commit -qm "docs: release note fragment for #$pr"; then
+        ns_warn "$branch: could not commit the fragment rename to ${new##*/}; the fragment ships still named 0000 and upstream's check-release-notes.sh will red this PR"
+        return 0
+    fi
+    if ! ns_git_push "$REPO" origin "refs/heads/$branch:refs/heads/$branch"; then
+        ns_warn "$branch: push of the fragment rename to ${new##*/} failed; the fragment ships still named 0000 and upstream's check-release-notes.sh will red this PR"
+        return 0
+    fi
     ns_log S5 "fragment renamed $base -> ${new##*/}"
 }
 

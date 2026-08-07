@@ -157,7 +157,7 @@ def auditable_files(prs: list[dict], cfg: dict) -> list[str] {
             }
             covered: bool = False;
             for r in roots {
-                if path.startswith(r) {
+                if path == r or path.startswith(r + "/") {
                     covered = True;
                     break;
                 }

@@ -7,12 +7,13 @@ comment. So, like testgate, we gate on introducing NO NEW errors: the verify ste
 on the changed files as they are on main AND on the branch, and this tool fails only if the branch
 output contains an error identity absent from the main output.
 
-Error identity = (error code, offending source-line text). Source text (not line number) is used so
-that inserting/removing lines elsewhere never fabricates a "new" error. Only hard errors count
-(lines beginning `✖ Error: error[`); warnings (`⚠ warning`) are ignored.
+Error identity = (file path, error code, offending source-line text). Source text (not line number)
+is used so that inserting/removing lines elsewhere never fabricates a "new" error; the file path is
+still included so the same code/text pair in two different files is not treated as one error. Only
+hard errors count (lines beginning `✖ Error: error[`); warnings (`⚠ warning`) are ignored.
 
 argv:
-  parse <raw.txt>                 print sorted unique error identities (code<TAB>src)
+  parse <raw.txt>                 print sorted unique error identities (file<TAB>code<TAB>src)
   ran   <raw.txt>                 print how many checker runs the capture contains
                                   (0 == `jac check` never started; see run_count)
   gate  <main_raw> <branch_raw>   exit 0 if branch adds no new error identity, 1 if it does
@@ -68,6 +69,7 @@ def after_pipe(line: str) -> str {
 def identities(raw: str) -> list[str] {
     ids: set[str] = set();
     cur: str = "";                       # current hard-error code, "" when inside a warning/none
+    cur_file: str = "";                  # current error's file path, from its "--> path:line:col"
     lines: list[str] = raw.splitlines();
     idx: int = 0;
     for line in lines {
@@ -76,12 +78,16 @@ def identities(raw: str) -> list[str] {
             a: int = stripped.find("error[") + 6;
             b: int = stripped.find("]", a);
             cur = stripped[a:b] if b > a else "";
+            cur_file = "";
         } elif stripped.startswith("⚠ warning") {
             cur = "";
+            cur_file = "";
+        } elif cur and stripped.startswith("--> ") {
+            cur_file = stripped[4:].rsplit(":", 2)[0];
         } elif cur and idx > 0 and is_caret(line) {
             src: str = after_pipe(lines[idx - 1]);
-            if src {
-                ids.add(cur + "\t" + src);
+            if src and cur_file {
+                ids.add(cur_file + "\t" + cur + "\t" + src);
             }
         }
         idx += 1;
@@ -147,7 +153,7 @@ test "identities keys on (code, source line), ignores warnings and line numbers"
         + "  81 |     result: dict[str, any] = {\n"
         + "     |                       ^^^\n";
     ids: list[str] = identities(raw);
-    assert ids == ["E1053\t'timeout': float(fallback_config.get('timeout', 60.0))"];
+    assert ids == ["f.jac\tE1053\t'timeout': float(fallback_config.get('timeout', 60.0))"];
 }
 
 test "run_count tells a checker that never started apart from one that found nothing" {
@@ -161,6 +167,7 @@ test "run_count tells a checker that never started apart from one that found not
     assert identities(never) == [];        # indistinguishable from clean WITHOUT this check
     # a real error capture still counts as HAVING run
     errcap: str = "✖ Error: error[E1053]: bad\n"
+        + "  --> f.jac:10:1\n"
         + "  10 |     x = float(cfg.get('a', 1.0))\n"
         + "     |         ^^^^^^^^^^^^^^^^^^^^^^^\n"
         + "============================== 1 failed in 0.25s ===============================\n";
@@ -196,10 +203,19 @@ test "gate: branch error absent on main is new (red); same set is green" {
             + "  20 |     y = float(cfg.get('b', 2.0))\n"
             + "     |         ^^^^^^^^^^^^^^^^^^^^^^^\n");
     }
+    branch_other_file: str = d + "/other_file.txt";  # same code+text, DIFFERENT file -> still red
+    with open(branch_other_file, "w") as f {
+        f.write("✖ Error: error[E1053]: bad\n"
+            + "  --> g.jac:10:1\n"
+            + "  10 |     x = float(cfg.get('a', 1.0))\n"
+            + "     |         ^^^^^^^^^^^^^^^^^^^^^^^\n");
+    }
     (c1, n1) = gate(main_raw, branch_same);
     (c2, n2) = gate(main_raw, branch_new);
+    (c4, n4) = gate(main_raw, branch_other_file);
     assert c1 == 0 and n1 == [];
-    assert c2 == 1 and n2 == ["E1053\ty = float(cfg.get('b', 2.0))"];
+    assert c2 == 1 and n2 == ["f.jac\tE1053\ty = float(cfg.get('b', 2.0))"];
+    assert c4 == 1 and n4 == ["g.jac\tE1053\tx = float(cfg.get('a', 1.0))"];
     (c3, _n3) = gate(d + "/missing.txt", branch_same);
     assert c3 == 2;
 }

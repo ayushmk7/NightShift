@@ -558,6 +558,12 @@ tier2_apply() {
     local phase=$1 sfx slug bslug branch theme_file prompt remaining attempt got_report limit_hit
     local theme_task theme_cx attempt_model spent
     sfx="$(ns_phase_suffix "$phase")"
+    # tier2_select writes no selection$sfx.json when there was nothing to select (see its own
+    # `[ -s "$input" ] || return 0` guard) -- e.g. every audit shard found nothing and there was no
+    # carry-over. `selector split` on a missing file raises in Jac and exits nonzero printing
+    # nothing, and under this file's errexit that would abort the whole night instead of the quiet
+    # no-op the rest of this phase already treats as normal.
+    [ -s "$LOG_DIR/selection$sfx.json" ] || { ns_log S3 "nothing to apply for the $phase phase"; return 0; }
     ns_jac selector split "$LOG_DIR/selection$sfx.json" "$LOG_DIR" | while IFS= read -r slug; do
         theme_file="$LOG_DIR/theme-$slug.json"
 

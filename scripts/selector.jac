@@ -518,16 +518,22 @@ def pack_themes(eligible: list[dict], cfg: dict, repo_dir: str,
         for f in group {
             file: str = str(f["file"]);
             new_file: int = 0 if file in files else 1;
-            if cur and (len(files) + new_file > files_cap or est_loc + budget_of(f) > loc_cap) {
+            # The file the coverage agent intends to WRITE also needs a slot, and must be counted
+            # in the SAME overflow check as `file` -- otherwise a finding that exactly fills the
+            # last file slot with `file` gets `test_file` appended right after with no gate at all.
+            test_file: str = str(f["test_file"]) if "test_file" in f else "";
+            new_test: int = 1 if test_file and test_file != file and test_file not in files else 0;
+            if cur and (len(files) + new_file + new_test > files_cap or est_loc + budget_of(f) > loc_cap) {
                 buckets.append(cur);
                 bucket_files.append(files);
                 cur = []; files = []; est_loc = 0; new_file = 1;
+                new_test = 1 if test_file and test_file != file else 0;
             }
             # ...but a finding that does not fit an EMPTY theme does not fit any theme, ever. That
             # is the only case `over-theme-budget` now describes, and it is exactly the case the
             # carry-over exclusion in select() was written for: carrying it would re-drop it for the
             # same reason every night, forever, while the file grew.
-            if len(files) + new_file > files_cap or est_loc + budget_of(f) > loc_cap {
+            if len(files) + new_file + new_test > files_cap or est_loc + budget_of(f) > loc_cap {
                 dropped.append({"fingerprint": f["fingerprint"], "file": file, "rule": f["rule"], "reason": "over-theme-budget"});
                 continue;
             }
@@ -537,8 +543,8 @@ def pack_themes(eligible: list[dict], cfg: dict, repo_dir: str,
             # The file the coverage agent intends to WRITE. Without it in the allow-list the theme
             # has no legal write target and the S4 gate discards the whole branch after a
             # 25-minute session. Not budgeted as a file slot: it is the point of the theme.
-            if "test_file" in f and str(f["test_file"]) not in files {
-                files.append(str(f["test_file"]));
+            if new_test == 1 {
+                files.append(test_file);
             }
             cur.append(f);
             est_loc += budget_of(f);

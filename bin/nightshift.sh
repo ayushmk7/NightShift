@@ -113,9 +113,13 @@ ns_run() {
 }
 
 ns_run_inner() {
+    # Installed before ns_lock_acquire so a lock-acquire failure (ns_die -> exit) still runs
+    # ns_on_exit and reaps NS_CAFFEINATE_PID/NS_WATCHDOG_PID -- otherwise the watchdog forked in
+    # ns_run outlives this process for up to NS_BUDGETS_WALLCLOCK_MIN and later kill -TERM/-KILL's
+    # a since-recycled pid.
+    trap 'ns_on_exit' EXIT TERM INT
     ns_lock_acquire
     ns_load_env
-    trap 'ns_on_exit' EXIT TERM INT
 
     ns_stage S0 preflight_main
     ns_stage S1 sync_main
@@ -186,7 +190,19 @@ case "$cmd" in
     promote)    [ $# -ge 1 ] || usage; mkdir -p "$LOG_DIR"; ns_load_env; promote_main "$@" ;;
     discard)    [ $# -ge 1 ] || usage; mkdir -p "$LOG_DIR"; discard_main "$@" ;;
     status)     status_main ;;
-    baseline)   mkdir -p "$LOG_DIR" "$NS_ROOT/state"; ns_load_env; baseline_main ;;
+    # Refuse to run underneath a live night, same as `mirror`/`inventory`: baseline_main
+    # git-checkouts $NS_REPO_DEFAULT_BRANCH in $REPO, which would land underneath a running
+    # S1/S3/S4/S5. Deliberately does NOT call ns_lock_acquire -- that reclaims a stale lock and
+    # there is no EXIT trap on this path to release it, so a manual baseline would leave
+    # /tmp/nightshift.lock held forever and block every subsequent night.
+    baseline)   mkdir -p "$LOG_DIR" "$NS_ROOT/state"; ns_load_env
+                if [ -f "$LOCK_DIR/pid" ]; then
+                    holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+                    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+                        ns_die "$EX_LOCK" "a nightly run (pid $holder) is live; 'baseline' would git-checkout $NS_REPO_DEFAULT_BRANCH in $REPO underneath it. Wait for it to finish, or stop it first."
+                    fi
+                fi
+                baseline_main ;;
     # Hand-debugging a red branch. Runs EVERY gate job in config order (fmt, check, jir, byllm,
     # compiler, runtime, contribution), stopping at the first failure -- so it is fast on a branch
     # that is broken early and ~40min+ on one that is only broken late. That breadth is the point:

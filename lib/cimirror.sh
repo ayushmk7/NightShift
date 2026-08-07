@@ -24,12 +24,6 @@ cimirror_cmds() {
     ns_jac cimirror cmds "$1" "$CI_MIRROR_CONFIG"
 }
 
-# CI's exact fmt-CHECK invocation (PR/diff-scoped -- ci.yml's mode=scoped branch, the one that
-# always applies to a Nightshift-opened PR). Verifies; does not modify.
-cimirror_fmt_cmd() {
-    cimirror_cmds fmt | head -1
-}
-
 # Run one mirrored job. Repo dev binary first on PATH so `jac` means the target repo's jac.
 #
 # HOME is set to $LOG_DIR/mirror-home (created once, reused by every job/call in the SAME

@@ -297,7 +297,20 @@ def session_rows(log_dir: str, date_s: str, package: str, dry_run: bool, caps: d
             } else {
                 task = night_task;
             }
-            got: list | None = read_findings(os.path.join(log_dir, "findings-" + name + ".json"));
+            # audit-repair-<name>.json OVERWRITES findings-<name>.json with the REPAIR session's own
+            # salvaged output (lib/tier2.sh's corrective re-prompt), and it only ever exists after a
+            # session that COMPLETED but emitted bad JSON (is_error=false, has .result, parse failed)
+            # -- a died session gets no repair. So when this "audit" row's own session completed and
+            # a repair file is present, the shared findings file holds the REPAIR's output, not this
+            # session's; crediting it here would hand the original attempt findings it never
+            # produced. Only the "audit-repair" row, which is that session, may read that file.
+            got: list | None = None;
+            if kind == "audit" and not bool(env.get("is_error", False)) and os.path.exists(
+                    os.path.join(log_dir, "audit-repair-" + name + ".json")) {
+                got = None;
+            } else {
+                got = read_findings(os.path.join(log_dir, "findings-" + name + ".json"));
+            }
             if got is not None {
                 n_out = len(got);
             }
@@ -956,6 +969,42 @@ test "sessions.jsonl gives every session a row, and never calls a dead lens a cl
     assert refuse["phase"] == "reactive" and refuse["model"] == "claude-sonnet-4-5";
     assert refuse["wasted"] and refuse["attempt"] == 1;
     assert "test_abi_lib.jac" in str(as_list(refuse["skipped_reasons"])[0]);
+}
+
+test "a malformed-then-repaired audit does not also credit the ORIGINAL session with the repair's findings" {
+    import tempfile;
+    d: str = tempfile.mkdtemp();
+    # findings-cli.json is what the REPAIR session wrote (3 real findings), overwriting whatever
+    # the original attempt left behind -- there is no separate file for the original's own output,
+    # because it never parsed.
+    with open(d + "/findings-cli.json", "w") as f {
+        f.write(json.dumps([
+            {"file": "a.jac", "rule": "dead-code"}, {"file": "b.jac", "rule": "dead-code"},
+            {"file": "c.jac", "rule": "dead-code"},
+        ]));
+    }
+    with open(d + "/audit-cli.json", "w") as f {
+        f.write(json.dumps({"is_error": False, "result": "not fenced json", "num_turns": 10,
+            "total_cost_usd": 1.0, "session_id": "s-orig", "terminal_reason": "completed",
+            "modelUsage": {"claude-opus-5": {}}}));
+    }
+    with open(d + "/audit-repair-cli.json", "w") as f {
+        f.write(json.dumps({"is_error": False, "result": "ok", "num_turns": 1,
+            "total_cost_usd": 0.1, "session_id": "s-repair", "terminal_reason": "completed",
+            "modelUsage": {"claude-opus-5": {}}}));
+    }
+    caps: dict = {"audit": None, "audit-repair": 1, "apply": None};
+    rows: list[dict] = session_rows(d, "2026-01-01", "repo", False, caps);
+    by_kind: dict[str, dict] = {};
+    for r in rows {
+        by_kind[str(r["kind"])] = r;
+    }
+    # THE ORIGINAL ATTEMPT: its own output never parsed, so it gets no findings, not the repair's 3.
+    orig: dict = by_kind["audit"];
+    assert orig["findings_out"] is None and orig["wasted"];
+    # THE REPAIR: this is the session that actually produced the 3 findings.
+    repair: dict = by_kind["audit-repair"];
+    assert repair["findings_out"] == 3 and not repair["wasted"];
 }
 
 test "an apply session that REFUSED lands as a shipped:false row with its real reason" {

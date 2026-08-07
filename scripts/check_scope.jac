@@ -9,6 +9,12 @@ argv:  check <theme.json> <config.toml> <task>  theme-scoped gate (apply branche
                                               from an existing test file (exit 1), else print what
                                               was compared (OK ...) or that there was nothing to
                                               compare (SKIP ...)
+       vestigial <theme.json>                 print the theme's vestigial_deletions paths, one per
+                                              line. Lets lib/verify.sh's test-weakening guard skip a
+                                              full test-file delete that selector.jac already
+                                              independently verified as vestigial, instead of
+                                              re-deriving that from text and reding a legitimate
+                                              dead-code sweep.
 
 A third verb, `protected <config.toml>`, was deleted with tier-1 on 2026-08-02: it printed the
 stdin paths hitting a protected glob so the S2 autofix could revert formatter overreach, and it
@@ -130,6 +136,15 @@ def weakened(path: str, old_text: str, new_text: str) -> list[str] {
     return out;
 }
 
+"""Read theme.vestigial_deletions, the same field violations() reads inline. Its own top-level
+function (rather than only inline in violations()) because lib/verify.sh's test-weakening guard
+needs this same list to exempt a genuine vestigial delete from the weakened() check, which would
+otherwise misread selector.jac's already-verified full-file removal as a reduced assert/test
+count."""
+def vestigial_deletions_of(theme: dict) -> list[str] {
+    return [str(f) for f in as_list(theme.get("vestigial_deletions", []))];
+}
+
 def parse_name_status(text: str) -> list[tuple[str, str]] {
     out: list[tuple[str, str]] = [];
     for line in text.splitlines() {
@@ -138,10 +153,14 @@ def parse_name_status(text: str) -> list[tuple[str, str]] {
             continue;
         }
         parts: list[str] = stripped.split("\t");
-        if len(parts) >= 2 {
-            # a rename shows as "R100\told\tnew"; treat as delete-old + not-tracked-new is out of
-            # scope here (renames never come from this pipeline), so only ever consume 2 parts.
-            out.append((parts[0][:1], parts[-1]));
+        if len(parts) == 3 {
+            # a rename shows as "R100\told\tnew": emit BOTH paths, or a rename that moves a
+            # protected file onto an allowlisted name would clear the old path from `changed`
+            # entirely and skip both the allowlist and protected-glob checks on it.
+            out.append(("D", parts[1]));
+            out.append((parts[0][:1], parts[2]));
+        } elif len(parts) == 2 {
+            out.append((parts[0][:1], parts[1]));
         }
     }
     return out;
@@ -184,9 +203,17 @@ with entry {
             }
         }
         sys.exit(1 if found2 else 0);
+    } elif len(args) == 3 and args[1] == "vestigial" {
+        with open(args[2], "r") as fv {
+            theme2: dict = parse_obj(fv.read());
+        }
+        for v in vestigial_deletions_of(theme2) {
+            print(v);
+        }
     } elif len(args) > 1 and args[1] != "test" {
         eprint("usage: git diff --name-status main...HEAD | jac run check_scope.jac check <theme.json> <config.toml> <task>");
         eprint("       jac run check_scope.jac weakened <path> <old_file> <new_file>");
+        eprint("       jac run check_scope.jac vestigial <theme.json>");
         # NONZERO, and deliberately not 1 (which means "violations found"). This arm used to exit
         # 0, so any future arity drift -- exactly the kind Task 6 is about to introduce when
         # `check` grows a <task> argv -- would make lib/verify.sh's `if ! ... check_scope`
@@ -194,6 +221,13 @@ with entry {
         # must never be the reason a branch passes. (RECONCILIATION B8.)
         sys.exit(2);
     }
+}
+
+test "vestigial_deletions_of reads the theme's list, defaulting to none" {
+    assert vestigial_deletions_of({"files": []}) == [];
+    assert vestigial_deletions_of(
+        {"files": [], "vestigial_deletions": ["jac/pkg/tests/test_gateway.jac"]}
+    ) == ["jac/pkg/tests/test_gateway.jac"];
 }
 
 test "diff outside allow-list is a violation, fragment is allowed" {
@@ -328,4 +362,9 @@ test "a file that was never a test file cannot be weakened" {
 test "parse_name_status splits STATUS and path, tolerates blank lines" {
     rows: list[tuple[str, str]] = parse_name_status("M\ta/b.jac\n\nD\tc/d.jac\n");
     assert rows == [("M", "a/b.jac"), ("D", "c/d.jac")];
+}
+
+test "parse_name_status emits BOTH paths of a rename, not just the new one" {
+    rows: list[tuple[str, str]] = parse_name_status("R100\told/path.jac\tnew/path.jac\n");
+    assert rows == [("D", "old/path.jac"), ("R", "new/path.jac")];
 }

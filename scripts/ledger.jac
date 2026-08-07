@@ -129,7 +129,7 @@ prunable_branches only looks at shipped/rejected."""
 def reap_stale_in_theme(path: str) -> int {
     n: int = 0;
     for (fp, row) in load_ledger(path).items() {
-        if str(row.get("status", "")) == "in_theme" and str(row.get("last_seen", "")) != today() {
+        if str(row.get("status", "")) == "in_theme" {
             set_status(path, fp, "new", {"reaped_from": "in_theme"});
             n += 1;
         }
@@ -266,28 +266,30 @@ test "state roundtrip" {
     assert state_read(path)["verify_estimate_min"] == 7;
 }
 
-test "reap frees in_theme rows a dead night stranded, and leaves today's alone" {
+test "reap frees in_theme rows a dead night stranded, same calendar day included" {
     import tempfile;
     with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tf {
         path: str = tf.name;
     }
     stale: str = fingerprint("a/b.jac", "dead-code");
-    fresh: str = fingerprint("c/d.jac", "dead-code");
+    # A night that dies just after local midnight stamps last_seen with the NEW calendar day, which
+    # is also the day the very next S1 runs on -- lib/sync.sh calls reap exactly once, before this
+    # night writes any in_theme row of its own, so last_seen == today() here is still stale, not
+    # in-flight. A same-date equality check would wrongly skip this row for a whole extra night.
+    same_day: str = fingerprint("c/d.jac", "dead-code");
     upsert(path, {"fingerprint": stale, "file": "a/b.jac", "rule": "dead-code", "summary": "s"});
-    upsert(path, {"fingerprint": fresh, "file": "c/d.jac", "rule": "dead-code", "summary": "s"});
-    set_status(path, stale, "in_theme", {"last_seen": "2026-08-02"});   # a night that died
-    set_status(path, fresh, "in_theme", {});                            # tonight, still in flight
-    assert reap_stale_in_theme(path) == 1;
+    upsert(path, {"fingerprint": same_day, "file": "c/d.jac", "rule": "dead-code", "summary": "s"});
+    set_status(path, stale, "in_theme", {"last_seen": "2026-08-02"});    # a night that died
+    set_status(path, same_day, "in_theme", {});                          # stamped with today() too
+    assert reap_stale_in_theme(path) == 2;
     rows: dict[str, dict] = load_ledger(path);
-    # the stranded one is buyable again...
+    # both are buyable again...
     assert rows[stale]["status"] == "new";
     assert rows[stale]["reaped_from"] == "in_theme";
+    assert rows[same_day]["status"] == "new";
+    assert rows[same_day]["reaped_from"] == "in_theme";
     # ...and the branch is kept as evidence of what happened
     assert "branch" not in rows[stale] or rows[stale]["branch"] is not None;
-    # ...while a row from THE CURRENT night is untouched: reaping it mid-flight would let the cycle
-    # phase re-buy a finding the reactive pass is applying right now, which is the exact duplicate
-    # this status exists to prevent.
-    assert rows[fresh]["status"] == "in_theme";
     # idempotent: a second sweep finds nothing left to do
     assert reap_stale_in_theme(path) == 0;
 }
